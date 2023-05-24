@@ -19,11 +19,11 @@
 
 use crate::nullif::SUPPORTED_NULLIF_TYPES;
 use crate::type_coercion::functions::data_types;
-use crate::ColumnarValue;
 use crate::{
     array_expressions, conditional_expressions, struct_expressions, Accumulator,
     BuiltinScalarFunction, Signature, TypeSignature,
 };
+use crate::{greatest_least, ColumnarValue};
 use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, TimeUnit};
 use datafusion_common::{DataFusionError, Result};
 use std::sync::Arc;
@@ -153,6 +153,16 @@ pub fn return_type(
         }
         BuiltinScalarFunction::InitCap => {
             utf8_to_str_type(&input_expr_types[0], "initcap")
+        }
+        BuiltinScalarFunction::Greatest => {
+            // GREATEST has multiple args and they might get coerced, get a preview of this
+            let coerced_types = data_types(input_expr_types, &signature(fun));
+            coerced_types.map(|types| types[0].clone())
+        }
+        BuiltinScalarFunction::Least => {
+            // GREATEST has multiple args and they might get coerced, get a preview of this
+            let coerced_types = data_types(input_expr_types, &signature(fun));
+            coerced_types.map(|types| types[0].clone())
         }
         BuiltinScalarFunction::Left => utf8_to_str_type(&input_expr_types[0], "left"),
         BuiltinScalarFunction::Lower => utf8_to_str_type(&input_expr_types[0], "lower"),
@@ -285,7 +295,7 @@ pub fn return_type(
             DataType::Int64 => Ok(DataType::Int64),
             DataType::Float32 => Ok(DataType::Float32),
             _ => Ok(DataType::Float64),
-        }
+        },
 
         BuiltinScalarFunction::Asin
         | BuiltinScalarFunction::Acos
@@ -337,6 +347,14 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
         }
         BuiltinScalarFunction::Coalesce => Signature::variadic(
             conditional_expressions::SUPPORTED_COALESCE_TYPES.to_vec(),
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::Greatest => Signature::variadic(
+            greatest_least::SUPPORTED_GREATEST_LEAST_TYPES.to_vec(),
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::Least => Signature::variadic(
+            greatest_least::SUPPORTED_GREATEST_LEAST_TYPES.to_vec(),
             fun.volatility(),
         ),
         BuiltinScalarFunction::SHA224
