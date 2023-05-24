@@ -38,6 +38,7 @@ pub mod expr_schema;
 pub mod field_util;
 pub mod function;
 pub mod function_err;
+mod greatest_least;
 mod literal;
 pub mod logical_plan;
 mod nullif;

@@ -127,6 +127,10 @@ pub enum BuiltinScalarFunction {
     DateBin,
     /// initcap
     InitCap,
+    /// greatest
+    Greatest,
+    /// Least
+    Least,
     /// left
     Left,
     /// lpad
@@ -292,6 +296,8 @@ impl BuiltinScalarFunction {
             BuiltinScalarFunction::DateTrunc => Volatility::Immutable,
             BuiltinScalarFunction::DateBin => Volatility::Immutable,
             BuiltinScalarFunction::InitCap => Volatility::Immutable,
+            BuiltinScalarFunction::Greatest => Volatility::Immutable,
+            BuiltinScalarFunction::Least => Volatility::Immutable,
             BuiltinScalarFunction::Left => Volatility::Immutable,
             BuiltinScalarFunction::Lpad => Volatility::Immutable,
             BuiltinScalarFunction::Lower => Volatility::Immutable,
@@ -381,6 +387,8 @@ fn aliases(func: &BuiltinScalarFunction) -> &'static [&'static str] {
         // conditional functions
         BuiltinScalarFunction::Coalesce => &["coalesce"],
         BuiltinScalarFunction::NullIf => &["nullif"],
+        BuiltinScalarFunction::Greatest => &["greatest"],
+        BuiltinScalarFunction::Least => &["least"],
 
         // string functions
         BuiltinScalarFunction::Ascii => &["ascii"],
