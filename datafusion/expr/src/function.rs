@@ -137,9 +137,12 @@ pub fn return_type(
         BuiltinScalarFunction::ConcatWithSeparator => Ok(DataType::Utf8),
         BuiltinScalarFunction::DatePart => Ok(DataType::Float64),
         BuiltinScalarFunction::DateTrunc | BuiltinScalarFunction::DateBin => {
-            match input_expr_types[1] {
-                DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Utf8 => {
+            match &input_expr_types[1] {
+                DataType::Timestamp(TimeUnit::Nanosecond, None) | DataType::Utf8 => {
                     Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                    Ok(DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()))
                 }
                 DataType::Timestamp(TimeUnit::Microsecond, _) => {
                     Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
@@ -496,10 +499,16 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
             ],
             fun.volatility(),
         ),
-        BuiltinScalarFunction::DateTrunc => Signature::exact(
+        BuiltinScalarFunction::DateTrunc => Signature::one_of(
             vec![
-                DataType::Utf8,
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                ]),
+                TypeSignature::Exact(vec![
+                    DataType::Utf8,
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                ]),
             ],
             fun.volatility(),
         ),
