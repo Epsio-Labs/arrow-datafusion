@@ -228,17 +228,20 @@ pub fn return_type(
                 ));
             }
         }),
-        BuiltinScalarFunction::ToTimestamp => {
-            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
-        }
-        BuiltinScalarFunction::ToTimestampMillis => {
-            Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-        }
-        BuiltinScalarFunction::ToTimestampMicros => {
-            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-        }
+        BuiltinScalarFunction::ToTimestamp => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("+00:00".into()),
+        )),
+        BuiltinScalarFunction::ToTimestampMillis => Ok(DataType::Timestamp(
+            TimeUnit::Millisecond,
+            Some("+00:00".into()),
+        )),
+        BuiltinScalarFunction::ToTimestampMicros => Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("+00:00".into()),
+        )),
         BuiltinScalarFunction::ToTimestampSeconds => {
-            Ok(DataType::Timestamp(TimeUnit::Second, None))
+            Ok(DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())))
         }
         BuiltinScalarFunction::FromUnixtime => {
             Ok(DataType::Timestamp(TimeUnit::Second, None))
@@ -439,6 +442,7 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
             1,
             vec![
                 DataType::Int64,
+                DataType::Float64,
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 DataType::Timestamp(TimeUnit::Millisecond, None),
