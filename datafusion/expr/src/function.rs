@@ -721,9 +721,17 @@ pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
             Signature::uniform(2, vec![DataType::Int64], fun.volatility())
         }
         BuiltinScalarFunction::ArrowTypeof => Signature::any(1, fun.volatility()),
-        // BuiltinScalarFunction::Abs => Signature::uniform(1, vec![DataType::Float64, DataType::Float32, DataType::Int64, DataType], fun.volatility()),
-        BuiltinScalarFunction::Abs
-        | BuiltinScalarFunction::Acos
+        BuiltinScalarFunction::Abs => Signature::uniform(
+            1,
+            vec![
+                DataType::Float64,
+                DataType::Float32,
+                DataType::Int64,
+                DataType::Int32,
+            ],
+            fun.volatility(),
+        ),
+        BuiltinScalarFunction::Acos
         | BuiltinScalarFunction::Asin
         | BuiltinScalarFunction::Atan
         | BuiltinScalarFunction::Acosh
