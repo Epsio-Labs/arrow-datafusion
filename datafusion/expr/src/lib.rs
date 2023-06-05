@@ -38,6 +38,7 @@ pub mod expr_schema;
 pub mod field_util;
 pub mod function;
 mod greatest_least;
+mod json;
 mod literal;
 pub mod logical_plan;
 mod nullif;
@@ -66,6 +67,7 @@ pub use function::{
     AccumulatorFunctionImplementation, ReturnTypeFunction, ScalarFunctionImplementation,
     StateTypeFunction,
 };
+pub use json::{json_type, JsonAcessOperator};
 pub use literal::{lit, lit_timestamp_nano, Literal, TimestampLiteral};
 pub use logical_plan::*;
 pub use nullif::SUPPORTED_NULLIF_TYPES;

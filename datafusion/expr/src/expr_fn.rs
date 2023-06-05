@@ -616,8 +616,16 @@ nary_scalar_expr!(
     "returns an array of fixed size with each argument on it."
 );
 nary_scalar_expr!(Coalesce, coalesce, "returns `coalesce(args...)`, which evaluates to the value of the first [Expr] which is not NULL");
-nary_scalar_expr!(Greatest, greatest, "returns the greatest value in a list of expressions");
-nary_scalar_expr!(Least, least, "returns the smallest value in a list of expressions");
+nary_scalar_expr!(
+    Greatest,
+    greatest,
+    "returns the greatest value in a list of expressions"
+);
+nary_scalar_expr!(
+    Least,
+    least,
+    "returns the smallest value in a list of expressions"
+);
 //there is a func concat_ws before, so use concat_ws_expr as name.c
 nary_scalar_expr!(
     ConcatWithSeparator,
