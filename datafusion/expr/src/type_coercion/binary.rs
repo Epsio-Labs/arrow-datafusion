@@ -631,9 +631,12 @@ pub fn json_type() -> DataType {
 }
 
 pub fn arrow_access_result_type(left: &DataType, right: &DataType) -> Result<DataType> {
-    if left != &json_type() {
+    eprintln!("Ben: arrow_access_result_type: left: {:?}, right: {:?}", left, right);
+    // eprint!("ADFASDFADSFASDFASDF@@@@\n");
+    // panic!("BENBENBEN");
+    if left != &json_type() || left != &DataType::Utf8{
         Err(DataFusionError::Plan(format!(
-            "Cannot use arrow access operator on non-json {left}!"
+            "Cannot use arrow access operator on non-json BENBENBEN {left}!"
         )))
     } else if !right.is_integer() && right != &DataType::Utf8 {
         Err(DataFusionError::Plan(format!(
@@ -1406,6 +1409,21 @@ mod tests {
             Operator::Or,
             DataType::Boolean
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_recursive_json() -> Result<()> {
+        let input_json = DataType::Struct(Fields::from(vec![Field::new(
+            "json",
+            DataType::Utf8,
+            false,
+        )]));
+        // let sub_json = input_json.
+        let result_type = get_result_type(&input_json, &Operator::ArrowAccess, &DataType::Int32)?;
+        let result_type2 = get_result_type(&result_type, &Operator::ArrowAccess, &DataType::Int32)?;
+        // input_json."json" = "abc";
+        assert_eq!(result_type2, json_type());
         Ok(())
     }
 }
