@@ -46,7 +46,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             // interpret names with '.' as if they were
             // compound identifiers, but this is not a compound
             // identifier. (e.g. it is "foo.bar" not foo.bar)
-            let normalize_ident = self.normalizer.normalize(id);
+            let normalize_ident = crate::utils::normalize_ident(id);
             match schema.field_with_unqualified_name(normalize_ident.as_str()) {
                 Ok(_) => {
                     // found a match without a qualified name, this is a inner table column

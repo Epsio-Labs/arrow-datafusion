@@ -47,7 +47,7 @@ impl Column {
     ) -> Self {
         Self {
             relation: relation.map(|r| r.into()),
-            name: name.into(),
+            name: name.into().to_lowercase(),
         }
     }
 
@@ -55,7 +55,7 @@ impl Column {
     pub fn new_unqualified(name: impl Into<String>) -> Self {
         Self {
             relation: None,
-            name: name.into(),
+            name: name.into().to_lowercase(),
         }
     }
 
@@ -63,7 +63,7 @@ impl Column {
     pub fn from_name(name: impl Into<String>) -> Self {
         Self {
             relation: None,
-            name: name.into(),
+            name: name.into().to_lowercase(),
         }
     }
 
@@ -95,7 +95,8 @@ impl Column {
             // identifiers will be treated as an unqualified column name
             _ => return None,
         };
-        Some(Self { relation, name })
+        let normalized_column_name = name.to_lowercase();
+        Some(Self { relation, name: normalized_column_name })
     }
 
     /// Deserialize a fully qualified name string into a column
