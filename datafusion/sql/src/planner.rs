@@ -65,6 +65,7 @@ pub trait ContextProvider {
 pub struct ParserOptions {
     pub parse_float_as_decimal: bool,
     pub enable_ident_normalization: bool,
+    pub enable_column_name_normalization: bool,
 }
 
 impl Default for ParserOptions {
@@ -72,6 +73,7 @@ impl Default for ParserOptions {
         Self {
             parse_float_as_decimal: false,
             enable_ident_normalization: true,
+            enable_column_name_normalization: true,
         }
     }
 }
@@ -80,21 +82,33 @@ impl Default for ParserOptions {
 #[derive(Debug)]
 pub struct IdentNormalizer {
     normalize: bool,
+    normalize_column: bool,
 }
 
 impl Default for IdentNormalizer {
     fn default() -> Self {
-        Self { normalize: true }
+        Self {
+            normalize: true,
+            normalize_column: true
+        }
     }
 }
 
 impl IdentNormalizer {
-    pub fn new(normalize: bool) -> Self {
-        Self { normalize }
+    pub fn new(normalize: bool, normalize_column: bool) -> Self {
+        Self { normalize, normalize_column}
     }
 
     pub fn normalize(&self, ident: Ident) -> String {
         if self.normalize {
+            crate::utils::normalize_ident(ident)
+        } else {
+            ident.value
+        }
+    }
+
+    pub fn normalize_column(&self, ident: Ident) -> String {
+        if self.normalize_column {
             crate::utils::normalize_ident(ident)
         } else {
             ident.value
@@ -200,10 +214,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Create a new query planner
     pub fn new_with_options(schema_provider: &'a S, options: ParserOptions) -> Self {
         let normalize = options.enable_ident_normalization;
+        let normalize_column = options.enable_column_name_normalization;
         SqlToRel {
             schema_provider,
             options,
-            normalizer: IdentNormalizer::new(normalize),
+            normalizer: IdentNormalizer::new(normalize, normalize_column),
         }
     }
 
@@ -217,7 +232,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 .iter()
                 .any(|x| x.option == ColumnOption::NotNull);
             fields.push(Field::new(
-                self.normalizer.normalize(column.name),
+                self.normalizer.normalize_column(column.name),
                 data_type,
                 !not_nullable,
             ));
@@ -256,7 +271,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             let fields = plan.schema().fields().clone();
             LogicalPlanBuilder::from(plan)
                 .project(fields.iter().zip(idents.into_iter()).map(|(field, ident)| {
-                    col(field.name()).alias(self.normalizer.normalize(ident))
+                    col(field.name()).alias(self.normalizer.normalize_column(ident))
                 }))?
                 .build()
         }
@@ -443,7 +458,7 @@ pub(crate) fn idents_to_table_reference(
     impl IdentTaker {
         fn take(&mut self, enable_normalization: bool) -> String {
             let ident = self.0.pop().expect("no more identifiers");
-            IdentNormalizer::new(enable_normalization).normalize(ident)
+            IdentNormalizer::new(enable_normalization, false).normalize(ident)
         }
     }
 
@@ -476,7 +491,7 @@ pub fn object_name_to_qualifier(
     enable_normalization: bool,
 ) -> String {
     let columns = vec!["table_name", "table_schema", "table_catalog"].into_iter();
-    let normalizer = IdentNormalizer::new(enable_normalization);
+    let normalizer = IdentNormalizer::new(enable_normalization, true);
     sql_table_name
         .0
         .iter()
