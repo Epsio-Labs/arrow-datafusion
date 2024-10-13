@@ -20,8 +20,7 @@ use crate::expr::{
     AggregateFunction, Alias, BinaryExpr, Cast, InList, InSubquery, Placeholder,
     ScalarFunction, TryCast, Unnest, WindowFunction,
 };
-use crate::field_util::GetFieldAccessSchema;
-use crate::type_coercion::binary::{extract_enum_name, get_result_type};;
+use crate::type_coercion::binary::{extract_enum_name, get_result_type};
 use crate::type_coercion::functions::{
     data_types_with_aggregate_udf, data_types_with_scalar_udf, data_types_with_window_udf,
 };

@@ -529,8 +529,8 @@ pub fn values_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataT
 fn bool_numeric_coercision(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     use arrow::datatypes::DataType::*;
     match (lhs_type, rhs_type) {
-        (Boolean, _) if is_numeric(rhs_type) => Some(Boolean),
-        (_, Boolean) if is_numeric(lhs_type) => Some(Boolean),
+        (Boolean, _) if rhs_type.is_numeric() => Some(Boolean),
+        (_, Boolean) if lhs_type.is_numeric() => Some(Boolean),
         _ => None,
     }
 }
@@ -985,13 +985,13 @@ pub fn get_arrow_return_type(
     arrow_type: &Operator,
 ) -> Result<DataType> {
     if left != &json_type() {
-        Err(DataFusionError::Plan(format!(
+        plan_err!(
             "Cannot use arrow access operator on non-json {left}!"
-        )))
+        )
     } else if !right.is_integer() && right != &DataType::Utf8 {
-        Err(DataFusionError::Plan(format!(
+        plan_err!(
             "Right side of of access operator must integer or text (not {right})!"
-        )))
+        )
     } else {
         match arrow_type {
             Operator::ArrowAccess => Ok(json_type()),
@@ -1038,6 +1038,13 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
         (LargeUtf8, Utf8 | LargeUtf8) | (Utf8, LargeUtf8) => Some(LargeUtf8),
         // Utf8 coerces to Utf8
         (Utf8, Utf8) => Some(Utf8),
+        (Struct(f), Utf8) | (Utf8, Struct(f)) => {
+            if f.len() == 2 && f[0].name() == "enum" {
+                Some(Utf8)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }

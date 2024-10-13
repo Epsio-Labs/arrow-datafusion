@@ -905,10 +905,10 @@ impl ExprMask {
 
         let is_aggr = matches!(expr, Expr::AggregateFunction(..));
 
-        let mut is_udf = matches!(expr, Expr::ScalarUDF(..));
+        let mut is_udf = matches!(expr, Expr::ScalarFunction(..));
 
         if let Expr::Cast(c) = expr {
-            is_udf |= matches!(c.expr.as_ref(), Expr::ScalarUDF(_));
+            is_udf |= matches!(c.expr.as_ref(), Expr::ScalarFunction(_));
         }
 
         match self {
@@ -1101,7 +1101,10 @@ impl<'n> TreeNodeVisitor<'n> for ExprIdentifierVisitor<'_, 'n> {
         let is_valid = !expr.is_volatile_node() && sub_expr_is_valid;
 
         self.id_array[down_index].0 = self.up_index;
-        if is_valid && !self.expr_mask.ignores(expr) && !format!("{expr}").contains("now()") {
+        if is_valid
+            && !self.expr_mask.ignores(expr)
+            && !format!("{expr}").contains("now()")
+        {
             self.id_array[down_index].1 = Some(expr_id);
             let (count, conditional_count) =
                 self.expr_stats.entry(expr_id).or_insert((0, 0));

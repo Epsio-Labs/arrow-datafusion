@@ -1836,7 +1836,7 @@ mod tests {
                     .gt(out_ref_col(DataType::UInt32, "test.a") * lit(2u32)),
             )?
             .project(vec![col("sq.c")])?
-            .distinct(None)?
+            .distinct()?
             .build()?;
         let plan = LogicalPlanBuilder::from(table_scan)
             .filter(exists(Arc::new(subquery)))?
@@ -1864,7 +1864,7 @@ mod tests {
                     .gt(out_ref_col(DataType::UInt32, "test.a") * lit(2u32)),
             )?
             .project(vec![col("sq.b") + col("sq.c")])?
-            .distinct(None)?
+            .distinct()?
             .build()?;
         let plan = LogicalPlanBuilder::from(table_scan)
             .filter(exists(Arc::new(subquery)))?
@@ -1892,7 +1892,7 @@ mod tests {
                     .gt(out_ref_col(DataType::UInt32, "test.a") * lit(2u32)),
             )?
             .project(vec![lit(1u32), col("sq.c")])?
-            .distinct(None)?
+            .distinct()?
             .build()?;
         let plan = LogicalPlanBuilder::from(table_scan)
             .filter(exists(Arc::new(subquery)))?

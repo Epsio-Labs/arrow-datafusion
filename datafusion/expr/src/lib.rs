@@ -67,10 +67,7 @@ pub mod window_function;
 pub mod window_state;
 
 pub use crate::type_coercion::binary::json_type;
-pub use aggregate_function::AggregateFunction;
-pub use built_in_function::BuiltinScalarFunction;
 pub use built_in_window_function::BuiltInWindowFunction;
-pub use columnar_value::ColumnarValue;
 pub use datafusion_expr_common::accumulator::Accumulator;
 pub use datafusion_expr_common::columnar_value::ColumnarValue;
 pub use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};

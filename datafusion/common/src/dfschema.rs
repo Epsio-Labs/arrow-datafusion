@@ -353,7 +353,10 @@ impl DFSchema {
                 // field to lookup is qualified.
                 // current field is qualified and not shared between relations, compare both
                 // qualifier and name.
-                (Some(q), Some(field_q)) => q.resolved_eq(field_q) && f.name().to_lowercase() == name.to_lowercase(),
+                (Some(q), Some(field_q)) => {
+                    q.resolved_eq(field_q)
+                        && f.name().to_lowercase() == name.to_lowercase()
+                }
                 // field to lookup is qualified but current field is unqualified.
                 (Some(qq), None) => {
                     // the original field may now be aliased with a name that matches the
@@ -370,7 +373,9 @@ impl DFSchema {
                     }
                 }
                 // field to lookup is unqualified, no need to compare qualifier
-                (None, Some(_)) | (None, None) => f.name().to_lowercase() == name.to_lowercase(),
+                (None, Some(_)) | (None, None) => {
+                    f.name().to_lowercase() == name.to_lowercase()
+                }
             })
             .map(|(idx, _)| idx);
         matches.next()
@@ -558,7 +563,9 @@ impl DFSchema {
 
     /// Find if the field exists with the given name
     pub fn has_column_with_unqualified_name(&self, name: &str) -> bool {
-        self.fields().iter().any(|field| field.name().to_lowercase() == name.to_lowercase())
+        self.fields()
+            .iter()
+            .any(|field| field.name().to_lowercase() == name.to_lowercase())
     }
 
     /// Find if the field exists with the given qualified name
@@ -567,15 +574,18 @@ impl DFSchema {
         qualifier: &TableReference,
         name: &str,
     ) -> bool {
-        self.iter()
-            .any(|(q, f)| q.map(|q| q.eq(qualifier)).unwrap_or(false) && f.name().to_lowercase() == name.to_lowercase())
+        self.iter().any(|(q, f)| {
+            q.map(|q| q.eq(qualifier)).unwrap_or(false)
+                && f.name().to_lowercase() == name.to_lowercase()
+        })
     }
 
     /// Find if the field exists with the given qualified column
     pub fn has_column(&self, column: &Column) -> bool {
-        self.index_of_column_by_name(column.relation.as_ref(), &column.name)
-            .map(|idx| idx.is_some())
-            .unwrap_or(false)
+        match &column.relation {
+            Some(r) => self.has_column_with_qualified_name(r, &column.name),
+            None => self.has_column_with_unqualified_name(&column.name),
+        }
     }
 
     /// Check to see if unqualified field names matches field names in Arrow schema
@@ -584,7 +594,9 @@ impl DFSchema {
             .fields
             .iter()
             .zip(arrow_schema.fields().iter())
-            .all(|(dffield, arrowfield)| dffield.name().to_lowercase() == arrowfield.name().to_lowercase())
+            .all(|(dffield, arrowfield)| {
+                dffield.name().to_lowercase() == arrowfield.name().to_lowercase()
+            })
     }
 
     /// Check to see if fields in 2 Arrow schemas are compatible

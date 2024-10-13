@@ -17,9 +17,7 @@
 
 //! SQL Utility Functions
 
-use arrow_schema::{
-    DataType, DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DECIMAL_DEFAULT_SCALE,
-};
+use arrow_schema::{DataType, DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION};
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
@@ -28,7 +26,6 @@ use datafusion_common::{
 };
 use datafusion_expr::builder::get_unnested_columns;
 use datafusion_expr::expr::{Alias, GroupingSet, Unnest, WindowFunction};
-use datafusion_expr::expr_vec_fmt;
 use datafusion_expr::utils::{expr_as_column_expr, find_column_exprs};
 use datafusion_expr::{expr_vec_fmt, Expr, ExprSchemable, LogicalPlan};
 use sqlparser::ast::{Ident, Value};
@@ -132,10 +129,10 @@ fn check_column_satisfies_expr(
     message_prefix: &str,
 ) -> Result<()> {
     if !columns.iter().any(|c| match (c, expr) {
-       (Expr::Column(c), Expr::Column(c2)) => {
-           c.name.to_lowercase() == c2.name.to_lowercase() && c.relation == c2.relation
-       },
-       _ => false // This should be unreachable
+        (Expr::Column(c), Expr::Column(c2)) => {
+            c.name.to_lowercase() == c2.name.to_lowercase() && c.relation == c2.relation
+        }
+        _ => false, // This should be unreachable
     }) {
         return plan_err!(
             "{}: Expression {} could not be resolved from available columns: {}",
