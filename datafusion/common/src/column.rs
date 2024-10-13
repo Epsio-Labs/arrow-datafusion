@@ -21,7 +21,7 @@ use arrow_schema::{Field, FieldRef};
 
 use crate::error::_schema_err;
 use crate::utils::{parse_identifiers_normalized, quote_identifier};
-use crate::{DFField, DFSchema, DataFusionError, OwnedTableReference, Result, SchemaError, TableReference};
+use crate::{DFSchema, DataFusionError, Result, SchemaError, TableReference};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt;
@@ -196,34 +196,7 @@ impl Column {
         for schema_level in schemas {
             let qualified_fields = schema_level
                 .iter()
-                .flat_map(|s| {
-                    s.fields()
-                        .iter()
-                        .filter_map(|field| {
-                            let tables_match = match &self.relation {
-                                Some(tb) => match field.qualifier() {
-                                    None => true,
-                                    Some(s) => tb.resolved_eq(s),
-                                },
-                                None => true,
-                            };
-                            if tables_match && field.name() == self.name.to_lowercase() {
-                                let qualifier = match &self.relation {
-                                    Some(tb) => Some(tb.clone()),
-                                    None => field.qualifier().cloned(),
-                                };
-                                return Some(DFField::new(
-                                    qualifier,
-                                    self.name.as_str(), // We want to use the original name
-                                    // in case there's some casing difference
-                                    field.data_type().clone(),
-                                    field.is_nullable(),
-                                ));
-                            }
-                            None
-                        })
-                        .collect::<Vec<_>>()
-                })
+                .flat_map(|s| s.qualified_fields_with_unqualified_name(&self.name))
                 .collect::<Vec<_>>();
             match qualified_fields.len() {
                 0 => continue,

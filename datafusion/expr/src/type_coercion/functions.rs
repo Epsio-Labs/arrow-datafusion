@@ -724,7 +724,9 @@ fn coerced_from<'a>(
         // This can lose precision (because `into_type` might be less precise than `from_type`),
         // but casting to Float64 can also lose precision- which is how most functions currently
         // work
-        Decimal128(_, _) => matches!(type_from, Decimal128(_, _)),
+        (Decimal128(_, _), _) if matches!(type_from, Decimal128(_, _)) => {
+            Some(type_into.clone())
+        }
         (Timestamp(_, Some(_)), _)
             if matches!(
                 type_from,
