@@ -15,27 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::ops::Deref;
+use std::sync::Arc;
+
 use arrow::array::{Int32Builder, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
-use datafusion::datasource::provider::{TableProvider, TableType};
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::provider::TableType;
 use datafusion::error::Result;
-use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
+use datafusion::execution::context::TaskContext;
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-    Statistics,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning,
+    PlanProperties, SendableRecordBatchStream, Statistics,
 };
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::cast::as_primitive_array;
-use datafusion_common::{not_impl_err, DataFusionError};
+use datafusion_common::{internal_err, not_impl_err};
 use datafusion_expr::expr::{BinaryExpr, Cast};
-use std::ops::Deref;
-use std::sync::Arc;
+use datafusion_functions_aggregate::expr_fn::count;
+use datafusion_physical_expr::EquivalenceProperties;
+
+use async_trait::async_trait;
+use datafusion_catalog::Session;
 
 fn create_batch(value: i32, num_rows: usize) -> Result<RecordBatch> {
     let mut builder = Int32Builder::with_capacity(num_rows);
@@ -55,8 +60,25 @@ fn create_batch(value: i32, num_rows: usize) -> Result<RecordBatch> {
 
 #[derive(Debug)]
 struct CustomPlan {
-    schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    cache: PlanProperties,
+}
+
+impl CustomPlan {
+    fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        let cache = Self::compute_properties(schema);
+        Self { batches, cache }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        )
+    }
 }
 
 impl DisplayAs for CustomPlan {
@@ -74,31 +96,32 @@ impl DisplayAs for CustomPlan {
 }
 
 impl ExecutionPlan for CustomPlan {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        unreachable!()
+        // CustomPlan has no children
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            internal_err!("Children cannot be replaced in {self:?}")
+        }
     }
 
     fn execute(
@@ -112,10 +135,10 @@ impl ExecutionPlan for CustomPlan {
         )))
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         // here we could provide more accurate statistics
         // but we want to test the filter pushdown not the CBOs
-        Statistics::default()
+        Ok(Statistics::new_unknown(&self.schema()))
     }
 }
 
@@ -141,11 +164,13 @@ impl TableProvider for CustomProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
-        _: Option<&Vec<usize>>,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let empty = Vec::new();
+        let projection = projection.unwrap_or(&empty);
         match &filters[0] {
             Expr::BinaryExpr(BinaryExpr { right, .. }) => {
                 let int_value = match &**right {
@@ -174,24 +199,33 @@ impl TableProvider for CustomProvider {
                     }
                 };
 
-                Ok(Arc::new(CustomPlan {
-                    schema: self.zero_batch.schema(),
-                    batches: match int_value {
+                Ok(Arc::new(CustomPlan::new(
+                    match projection.is_empty() {
+                        true => Arc::new(Schema::empty()),
+                        false => self.zero_batch.schema(),
+                    },
+                    match int_value {
                         0 => vec![self.zero_batch.clone()],
                         1 => vec![self.one_batch.clone()],
                         _ => vec![],
                     },
-                }))
+                )))
             }
-            _ => Ok(Arc::new(CustomPlan {
-                schema: self.zero_batch.schema(),
-                batches: vec![],
-            })),
+            _ => Ok(Arc::new(CustomPlan::new(
+                match projection.is_empty() {
+                    true => Arc::new(Schema::empty()),
+                    false => self.zero_batch.schema(),
+                },
+                vec![],
+            ))),
         }
     }
 
-    fn supports_filter_pushdown(&self, _: &Expr) -> Result<TableProviderFilterPushDown> {
-        Ok(TableProviderFilterPushDown::Exact)
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 }
 

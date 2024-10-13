@@ -22,14 +22,11 @@ use arrow::{
     datatypes::Float64Type,
 };
 use arrow_schema::DataType;
-use datafusion::datasource::file_format::options::CsvReadOptions;
 
 use datafusion::error::Result;
 use datafusion::prelude::*;
-use datafusion_common::{plan_err, DataFusionError, ScalarValue};
-use datafusion_expr::{
-    PartitionEvaluator, Signature, Volatility, WindowFrame, WindowUDF,
-};
+use datafusion_common::ScalarValue;
+use datafusion_expr::{PartitionEvaluator, Volatility, WindowFrame};
 
 // create local execution context with `cars.csv` registered as a table named `cars`
 async fn create_context() -> Result<SessionContext> {
@@ -38,7 +35,7 @@ async fn create_context() -> Result<SessionContext> {
 
     // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
     println!("pwd: {}", std::env::current_dir().unwrap().display());
-    let csv_path = "datafusion/core/tests/data/cars.csv".to_string();
+    let csv_path = "../../datafusion/core/tests/data/cars.csv".to_string();
     let read_options = CsvReadOptions::default().has_header(true);
 
     ctx.register_csv("cars", &csv_path, read_options).await?;
@@ -50,8 +47,17 @@ async fn create_context() -> Result<SessionContext> {
 async fn main() -> Result<()> {
     let ctx = create_context().await?;
 
+    // here is where we define the UDWF. We also declare its signature:
+    let smooth_it = create_udwf(
+        "smooth_it",
+        DataType::Float64,
+        Arc::new(DataType::Float64),
+        Volatility::Immutable,
+        Arc::new(make_partition_evaluator),
+    );
+
     // register the window function with DataFusion so we can call it
-    ctx.register_udwf(smooth_it());
+    ctx.register_udwf(smooth_it.clone());
 
     // Use SQL to run the new window function
     let df = ctx.sql("SELECT * from cars").await?;
@@ -65,7 +71,7 @@ async fn main() -> Result<()> {
     // creating a new `PartitionEvaluator`)
     //
     // `ORDER BY time`: within each partition ('green' or 'red') the
-    // rows will be be ordered by the value in the `time` column
+    // rows will be ordered by the value in the `time` column
     //
     // `evaluate_inside_range` is invoked with a window defined by the
     // SQL. In this case:
@@ -82,7 +88,7 @@ async fn main() -> Result<()> {
             "SELECT \
                car, \
                speed, \
-               smooth_it(speed) OVER (PARTITION BY car ORDER BY time),\
+               smooth_it(speed) OVER (PARTITION BY car ORDER BY time) AS smooth_speed,\
                time \
                from cars \
              ORDER BY \
@@ -102,7 +108,7 @@ async fn main() -> Result<()> {
         "SELECT \
            car, \
            speed, \
-           smooth_it(speed) OVER (PARTITION BY car ORDER BY time ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING),\
+           smooth_it(speed) OVER (PARTITION BY car ORDER BY time ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS smooth_speed,\
            time \
            from cars \
          ORDER BY \
@@ -112,12 +118,12 @@ async fn main() -> Result<()> {
     df.show().await?;
 
     // Now, run the function using the DataFrame API:
-    let window_expr = smooth_it().call(
-        vec![col("speed")],                 // smooth_it(speed)
-        vec![col("car")],                   // PARTITION BY car
-        vec![col("time").sort(true, true)], // ORDER BY time ASC
-        WindowFrame::new(false),
-    );
+    let window_expr = smooth_it
+        .call(vec![col("speed")]) // smooth_it(speed)
+        .partition_by(vec![col("car")]) // PARTITION BY car
+        .order_by(vec![col("time").sort(true, true)]) // ORDER BY time ASC
+        .window_frame(WindowFrame::new(None))
+        .build()?;
     let df = ctx.table("cars").await?.window(vec![window_expr])?;
 
     // print the results
@@ -126,30 +132,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn smooth_it() -> WindowUDF {
-    WindowUDF {
-        name: String::from("smooth_it"),
-        // it will take 1 arguments -- the column to smooth
-        signature: Signature::exact(vec![DataType::Float64], Volatility::Immutable),
-        return_type: Arc::new(return_type),
-        partition_evaluator_factory: Arc::new(make_partition_evaluator),
-    }
-}
-
-/// Compute the return type of the smooth_it window function given
-/// arguments of `arg_types`.
-fn return_type(arg_types: &[DataType]) -> Result<Arc<DataType>> {
-    if arg_types.len() != 1 {
-        return plan_err!(
-            "my_udwf expects 1 argument, got {}: {:?}",
-            arg_types.len(),
-            arg_types
-        );
-    }
-    Ok(Arc::new(arg_types[0].clone()))
-}
-
-/// Create a `PartitionEvalutor` to evaluate this function on a new
+/// Create a `PartitionEvaluator` to evaluate this function on a new
 /// partition.
 fn make_partition_evaluator() -> Result<Box<dyn PartitionEvaluator>> {
     Ok(Box::new(MyPartitionEvaluator::new()))

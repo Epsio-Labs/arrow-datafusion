@@ -17,31 +17,34 @@
 
 //! This file has test utils for hash joins
 
+use std::sync::Arc;
+
 use crate::joins::utils::{JoinFilter, JoinOn};
 use crate::joins::{
     HashJoinExec, PartitionMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use crate::memory::MemoryExec;
 use crate::repartition::RepartitionExec;
-use crate::{common, ExecutionPlan, Partitioning};
+use crate::{common, ExecutionPlan, ExecutionPlanProperties, Partitioning};
+
 use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{
     ArrayRef, Float64Array, Int32Array, IntervalDayTimeArray, RecordBatch,
     TimestampMillisecondArray,
 };
-use arrow_schema::Schema;
-use datafusion_common::Result;
-use datafusion_common::ScalarValue;
+use arrow_buffer::IntervalDayTime;
+use arrow_schema::{DataType, Schema};
+use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::TaskContext;
 use datafusion_expr::{JoinType, Operator};
+use datafusion_physical_expr::expressions::{binary, cast, col, lit};
 use datafusion_physical_expr::intervals::test_utils::{
     gen_conjunctive_numerical_expr, gen_conjunctive_temporal_expr,
 };
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
+
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
-use std::sync::Arc;
-use std::usize;
 
 pub fn compare_batches(collected_1: &[RecordBatch], collected_2: &[RecordBatch]) {
     // compare
@@ -77,33 +80,35 @@ pub async fn partitioned_sym_join_with_filter(
 
     let left_expr = on
         .iter()
-        .map(|(l, _)| Arc::new(l.clone()) as _)
+        .map(|(l, _)| Arc::clone(l) as _)
         .collect::<Vec<_>>();
 
     let right_expr = on
         .iter()
-        .map(|(_, r)| Arc::new(r.clone()) as _)
+        .map(|(_, r)| Arc::clone(r) as _)
         .collect::<Vec<_>>();
 
     let join = SymmetricHashJoinExec::try_new(
         Arc::new(RepartitionExec::try_new(
-            left,
+            Arc::clone(&left),
             Partitioning::Hash(left_expr, partition_count),
         )?),
         Arc::new(RepartitionExec::try_new(
-            right,
+            Arc::clone(&right),
             Partitioning::Hash(right_expr, partition_count),
         )?),
         on,
         filter,
         join_type,
         null_equals_null,
+        left.output_ordering().map(|p| p.to_vec()),
+        right.output_ordering().map(|p| p.to_vec()),
         StreamJoinPartitionMode::Partitioned,
     )?;
 
     let mut batches = vec![];
     for i in 0..partition_count {
-        let stream = join.execute(i, context.clone())?;
+        let stream = join.execute(i, Arc::clone(&context))?;
         let more_batches = common::collect(stream).await?;
         batches.extend(
             more_batches
@@ -128,7 +133,7 @@ pub async fn partitioned_hash_join_with_filter(
     let partition_count = 4;
     let (left_expr, right_expr) = on
         .iter()
-        .map(|(l, r)| (Arc::new(l.clone()) as _, Arc::new(r.clone()) as _))
+        .map(|(l, r)| (Arc::clone(l) as _, Arc::clone(r) as _))
         .unzip();
 
     let join = Arc::new(HashJoinExec::try_new(
@@ -143,13 +148,14 @@ pub async fn partitioned_hash_join_with_filter(
         on,
         filter,
         join_type,
+        None,
         PartitionMode::Partitioned,
         null_equals_null,
     )?);
 
     let mut batches = vec![];
     for i in 0..partition_count {
-        let stream = join.execute(i, context.clone())?;
+        let stream = join.execute(i, Arc::clone(&context))?;
         let more_batches = common::collect(stream).await?;
         batches.extend(
             more_batches
@@ -238,6 +244,20 @@ pub fn join_expr_tests_fixture_temporal(
             ScalarValue::TimestampMillisecond(Some(1672574401000), None), // 2023-01-01:12.00.01
             ScalarValue::TimestampMillisecond(Some(1672574400000), None), // 2023-01-01:12.00.00
             ScalarValue::TimestampMillisecond(Some(1672574402000), None), // 2023-01-01:12.00.02
+            schema,
+        ),
+        // constructs ((left_col - DURATION '3 secs')  > (right_col - DURATION '2 secs')) AND ((left_col - DURATION '5 secs') < (right_col - DURATION '4 secs'))
+        2 => gen_conjunctive_temporal_expr(
+            left_col,
+            right_col,
+            Operator::Minus,
+            Operator::Minus,
+            Operator::Minus,
+            Operator::Minus,
+            ScalarValue::DurationMillisecond(Some(3000)), // 3 secs
+            ScalarValue::DurationMillisecond(Some(2000)), // 2 secs
+            ScalarValue::DurationMillisecond(Some(5000)), // 5 secs
+            ScalarValue::DurationMillisecond(Some(4000)), // 4 secs
             schema,
         ),
         _ => unreachable!(),
@@ -448,8 +468,11 @@ pub fn build_sides_record_batches(
     ));
     let interval_time: ArrayRef = Arc::new(IntervalDayTimeArray::from(
         initial_range
-            .map(|x| x as i64 * 100) // x * 100ms
-            .collect::<Vec<i64>>(),
+            .map(|x| IntervalDayTime {
+                days: 0,
+                milliseconds: x * 100,
+            }) // x * 100ms
+            .collect::<Vec<_>>(),
     ));
 
     let float_asc = Arc::new(Float64Array::from_iter_values(
@@ -458,20 +481,29 @@ pub fn build_sides_record_batches(
     ));
 
     let left = RecordBatch::try_from_iter(vec![
-        ("la1", ordered.clone()),
-        ("lb1", cardinality.clone()),
+        ("la1", Arc::clone(&ordered)),
+        ("lb1", Arc::clone(&cardinality) as ArrayRef),
         ("lc1", cardinality_key_left),
-        ("lt1", time.clone()),
-        ("la2", ordered.clone()),
-        ("la1_des", ordered_des.clone()),
-        ("l_asc_null_first", ordered_asc_null_first.clone()),
-        ("l_asc_null_last", ordered_asc_null_last.clone()),
-        ("l_desc_null_first", ordered_desc_null_first.clone()),
-        ("li1", interval_time.clone()),
-        ("l_float", float_asc.clone()),
+        ("lt1", Arc::clone(&time) as ArrayRef),
+        ("la2", Arc::clone(&ordered)),
+        ("la1_des", Arc::clone(&ordered_des) as ArrayRef),
+        (
+            "l_asc_null_first",
+            Arc::clone(&ordered_asc_null_first) as ArrayRef,
+        ),
+        (
+            "l_asc_null_last",
+            Arc::clone(&ordered_asc_null_last) as ArrayRef,
+        ),
+        (
+            "l_desc_null_first",
+            Arc::clone(&ordered_desc_null_first) as ArrayRef,
+        ),
+        ("li1", Arc::clone(&interval_time)),
+        ("l_float", Arc::clone(&float_asc) as ArrayRef),
     ])?;
     let right = RecordBatch::try_from_iter(vec![
-        ("ra1", ordered.clone()),
+        ("ra1", Arc::clone(&ordered)),
         ("rb1", cardinality),
         ("rc1", cardinality_key_right),
         ("rt1", time),
@@ -499,4 +531,52 @@ pub fn create_memory_table(
     let right = MemoryExec::try_new(&[right_partition], right_schema, None)?
         .with_sort_information(right_sorted);
     Ok((Arc::new(left), Arc::new(right)))
+}
+
+/// Filter expr for a + b > c + 10 AND a + b < c + 100
+pub(crate) fn complicated_filter(
+    filter_schema: &Schema,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let left_expr = binary(
+        cast(
+            binary(
+                col("0", filter_schema)?,
+                Operator::Plus,
+                col("1", filter_schema)?,
+                filter_schema,
+            )?,
+            filter_schema,
+            DataType::Int64,
+        )?,
+        Operator::Gt,
+        binary(
+            cast(col("2", filter_schema)?, filter_schema, DataType::Int64)?,
+            Operator::Plus,
+            lit(ScalarValue::Int64(Some(10))),
+            filter_schema,
+        )?,
+        filter_schema,
+    )?;
+
+    let right_expr = binary(
+        cast(
+            binary(
+                col("0", filter_schema)?,
+                Operator::Plus,
+                col("1", filter_schema)?,
+                filter_schema,
+            )?,
+            filter_schema,
+            DataType::Int64,
+        )?,
+        Operator::Lt,
+        binary(
+            cast(col("2", filter_schema)?, filter_schema, DataType::Int64)?,
+            Operator::Plus,
+            lit(ScalarValue::Int64(Some(100))),
+            filter_schema,
+        )?,
+        filter_schema,
+    )?;
+    binary(left_expr, Operator::And, right_expr, filter_schema)
 }

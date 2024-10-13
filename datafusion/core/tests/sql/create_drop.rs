@@ -15,22 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::execution::context::SessionState;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::test_util::TestTableFactory;
 
 use super::*;
 
 #[tokio::test]
 async fn create_custom_table() -> Result<()> {
-    let cfg = RuntimeConfig::new();
-    let env = RuntimeEnv::new(cfg).unwrap();
-    let ses = SessionConfig::new();
-    let mut state = SessionState::with_config_rt(ses, Arc::new(env));
+    let mut state = SessionStateBuilder::new().with_default_features().build();
     state
         .table_factories_mut()
         .insert("DELTATABLE".to_string(), Arc::new(TestTableFactory {}));
-    let ctx = SessionContext::with_state(state);
+    let ctx = SessionContext::new_with_state(state);
 
     let sql = "CREATE EXTERNAL TABLE dt STORED AS DELTATABLE LOCATION 's3://bucket/schema/table';";
     ctx.sql(sql).await.unwrap();
@@ -45,14 +41,11 @@ async fn create_custom_table() -> Result<()> {
 
 #[tokio::test]
 async fn create_external_table_with_ddl() -> Result<()> {
-    let cfg = RuntimeConfig::new();
-    let env = RuntimeEnv::new(cfg).unwrap();
-    let ses = SessionConfig::new();
-    let mut state = SessionState::with_config_rt(ses, Arc::new(env));
+    let mut state = SessionStateBuilder::new().with_default_features().build();
     state
         .table_factories_mut()
         .insert("MOCKTABLE".to_string(), Arc::new(TestTableFactory {}));
-    let ctx = SessionContext::with_state(state);
+    let ctx = SessionContext::new_with_state(state);
 
     let sql = "CREATE EXTERNAL TABLE dt (a_id integer, a_str string, a_bool boolean) STORED AS MOCKTABLE LOCATION 'mockprotocol://path/to/table';";
     ctx.sql(sql).await.unwrap();
@@ -63,7 +56,7 @@ async fn create_external_table_with_ddl() -> Result<()> {
     let exists = schema.table_exist("dt");
     assert!(exists, "Table should have been created!");
 
-    let table_schema = schema.table("dt").await.unwrap().schema();
+    let table_schema = schema.table("dt").await.unwrap().unwrap().schema();
 
     assert_eq!(3, table_schema.fields().len());
 

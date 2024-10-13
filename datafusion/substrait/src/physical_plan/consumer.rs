@@ -15,42 +15,76 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use async_recursion::async_recursion;
-use chrono::DateTime;
-use datafusion::arrow::datatypes::Schema;
-use datafusion::common::not_impl_err;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::{not_impl_err, substrait_err};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::{FileScanConfig, ParquetExec};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
+
+use async_recursion::async_recursion;
+use chrono::DateTime;
 use object_store::ObjectMeta;
-use std::collections::HashMap;
-use std::sync::Arc;
+use substrait::proto::r#type::{Kind, Nullability};
 use substrait::proto::read_rel::local_files::file_or_files::PathType;
+use substrait::proto::Type;
 use substrait::proto::{
     expression::MaskExpression, read_rel::ReadType, rel::RelType, Rel,
+};
+
+use crate::variation_const::{
+    DEFAULT_CONTAINER_TYPE_VARIATION_REF, LARGE_CONTAINER_TYPE_VARIATION_REF,
+    VIEW_CONTAINER_TYPE_VARIATION_REF,
 };
 
 /// Convert Substrait Rel to DataFusion ExecutionPlan
 #[async_recursion]
 pub async fn from_substrait_rel(
-    _ctx: &mut SessionContext,
+    _ctx: &SessionContext,
     rel: &Rel,
     _extensions: &HashMap<u32, &String>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut base_config;
+
     match &rel.rel_type {
         Some(RelType::Read(read)) => {
             if read.filter.is_some() || read.best_effort_filter.is_some() {
                 return not_impl_err!("Read with filter is not supported");
             }
-            if read.base_schema.is_some() {
-                return not_impl_err!("Read with schema is not supported");
-            }
+
             if read.advanced_extension.is_some() {
                 return not_impl_err!("Read with AdvancedExtension is not supported");
             }
+
+            let Some(schema) = read.base_schema.as_ref() else {
+                return substrait_err!("Missing base schema in the read");
+            };
+
+            let Some(r#struct) = schema.r#struct.as_ref() else {
+                return substrait_err!("Missing struct in the schema");
+            };
+
+            match schema
+                .names
+                .iter()
+                .zip(r#struct.types.iter())
+                .map(|(name, r#type)| to_field(name, r#type))
+                .collect::<Result<Vec<Field>>>()
+            {
+                Ok(fields) => {
+                    base_config = FileScanConfig::new(
+                        ObjectStoreUrl::local_filesystem(),
+                        Arc::new(Schema::new(fields)),
+                    );
+                }
+                Err(e) => return Err(e),
+            };
+
             match &read.as_ref().read_type {
                 Some(ReadType::LocalFiles(files)) => {
                     let mut file_groups = vec![];
@@ -87,9 +121,11 @@ pub async fn from_substrait_rel(
                                 location: path.into(),
                                 size,
                                 e_tag: None,
+                                version: None,
                             },
                             partition_values: vec![],
                             range: None,
+                            statistics: None,
                             extensions: None,
                         };
 
@@ -100,17 +136,7 @@ pub async fn from_substrait_rel(
                         file_groups[part_index].push(partitioned_file)
                     }
 
-                    let mut base_config = FileScanConfig {
-                        object_store_url: ObjectStoreUrl::local_filesystem(),
-                        file_schema: Arc::new(Schema::empty()),
-                        file_groups,
-                        statistics: Default::default(),
-                        projection: None,
-                        limit: None,
-                        table_partition_cols: vec![],
-                        output_ordering: vec![],
-                        infinite_source: false,
-                    };
+                    base_config = base_config.with_file_groups(file_groups);
 
                     if let Some(MaskExpression { select, .. }) = &read.projection {
                         if let Some(projection) = &select.as_ref() {
@@ -123,7 +149,7 @@ pub async fn from_substrait_rel(
                         }
                     }
 
-                    Ok(Arc::new(ParquetExec::new(base_config, None, None))
+                    Ok(ParquetExec::builder(base_config).build_arc()
                         as Arc<dyn ExecutionPlan>)
                 }
                 _ => not_impl_err!(
@@ -132,5 +158,69 @@ pub async fn from_substrait_rel(
             }
         }
         _ => not_impl_err!("Unsupported RelType: {:?}", rel.rel_type),
+    }
+}
+
+fn to_field(name: &String, r#type: &Type) -> Result<Field> {
+    let Some(kind) = r#type.kind.as_ref() else {
+        return substrait_err!("Missing kind in the type with name {}", name);
+    };
+
+    let mut nullable = false;
+    let data_type = match kind {
+        Kind::Bool(boolean) => {
+            nullable = is_nullable(boolean.nullability);
+            Ok(DataType::Boolean)
+        }
+        Kind::I64(i64) => {
+            nullable = is_nullable(i64.nullability);
+            Ok(DataType::Int64)
+        }
+        Kind::Fp64(fp64) => {
+            nullable = is_nullable(fp64.nullability);
+            Ok(DataType::Float64)
+        }
+        Kind::String(string) => {
+            nullable = is_nullable(string.nullability);
+            match string.type_variation_reference {
+                DEFAULT_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::Utf8),
+                LARGE_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::LargeUtf8),
+                VIEW_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::Utf8View),
+                _ => substrait_err!(
+                    "Invalid type variation found for substrait string type class: {}",
+                    string.type_variation_reference
+                ),
+            }
+        }
+        Kind::Binary(binary) => {
+            nullable = is_nullable(binary.nullability);
+            match binary.type_variation_reference {
+                DEFAULT_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::Binary),
+                LARGE_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::LargeBinary),
+                VIEW_CONTAINER_TYPE_VARIATION_REF => Ok(DataType::BinaryView),
+                _ => substrait_err!(
+                    "Invalid type variation found for substrait binary type class: {}",
+                    binary.type_variation_reference
+                ),
+            }
+        }
+        _ => substrait_err!(
+            "Unsupported kind: {:?} in the type with name {}",
+            kind,
+            name
+        ),
+    }?;
+
+    Ok(Field::new(name, data_type, nullable))
+}
+
+fn is_nullable(nullability: i32) -> bool {
+    let Ok(nullability) = Nullability::try_from(nullability) else {
+        return true;
+    };
+
+    match nullability {
+        Nullability::Nullable | Nullability::Unspecified => true,
+        Nullability::Required => false,
     }
 }

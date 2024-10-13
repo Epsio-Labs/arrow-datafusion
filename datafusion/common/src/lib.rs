@@ -14,57 +14,76 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
+#![deny(clippy::clone_on_ref_ptr)]
+
+mod column;
+mod dfschema;
+mod functional_dependencies;
+mod join_type;
+mod param_value;
+#[cfg(feature = "pyarrow")]
+mod pyarrow;
+mod schema_reference;
+mod table_reference;
+mod unnest;
 
 pub mod alias;
 pub mod cast;
-mod column;
 pub mod config;
-mod dfschema;
 pub mod display;
-mod error;
+pub mod error;
 pub mod file_options;
 pub mod format;
-mod functional_dependencies;
-mod join_type;
+pub mod hash_utils;
+pub mod instant;
 pub mod parsers;
-#[cfg(feature = "pyarrow")]
-mod pyarrow;
+pub mod rounding;
 pub mod scalar;
-mod schema_reference;
 pub mod stats;
-mod table_reference;
 pub mod test_util;
 pub mod tree_node;
-mod unnest;
 pub mod utils;
 
+/// Reexport arrow crate
+pub use arrow;
 pub use column::Column;
-pub use dfschema::{DFField, DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema};
+pub use dfschema::{
+    qualified_name, DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema,
+};
 pub use error::{
     field_not_found, unqualified_field_not_found, DataFusionError, Result, SchemaError,
     SharedResult,
 };
-
 pub use file_options::file_type::{
-    FileCompressionType, FileType, GetExt, DEFAULT_ARROW_EXTENSION,
-    DEFAULT_AVRO_EXTENSION, DEFAULT_CSV_EXTENSION, DEFAULT_JSON_EXTENSION,
-    DEFAULT_PARQUET_EXTENSION,
+    GetExt, DEFAULT_ARROW_EXTENSION, DEFAULT_AVRO_EXTENSION, DEFAULT_CSV_EXTENSION,
+    DEFAULT_JSON_EXTENSION, DEFAULT_PARQUET_EXTENSION,
 };
-pub use file_options::FileTypeWriterOptions;
 pub use functional_dependencies::{
-    aggregate_functional_dependencies, get_target_functional_dependencies, Constraints,
-    Dependency, FunctionalDependence, FunctionalDependencies,
+    aggregate_functional_dependencies, get_required_group_by_exprs_indices,
+    get_target_functional_dependencies, Constraint, Constraints, Dependency,
+    FunctionalDependence, FunctionalDependencies,
 };
-pub use join_type::{JoinConstraint, JoinType};
+pub use join_type::{JoinConstraint, JoinSide, JoinType};
+pub use param_value::ParamValues;
 pub use scalar::{ScalarType, ScalarValue};
-pub use schema_reference::{OwnedSchemaReference, SchemaReference};
+pub use schema_reference::SchemaReference;
 pub use stats::{ColumnStatistics, Statistics};
-pub use table_reference::{OwnedTableReference, ResolvedTableReference, TableReference};
+pub use table_reference::{ResolvedTableReference, TableReference};
 pub use unnest::UnnestOptions;
 pub use utils::project_schema;
 
-/// Reexport arrow crate
-pub use arrow;
+// These are hidden from docs purely to avoid polluting the public view of what this crate exports.
+// These are just re-exports of macros by the same name, which gets around the 'cannot refer to
+// macro-expanded macro_export macros by their full path' error.
+// The design to get around this comes from this comment:
+// https://github.com/rust-lang/rust/pull/52234#issuecomment-976702997
+#[doc(hidden)]
+pub use error::{
+    _config_datafusion_err, _exec_datafusion_err, _internal_datafusion_err,
+    _not_impl_datafusion_err, _plan_datafusion_err, _resources_datafusion_err,
+    _substrait_datafusion_err,
+};
 
 /// Downcast an Arrow Array to a concrete type, return an `DataFusionError::Internal` if the cast is
 /// not possible. In normal usage of DataFusion the downcast should always succeed.

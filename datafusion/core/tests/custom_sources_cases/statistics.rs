@@ -20,21 +20,23 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::execution::context::TaskContext;
 use datafusion::{
     datasource::{TableProvider, TableType},
     error::Result,
     logical_expr::Expr,
     physical_plan::{
-        expressions::PhysicalSortExpr, ColumnStatistics, DisplayAs, DisplayFormatType,
-        ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+        ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan,
+        Partitioning, PlanProperties, SendableRecordBatchStream, Statistics,
     },
     prelude::SessionContext,
     scalar::ScalarValue,
 };
+use datafusion_common::{project_schema, stats::Precision};
+use datafusion_physical_expr::EquivalenceProperties;
 
 use async_trait::async_trait;
-use datafusion::execution::context::{SessionState, TaskContext};
-use datafusion_common::project_schema;
+use datafusion_catalog::Session;
 
 /// This is a testing structure for statistics
 /// It will act both as a table provider and execution plan
@@ -42,19 +44,33 @@ use datafusion_common::project_schema;
 struct StatisticsValidation {
     stats: Statistics,
     schema: Arc<Schema>,
+    cache: PlanProperties,
 }
 
 impl StatisticsValidation {
     fn new(stats: Statistics, schema: SchemaRef) -> Self {
-        assert!(
-            stats
-                .column_statistics
-                .as_ref()
-                .map(|cols| cols.len() == schema.fields().len())
-                .unwrap_or(true),
-            "if defined, the column statistics vector length should be the number of fields"
+        assert_eq!(
+            stats.column_statistics.len(),
+            schema.fields().len(),
+            "the column statistics vector length should be the number of fields"
         );
-        Self { stats, schema }
+        let cache = Self::compute_properties(schema.clone());
+        Self {
+            stats,
+            schema,
+            cache,
+        }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(2),
+            ExecutionMode::Bounded,
+        )
     }
 }
 
@@ -74,7 +90,7 @@ impl TableProvider for StatisticsValidation {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         // limit is ignored because it is not mandatory for a `TableProvider` to honor it
@@ -94,17 +110,16 @@ impl TableProvider for StatisticsValidation {
 
         let current_stat = self.stats.clone();
 
-        let proj_col_stats = current_stat
-            .column_statistics
-            .map(|col_stat| projection.iter().map(|i| col_stat[*i].clone()).collect());
-
+        let proj_col_stats = projection
+            .iter()
+            .map(|i| current_stat.column_statistics[*i].clone())
+            .collect();
         Ok(Arc::new(Self::new(
             Statistics {
-                is_exact: current_stat.is_exact,
                 num_rows: current_stat.num_rows,
                 column_statistics: proj_col_stats,
                 // TODO stats: knowing the type of the new columns we can guess the output size
-                total_byte_size: None,
+                total_byte_size: Precision::Absent,
             },
             projected_schema,
         )))
@@ -131,23 +146,19 @@ impl DisplayAs for StatisticsValidation {
 }
 
 impl ExecutionPlan for StatisticsValidation {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(2)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -166,8 +177,8 @@ impl ExecutionPlan for StatisticsValidation {
         unimplemented!("This plan only serves for testing statistics")
     }
 
-    fn statistics(&self) -> Statistics {
-        self.stats.clone()
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self.stats.clone())
     }
 }
 
@@ -182,23 +193,22 @@ fn init_ctx(stats: Statistics, schema: Schema) -> Result<SessionContext> {
 fn fully_defined() -> (Statistics, Schema) {
     (
         Statistics {
-            num_rows: Some(13),
-            is_exact: true,
-            total_byte_size: None, // ignore byte size for now
-            column_statistics: Some(vec![
+            num_rows: Precision::Exact(13),
+            total_byte_size: Precision::Absent, // ignore byte size for now
+            column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: Some(2),
-                    max_value: Some(ScalarValue::Int32(Some(1023))),
-                    min_value: Some(ScalarValue::Int32(Some(-24))),
-                    null_count: Some(0),
+                    distinct_count: Precision::Exact(2),
+                    max_value: Precision::Exact(ScalarValue::Int32(Some(1023))),
+                    min_value: Precision::Exact(ScalarValue::Int32(Some(-24))),
+                    null_count: Precision::Exact(0),
                 },
                 ColumnStatistics {
-                    distinct_count: Some(13),
-                    max_value: Some(ScalarValue::Int64(Some(5486))),
-                    min_value: Some(ScalarValue::Int64(Some(-6783))),
-                    null_count: Some(5),
+                    distinct_count: Precision::Exact(13),
+                    max_value: Precision::Exact(ScalarValue::Int64(Some(5486))),
+                    min_value: Precision::Exact(ScalarValue::Int64(Some(-6783))),
+                    null_count: Precision::Exact(5),
                 },
-            ]),
+            ],
         },
         Schema::new(vec![
             Field::new("c1", DataType::Int32, false),
@@ -216,7 +226,7 @@ async fn sql_basic() -> Result<()> {
     let physical_plan = df.create_physical_plan().await.unwrap();
 
     // the statistics should be those of the source
-    assert_eq!(stats, physical_plan.statistics());
+    assert_eq!(stats, physical_plan.statistics()?);
 
     Ok(())
 }
@@ -232,10 +242,8 @@ async fn sql_filter() -> Result<()> {
         .unwrap();
 
     let physical_plan = df.create_physical_plan().await.unwrap();
-
-    let stats = physical_plan.statistics();
-    assert!(!stats.is_exact);
-    assert_eq!(stats.num_rows, Some(1));
+    let stats = physical_plan.statistics()?;
+    assert_eq!(stats.num_rows, Precision::Inexact(1));
 
     Ok(())
 }
@@ -243,6 +251,7 @@ async fn sql_filter() -> Result<()> {
 #[tokio::test]
 async fn sql_limit() -> Result<()> {
     let (stats, schema) = fully_defined();
+    let col_stats = Statistics::unknown_column(&schema);
     let ctx = init_ctx(stats.clone(), schema)?;
 
     let df = ctx.sql("SELECT * FROM stats_table LIMIT 5").await.unwrap();
@@ -251,11 +260,11 @@ async fn sql_limit() -> Result<()> {
     // we loose all statistics except the for number of rows which becomes the limit
     assert_eq!(
         Statistics {
-            num_rows: Some(5),
-            is_exact: true,
-            ..Default::default()
+            num_rows: Precision::Exact(5),
+            column_statistics: col_stats,
+            total_byte_size: Precision::Absent
         },
-        physical_plan.statistics()
+        physical_plan.statistics()?
     );
 
     let df = ctx
@@ -264,7 +273,7 @@ async fn sql_limit() -> Result<()> {
         .unwrap();
     let physical_plan = df.create_physical_plan().await.unwrap();
     // when the limit is larger than the original number of lines, statistics remain unchanged
-    assert_eq!(stats, physical_plan.statistics());
+    assert_eq!(stats, physical_plan.statistics()?);
 
     Ok(())
 }
@@ -281,13 +290,12 @@ async fn sql_window() -> Result<()> {
 
     let physical_plan = df.create_physical_plan().await.unwrap();
 
-    let result = physical_plan.statistics();
+    let result = physical_plan.statistics()?;
 
     assert_eq!(stats.num_rows, result.num_rows);
-    assert!(result.column_statistics.is_some());
-    let col_stats = result.column_statistics.unwrap();
+    let col_stats = result.column_statistics;
     assert_eq!(2, col_stats.len());
-    assert_eq!(stats.column_statistics.unwrap()[1], col_stats[0]);
+    assert_eq!(stats.column_statistics[1], col_stats[0]);
 
     Ok(())
 }

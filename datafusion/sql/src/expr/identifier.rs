@@ -15,12 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{
-    internal_err, Column, DFField, DFSchema, DataFusionError, Result, TableReference,
-};
-use datafusion_expr::{Case, Expr};
+use arrow_schema::Field;
 use sqlparser::ast::{Expr as SQLExpr, Ident};
+
+use datafusion_common::{
+    internal_err, not_impl_err, plan_datafusion_err, Column, DFSchema, DataFusionError,
+    Result, TableReference,
+};
+use datafusion_expr::planner::PlannerResult;
+use datafusion_expr::{Case, Expr};
+
+use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use datafusion_expr::UNNAMED_TABLE;
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     pub(super) fn sql_identifier_to_expr(
@@ -33,12 +39,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             // TODO: figure out if ScalarVariables should be insensitive.
             let var_names = vec![id.value];
             let ty = self
-                .schema_provider
+                .context_provider
                 .get_variable_type(&var_names)
                 .ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "variable {var_names:?} has no type information"
-                    ))
+                    plan_datafusion_err!("variable {var_names:?} has no type information")
                 })?;
             Ok(Expr::ScalarVariable(ty, var_names))
         } else {
@@ -46,44 +50,37 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             // interpret names with '.' as if they were
             // compound identifiers, but this is not a compound
             // identifier. (e.g. it is "foo.bar" not foo.bar)
-            // let normalize_ident = self.normalizer.normalize_column(id);
+            // let normalize_ident = self.ident_normalizer.normalize(id);
             let normalize_ident = id.value;
-            match schema.field_with_unqualified_name(normalize_ident.as_str()) {
-                Ok(_) => {
-                    // found a match without a qualified name, this is a inner table column
-                    Ok(Expr::Column(Column {
-                        relation: None,
-                        name: normalize_ident,
-                    }))
-                }
-                Err(_) => {
-                    // check the outer_query_schema and try to find a match
-                    if let Some(outer) = planner_context.outer_query_schema() {
-                        match outer.field_with_unqualified_name(normalize_ident.as_str())
-                        {
-                            Ok(field) => {
-                                // found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
-                                Ok(Expr::OuterReferenceColumn(
-                                    field.data_type().clone(),
-                                    Column {
-                                        relation: field.qualifier().cloned(),
-                                        name: normalize_ident,
-                                    },
-                                ))
-                            }
-                            Err(_) => Ok(Expr::Column(Column {
-                                relation: None,
-                                name: normalize_ident,
-                            })),
-                        }
-                    } else {
-                        Ok(Expr::Column(Column {
-                            relation: None,
-                            name: normalize_ident,
-                        }))
-                    }
+
+            // Check for qualified field with unqualified name
+            if let Ok((qualifier, _)) =
+                schema.qualified_field_with_unqualified_name(normalize_ident.as_str())
+            {
+                return Ok(Expr::Column(Column {
+                    relation: qualifier.filter(|q| q.table() != UNNAMED_TABLE).cloned(),
+                    name: normalize_ident,
+                }));
+            }
+
+            // Check the outer query schema
+            if let Some(outer) = planner_context.outer_query_schema() {
+                if let Ok((qualifier, field)) =
+                    outer.qualified_field_with_unqualified_name(normalize_ident.as_str())
+                {
+                    // Found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
+                    return Ok(Expr::OuterReferenceColumn(
+                        field.data_type().clone(),
+                        Column::from((qualifier, normalize_ident)),
+                    ));
                 }
             }
+
+            // Default case
+            Ok(Expr::Column(Column {
+                relation: None,
+                name: normalize_ident,
+            }))
         }
     }
 
@@ -100,11 +97,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         if ids[0].value.starts_with('@') {
             let mut var_names: Vec<_> = ids
                 .into_iter()
-                .map(|id| self.normalizer.normalize(id))
+                .map(|id| self.ident_normalizer.normalize(id))
                 .collect();
             var_names.push(self.normalizer.normalize_column(col_name));
             let ty = self
-                .schema_provider
+                .context_provider
                 .get_variable_type(&var_names)
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
@@ -115,7 +112,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         } else {
             let mut ids = ids
                 .into_iter()
-                .map(|id| self.normalizer.normalize(id))
+                .map(|id| self.ident_normalizer.normalize(id))
                 .collect::<Vec<_>>();
             ids.push(col_name.value.clone());
 
@@ -123,57 +120,60 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             // Though ideally once that support is in place, this code should work with it
             // TODO: remove when can support multiple nested identifiers
             if ids.len() > 5 {
-                return internal_err!("Unsupported compound identifier: {ids:?}");
+                return not_impl_err!("Compound identifier: {ids:?}");
             }
 
             let search_result = search_dfschema(&ids, schema);
             match search_result {
                 // found matching field with spare identifier(s) for nested field(s) in structure
-                Some((field, nested_names)) if !nested_names.is_empty() => {
-                    // TODO: remove when can support multiple nested identifiers
-                    if nested_names.len() > 1 {
-                        return internal_err!(
-                            "Nested identifiers not yet supported for column {}",
-                            field.qualified_column().quoted_flat_name()
-                        );
+                Some((field, qualifier, nested_names)) if !nested_names.is_empty() => {
+                    // found matching field with spare identifier(s) for nested field(s) in structure
+                    for planner in self.context_provider.get_expr_planners() {
+                        if let Ok(planner_result) = planner.plan_compound_identifier(
+                            field,
+                            qualifier,
+                            nested_names,
+                        ) {
+                            match planner_result {
+                                PlannerResult::Planned(expr) => return Ok(expr),
+                                PlannerResult::Original(_args) => {}
+                            }
+                        }
                     }
-                    let nested_name = nested_names[0].to_string();
-                    Ok(Expr::Column(field.qualified_column()).field(nested_name))
+                    not_impl_err!(
+                        "Compound identifiers not supported by ExprPlanner: {ids:?}"
+                    )
                 }
                 // found matching field with no spare identifier(s)
-                Some((field, _nested_names)) => Ok(Expr::Column(Column {
-                    relation: field.qualifier().cloned(),
-                    name: col_name.value,
-                })),
+                Some((field, qualifier, _nested_names)) => {
+                    Ok(Expr::Column(Column::from((qualifier, col_name.value))))
+                }
                 None => {
                     // return default where use all identifiers to not have a nested field
                     // this len check is because at 5 identifiers will have to have a nested field
                     if ids.len() == 5 {
-                        internal_err!("Unsupported compound identifier: {ids:?}")
+                        not_impl_err!("compound identifier: {ids:?}")
                     } else {
                         // check the outer_query_schema and try to find a match
                         if let Some(outer) = planner_context.outer_query_schema() {
                             let search_result = search_dfschema(&ids, outer);
                             match search_result {
                                 // found matching field with spare identifier(s) for nested field(s) in structure
-                                Some((field, nested_names))
+                                Some((field, qualifier, nested_names))
                                     if !nested_names.is_empty() =>
                                 {
                                     // TODO: remove when can support nested identifiers for OuterReferenceColumn
-                                    internal_err!(
+                                    not_impl_err!(
                                         "Nested identifiers are not yet supported for OuterReferenceColumn {}",
-                                        field.qualified_column().quoted_flat_name()
+                                        Column::from((qualifier, field)).quoted_flat_name()
                                     )
                                 }
                                 // found matching field with no spare identifier(s)
-                                Some((field, _nested_names)) => {
+                                Some((field, qualifier, _nested_names)) => {
                                     // found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
                                     Ok(Expr::OuterReferenceColumn(
                                         field.data_type().clone(),
-                                        Column {
-                                            relation: field.qualifier().cloned(),
-                                            name: col_name.value,
-                                        },
+                                        Column::from((qualifier, col_name.value)),
                                     ))
                                 }
                                 // found no matching field, will return a default
@@ -182,8 +182,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                                     // safe unwrap as s can never be empty or exceed the bounds
                                     let (relation, column_name) =
                                         form_identifier(s).unwrap();
-                                    let relation =
-                                        relation.map(|r| r.to_owned_reference());
                                     Ok(Expr::Column(Column::new(relation, column_name)))
                                 }
                             }
@@ -191,7 +189,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             let s = &ids[0..ids.len()];
                             // safe unwrap as s can never be empty or exceed the bounds
                             let (relation, column_name) = form_identifier(s).unwrap();
-                            let relation = relation.map(|r| r.to_owned_reference());
                             Ok(Expr::Column(Column::new(relation, column_name)))
                         }
                     }
@@ -254,22 +251,22 @@ fn form_identifier(idents: &[String]) -> Result<(Option<TableReference>, &String
         1 => Ok((None, &idents[0])),
         2 => Ok((
             Some(TableReference::Bare {
-                table: (&idents[0]).into(),
+                table: idents[0].clone().into(),
             }),
             &idents[1],
         )),
         3 => Ok((
             Some(TableReference::Partial {
-                schema: (&idents[0]).into(),
-                table: (&idents[1]).into(),
+                schema: idents[0].clone().into(),
+                table: idents[1].clone().into(),
             }),
             &idents[2],
         )),
         4 => Ok((
             Some(TableReference::Full {
-                catalog: (&idents[0]).into(),
-                schema: (&idents[1]).into(),
-                table: (&idents[2]).into(),
+                catalog: idents[0].clone().into(),
+                schema: idents[1].clone().into(),
+                table: idents[2].clone().into(),
             }),
             &idents[3],
         )),
@@ -280,10 +277,16 @@ fn form_identifier(idents: &[String]) -> Result<(Option<TableReference>, &String
 fn search_dfschema<'ids, 'schema>(
     ids: &'ids [String],
     schema: &'schema DFSchema,
-) -> Option<(&'schema DFField, &'ids [String])> {
+) -> Option<(
+    &'schema Field,
+    Option<&'schema TableReference>,
+    &'ids [String],
+)> {
     generate_schema_search_terms(ids).find_map(|(qualifier, column, nested_names)| {
-        let field = schema.field_with_name(qualifier.as_ref(), column).ok();
-        field.map(|f| (f, nested_names))
+        let qualifier_and_field = schema
+            .qualified_field_with_name(qualifier.as_ref(), column)
+            .ok();
+        qualifier_and_field.map(|(qualifier, field)| (field, qualifier, nested_names))
     })
 }
 
@@ -341,7 +344,7 @@ mod test {
     // where ensure generated search terms are in correct order with correct values
     fn test_generate_schema_search_terms() -> Result<()> {
         type ExpectedItem = (
-            Option<TableReference<'static>>,
+            Option<TableReference>,
             &'static str,
             &'static [&'static str],
         );

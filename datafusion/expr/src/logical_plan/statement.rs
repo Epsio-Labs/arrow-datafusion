@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt::{self, Display};
-
 use datafusion_common::DFSchemaRef;
+use std::fmt::{self, Display};
 
 /// Various types of Statements.
 ///
@@ -26,7 +25,7 @@ use datafusion_common::DFSchemaRef;
 /// While DataFusion does not offer support transactions, it provides
 /// [`LogicalPlan`](crate::LogicalPlan) support to assist building
 /// database systems using DataFusion
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Statement {
     // Begin a transaction
     TransactionStart(TransactionStart),
@@ -116,7 +115,7 @@ pub enum TransactionIsolationLevel {
 }
 
 /// Indicator that the following statements should be committed or rolled back atomically
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransactionStart {
     /// indicates if transaction is allowed to write
     pub access_mode: TransactionAccessMode,
@@ -127,7 +126,7 @@ pub struct TransactionStart {
 }
 
 /// Indicator that any current transaction should be terminated
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransactionEnd {
     /// whether the transaction committed or aborted
     pub conclusion: TransactionConclusion,
@@ -139,7 +138,7 @@ pub struct TransactionEnd {
 
 /// Set a Variable's value -- value in
 /// [`ConfigOptions`](datafusion_common::config::ConfigOptions)
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SetVariable {
     /// The variable name
     pub variable: String,

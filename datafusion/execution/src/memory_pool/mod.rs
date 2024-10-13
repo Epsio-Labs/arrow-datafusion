@@ -15,40 +15,73 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Manages all available memory during query execution
+//! [`MemoryPool`] for memory management during query execution, [`proxy]` for
+//! help with allocation accounting.
 
-use datafusion_common::Result;
+use datafusion_common::{internal_err, Result};
 use std::{cmp::Ordering, sync::Arc};
 
 mod pool;
-pub mod proxy;
+pub mod proxy {
+    pub use datafusion_common::utils::proxy::{RawTableAllocExt, VecAllocExt};
+}
 
 pub use pool::*;
 
-/// The pool of memory on which [`MemoryReservation`]s record their
-/// memory reservations.
+/// Tracks and potentially limits memory use across operators during execution.
 ///
-/// DataFusion is a streaming query engine, processing most queries
-/// without buffering the entire input. However, certain operations
-/// such as sorting and grouping/joining with a large number of
-/// distinct groups/keys, can require buffering intermediate results
-/// and for large datasets this can require large amounts of memory.
+/// # Memory Management Overview
 ///
-/// In order to avoid allocating memory until the OS or the container
-/// system kills the process, DataFusion operators only allocate
-/// memory they are able to reserve from the configured
-/// [`MemoryPool`]. Once the memory tracked by the pool is exhausted,
-/// operators must either free memory by spilling to local disk or
-/// error.
+/// DataFusion is a streaming query engine, processing most queries without
+/// buffering the entire input. Most operators require a fixed amount of memory
+/// based on the schema and target batch size. However, certain operations such
+/// as sorting and grouping/joining, require buffering intermediate results,
+/// which can require memory proportional to the number of input rows.
 ///
-/// A `MemoryPool` can be shared by concurrently executing plans in
-/// the same process to control memory usage in a multi-tenant system.
+/// Rather than tracking all allocations, DataFusion takes a pragmatic approach:
+/// Intermediate memory used as data streams through the system is not accounted
+/// (it assumed to be "small") but the large consumers of memory must register
+/// and constrain their use. This design trades off the additional code
+/// complexity of memory tracking with limiting resource usage.
 ///
-/// The following memory pool implementations are available:
+/// When limiting memory with a `MemoryPool` you should typically reserve some
+/// overhead (e.g. 10%) for the "small" memory allocations that are not tracked.
 ///
-/// * [`UnboundedMemoryPool`](pool::UnboundedMemoryPool)
-/// * [`GreedyMemoryPool`](pool::GreedyMemoryPool)
-/// * [`FairSpillPool`](pool::FairSpillPool)
+/// # Memory Management Design
+///
+/// As explained above, DataFusion's design ONLY limits operators that require
+/// "large" amounts of memory (proportional to number of input rows), such as
+/// `GroupByHashExec`. It does NOT track and limit memory used internally by
+/// other operators such as `ParquetExec` or the `RecordBatch`es that flow
+/// between operators.
+///
+/// In order to avoid allocating memory until the OS or the container system
+/// kills the process, DataFusion `ExecutionPlan`s (operators) that consume
+/// large amounts of memory must first request their desired allocation from a
+/// [`MemoryPool`] before allocating more.  The request is typically managed via
+/// a  [`MemoryReservation`] and [`MemoryConsumer`].
+///
+/// If the allocation is successful, the operator should proceed and allocate
+/// the desired memory. If the allocation fails, the operator must either first
+/// free memory (e.g. by spilling to local disk) and try again, or error.
+///
+/// Note that a `MemoryPool` can be shared by concurrently executing plans,
+/// which can be used to control memory usage in a multi-tenant system.
+///
+/// # Implementing `MemoryPool`
+///
+/// You can implement a custom allocation policy by implementing the
+/// [`MemoryPool`] trait and configuring a `SessionContext` appropriately.
+/// However, mDataFusion comes with the following simple memory pool implementations that
+/// handle many common cases:
+///
+/// * [`UnboundedMemoryPool`]: no memory limits (the default)
+///
+/// * [`GreedyMemoryPool`]: Limits memory usage to a fixed size using a "first
+///   come first served" policy
+///
+/// * [`FairSpillPool`]: Limits memory usage to a fixed size, allocating memory
+///   to all spilling operators fairly
 pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     /// Registers a new [`MemoryConsumer`]
     ///
@@ -77,10 +110,14 @@ pub trait MemoryPool: Send + Sync + std::fmt::Debug {
     fn reserved(&self) -> usize;
 }
 
-/// A memory consumer that can be tracked by [`MemoryReservation`] in
-/// a [`MemoryPool`]. All allocations are registered to a particular
-/// `MemoryConsumer`;
-#[derive(Debug)]
+/// A memory consumer is a named allocation traced by a particular
+/// [`MemoryReservation`] in a [`MemoryPool`]. All allocations are registered to
+/// a particular `MemoryConsumer`;
+///
+/// For help with allocation accounting, see the [proxy] module.
+///
+/// [proxy]: crate::memory_pool::proxy
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct MemoryConsumer {
     name: String,
     can_spill: bool,
@@ -157,6 +194,11 @@ impl MemoryReservation {
         self.size
     }
 
+    /// Returns [MemoryConsumer] for this [MemoryReservation]
+    pub fn consumer(&self) -> &MemoryConsumer {
+        &self.registration.consumer
+    }
+
     /// Frees all bytes from this reservation back to the underlying
     /// pool, returning the number of bytes freed.
     pub fn free(&mut self) -> usize {
@@ -176,6 +218,23 @@ impl MemoryReservation {
         let new_size = self.size.checked_sub(capacity).unwrap();
         self.registration.pool.shrink(self, capacity);
         self.size = new_size
+    }
+
+    /// Tries to free `capacity` bytes from this reservation
+    /// if `capacity` does not exceed [`Self::size`]
+    /// Returns new reservation size
+    /// or error if shrinking capacity is more than allocated size
+    pub fn try_shrink(&mut self, capacity: usize) -> Result<usize> {
+        if let Some(new_size) = self.size.checked_sub(capacity) {
+            self.registration.pool.shrink(self, capacity);
+            self.size = new_size;
+            Ok(new_size)
+        } else {
+            internal_err!(
+                "Cannot free the capacity {capacity} out of allocated size {}",
+                self.size
+            )
+        }
     }
 
     /// Sets the size of this reservation to `capacity`
@@ -226,15 +285,15 @@ impl MemoryReservation {
         self.size = self.size.checked_sub(capacity).unwrap();
         Self {
             size: capacity,
-            registration: self.registration.clone(),
+            registration: Arc::clone(&self.registration),
         }
     }
 
-    /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]
+    /// Returns a new empty [`MemoryReservation`] with the same [`MemoryConsumer`]
     pub fn new_empty(&self) -> Self {
         Self {
             size: 0,
-            registration: self.registration.clone(),
+            registration: Arc::clone(&self.registration),
         }
     }
 

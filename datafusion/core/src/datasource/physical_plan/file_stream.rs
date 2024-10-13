@@ -25,12 +25,10 @@ use std::collections::VecDeque;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Instant;
 
 use crate::datasource::listing::PartitionedFile;
-use crate::datasource::physical_plan::{
-    FileMeta, FileScanConfig, PartitionColumnProjector,
-};
+use crate::datasource::physical_plan::file_scan_config::PartitionColumnProjector;
+use crate::datasource::physical_plan::{FileMeta, FileScanConfig};
 use crate::error::Result;
 use crate::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, Time,
@@ -40,6 +38,7 @@ use crate::physical_plan::RecordBatchStream;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::instant::Instant;
 use datafusion_common::ScalarValue;
 
 use futures::future::BoxFuture;
@@ -83,11 +82,9 @@ pub struct FileStream<F: FileOpener> {
     projected_schema: SchemaRef,
     /// The remaining number of records to parse, None if no limit
     remain: Option<usize>,
-    /// A closure that takes a reader and an optional remaining number of lines
-    /// (before reaching the limit) and returns a batch iterator. If the file reader
-    /// is not capable of limiting the number of records in the last batch, the file
-    /// stream will take care of truncating it.
-    file_reader: F,
+    /// A generic [`FileOpener`]. Calling `open()` returns a [`FileOpenFuture`],
+    /// which can be resolved to a stream of `RecordBatch`.
+    file_opener: F,
     /// The partition column projector
     pc_projector: PartitionColumnProjector,
     /// The stream state
@@ -112,7 +109,7 @@ enum FileStreamState {
     /// The idle state, no file is currently being read
     Idle,
     /// Currently performing asynchronous IO to obtain a stream of RecordBatch
-    /// for a given parquet file
+    /// for a given file
     Open {
         /// A [`FileOpenFuture`] returned by [`FileOpener::open`]
         future: FileOpenFuture,
@@ -250,7 +247,7 @@ impl<F: FileOpener> FileStream<F> {
     pub fn new(
         config: &FileScanConfig,
         partition: usize,
-        file_reader: F,
+        file_opener: F,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let (projected_schema, ..) = config.project();
@@ -259,7 +256,7 @@ impl<F: FileOpener> FileStream<F> {
             &config
                 .table_partition_cols
                 .iter()
-                .map(|x| x.0.clone())
+                .map(|x| x.name().clone())
                 .collect::<Vec<_>>(),
         );
 
@@ -269,7 +266,7 @@ impl<F: FileOpener> FileStream<F> {
             file_iter: files.into(),
             projected_schema,
             remain: config.limit,
-            file_reader,
+            file_opener,
             pc_projector,
             state: FileStreamState::Idle,
             file_stream_metrics: FileStreamMetrics::new(metrics, partition),
@@ -301,7 +298,7 @@ impl<F: FileOpener> FileStream<F> {
         };
 
         Some(
-            self.file_reader
+            self.file_opener
                 .open(file_meta)
                 .map(|future| (future, part_file.partition_values)),
         )
@@ -518,27 +515,16 @@ impl<F: FileOpener> RecordBatchStream for FileStream<F> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::Schema;
-    use datafusion_common::internal_err;
-    use datafusion_common::DataFusionError;
-
-    use super::*;
-    use crate::datasource::file_format::write::BatchSerializer;
-    use crate::datasource::object_store::ObjectStoreUrl;
-    use crate::datasource::physical_plan::FileMeta;
-    use crate::physical_plan::metrics::ExecutionPlanMetricsSet;
-    use crate::prelude::SessionContext;
-    use crate::{
-        error::Result,
-        test::{make_partition, object_store::register_test_store},
-    };
-
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use bytes::Bytes;
-    use futures::StreamExt;
+    use super::*;
+    use crate::datasource::object_store::ObjectStoreUrl;
+    use crate::prelude::SessionContext;
+    use crate::test::{make_partition, object_store::register_test_store};
+
+    use arrow_schema::Schema;
+    use datafusion_common::internal_err;
 
     /// Test `FileOpener` which will simulate errors during file opening or scanning
     #[derive(Default)]
@@ -560,7 +546,7 @@ mod tests {
             if self.error_opening_idx.contains(&idx) {
                 Ok(futures::future::ready(internal_err!("error opening")).boxed())
             } else if self.error_scanning_idx.contains(&idx) {
-                let error = futures::future::ready(Err(ArrowError::IoError(
+                let error = futures::future::ready(Err(ArrowError::IpcError(
                     "error scanning".to_owned(),
                 )));
                 let stream = futures::stream::once(error).boxed();
@@ -657,17 +643,12 @@ mod tests {
 
             let on_error = self.on_error;
 
-            let config = FileScanConfig {
-                object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
+            let config = FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
                 file_schema,
-                file_groups: vec![file_group],
-                statistics: Default::default(),
-                projection: None,
-                limit: self.limit,
-                table_partition_cols: vec![],
-                output_ordering: vec![],
-                infinite_source: false,
-            };
+            )
+            .with_file_group(file_group)
+            .with_limit(self.limit);
             let metrics_set = ExecutionPlanMetricsSet::new();
             let file_stream = FileStream::new(&config, 0, self.opener, &metrics_set)
                 .unwrap()
@@ -985,16 +966,5 @@ mod tests {
         ], &batches);
 
         Ok(())
-    }
-
-    struct TestSerializer {
-        bytes: Bytes,
-    }
-
-    #[async_trait]
-    impl BatchSerializer for TestSerializer {
-        async fn serialize(&mut self, _batch: RecordBatch) -> Result<Bytes> {
-            Ok(self.bytes.clone())
-        }
     }
 }

@@ -18,11 +18,13 @@
 //! Simplifier implementation for [`ExprSimplifier::with_guarantees()`]
 //!
 //! [`ExprSimplifier::with_guarantees()`]: crate::simplify_expressions::expr_simplifier::ExprSimplifier::with_guarantees
-use datafusion_common::{tree_node::TreeNodeRewriter, DataFusionError, Result};
-use datafusion_expr::{expr::InList, lit, Between, BinaryExpr, Expr};
-use std::collections::HashMap;
 
-use datafusion_physical_expr::intervals::{Interval, IntervalBound, NullableInterval};
+use std::{borrow::Cow, collections::HashMap};
+
+use datafusion_common::tree_node::{Transformed, TreeNodeRewriter};
+use datafusion_common::{DataFusionError, Result};
+use datafusion_expr::interval_arithmetic::{Interval, NullableInterval};
+use datafusion_expr::{expr::InList, lit, Between, BinaryExpr, Expr};
 
 /// Rewrite expressions to incorporate guarantees.
 ///
@@ -37,7 +39,7 @@ use datafusion_physical_expr::intervals::{Interval, IntervalBound, NullableInter
 /// See a full example in [`ExprSimplifier::with_guarantees()`].
 ///
 /// [`ExprSimplifier::with_guarantees()`]: crate::simplify_expressions::expr_simplifier::ExprSimplifier::with_guarantees
-pub(crate) struct GuaranteeRewriter<'a> {
+pub struct GuaranteeRewriter<'a> {
     guarantees: HashMap<&'a Expr, &'a NullableInterval>,
 }
 
@@ -46,29 +48,35 @@ impl<'a> GuaranteeRewriter<'a> {
         guarantees: impl IntoIterator<Item = &'a (Expr, NullableInterval)>,
     ) -> Self {
         Self {
+            // TODO: Clippy wants the "map" call removed, but doing so generates
+            //       a compilation error. Remove the clippy directive once this
+            //       issue is fixed.
+            #[allow(clippy::map_identity)]
             guarantees: guarantees.into_iter().map(|(k, v)| (k, v)).collect(),
         }
     }
 }
 
 impl<'a> TreeNodeRewriter for GuaranteeRewriter<'a> {
-    type N = Expr;
+    type Node = Expr;
 
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         if self.guarantees.is_empty() {
-            return Ok(expr);
+            return Ok(Transformed::no(expr));
         }
 
         match &expr {
             Expr::IsNull(inner) => match self.guarantees.get(inner.as_ref()) {
-                Some(NullableInterval::Null { .. }) => Ok(lit(true)),
-                Some(NullableInterval::NotNull { .. }) => Ok(lit(false)),
-                _ => Ok(expr),
+                Some(NullableInterval::Null { .. }) => Ok(Transformed::yes(lit(true))),
+                Some(NullableInterval::NotNull { .. }) => {
+                    Ok(Transformed::yes(lit(false)))
+                }
+                _ => Ok(Transformed::no(expr)),
             },
             Expr::IsNotNull(inner) => match self.guarantees.get(inner.as_ref()) {
-                Some(NullableInterval::Null { .. }) => Ok(lit(false)),
-                Some(NullableInterval::NotNull { .. }) => Ok(lit(true)),
-                _ => Ok(expr),
+                Some(NullableInterval::Null { .. }) => Ok(Transformed::yes(lit(false))),
+                Some(NullableInterval::NotNull { .. }) => Ok(Transformed::yes(lit(true))),
+                _ => Ok(Transformed::no(expr)),
             },
             Expr::Between(Between {
                 expr: inner,
@@ -82,71 +90,71 @@ impl<'a> TreeNodeRewriter for GuaranteeRewriter<'a> {
                     high.as_ref(),
                 ) {
                     let expr_interval = NullableInterval::NotNull {
-                        values: Interval::new(
-                            IntervalBound::new(low.clone(), false),
-                            IntervalBound::new(high.clone(), false),
-                        ),
+                        values: Interval::try_new(low.clone(), high.clone())?,
                     };
 
                     let contains = expr_interval.contains(*interval)?;
 
                     if contains.is_certainly_true() {
-                        Ok(lit(!negated))
+                        Ok(Transformed::yes(lit(!negated)))
                     } else if contains.is_certainly_false() {
-                        Ok(lit(*negated))
+                        Ok(Transformed::yes(lit(*negated)))
                     } else {
-                        Ok(expr)
+                        Ok(Transformed::no(expr))
                     }
                 } else {
-                    Ok(expr)
+                    Ok(Transformed::no(expr))
                 }
             }
 
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                // We only support comparisons for now
-                if !op.is_comparison_operator() {
-                    return Ok(expr);
-                };
-
-                // Check if this is a comparison between a column and literal
-                let (col, op, value) = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Column(_), Expr::Literal(value)) => (left, *op, value),
-                    (Expr::Literal(value), Expr::Column(_)) => {
-                        // If we can swap the op, we can simplify the expression
-                        if let Some(op) = op.swap() {
-                            (right, op, value)
+                // The left or right side of expression might either have a guarantee
+                // or be a literal. Either way, we can resolve them to a NullableInterval.
+                let left_interval = self
+                    .guarantees
+                    .get(left.as_ref())
+                    .map(|interval| Cow::Borrowed(*interval))
+                    .or_else(|| {
+                        if let Expr::Literal(value) = left.as_ref() {
+                            Some(Cow::Owned(value.clone().into()))
                         } else {
-                            return Ok(expr);
+                            None
+                        }
+                    });
+                let right_interval = self
+                    .guarantees
+                    .get(right.as_ref())
+                    .map(|interval| Cow::Borrowed(*interval))
+                    .or_else(|| {
+                        if let Expr::Literal(value) = right.as_ref() {
+                            Some(Cow::Owned(value.clone().into()))
+                        } else {
+                            None
+                        }
+                    });
+
+                match (left_interval, right_interval) {
+                    (Some(left_interval), Some(right_interval)) => {
+                        let result =
+                            left_interval.apply_operator(op, right_interval.as_ref())?;
+                        if result.is_certainly_true() {
+                            Ok(Transformed::yes(lit(true)))
+                        } else if result.is_certainly_false() {
+                            Ok(Transformed::yes(lit(false)))
+                        } else {
+                            Ok(Transformed::no(expr))
                         }
                     }
-                    _ => return Ok(expr),
-                };
-
-                if let Some(col_interval) = self.guarantees.get(col.as_ref()) {
-                    let result =
-                        col_interval.apply_operator(&op, &value.clone().into())?;
-                    if result.is_certainly_true() {
-                        Ok(lit(true))
-                    } else if result.is_certainly_false() {
-                        Ok(lit(false))
-                    } else {
-                        Ok(expr)
-                    }
-                } else {
-                    Ok(expr)
+                    _ => Ok(Transformed::no(expr)),
                 }
             }
 
             // Columns (if interval is collapsed to a single value)
             Expr::Column(_) => {
-                if let Some(col_interval) = self.guarantees.get(&expr) {
-                    if let Some(value) = col_interval.single_value() {
-                        Ok(lit(value))
-                    } else {
-                        Ok(expr)
-                    }
+                if let Some(interval) = self.guarantees.get(&expr) {
+                    Ok(Transformed::yes(interval.single_value().map_or(expr, lit)))
                 } else {
-                    Ok(expr)
+                    Ok(Transformed::no(expr))
                 }
             }
 
@@ -162,7 +170,7 @@ impl<'a> TreeNodeRewriter for GuaranteeRewriter<'a> {
                         .filter_map(|expr| {
                             if let Expr::Literal(item) = expr {
                                 match interval
-                                    .contains(&NullableInterval::from(item.clone()))
+                                    .contains(NullableInterval::from(item.clone()))
                                 {
                                     // If we know for certain the value isn't in the column's interval,
                                     // we can skip checking it.
@@ -176,17 +184,17 @@ impl<'a> TreeNodeRewriter for GuaranteeRewriter<'a> {
                         })
                         .collect::<Result<_, DataFusionError>>()?;
 
-                    Ok(Expr::InList(InList {
+                    Ok(Transformed::yes(Expr::InList(InList {
                         expr: inner.clone(),
                         list: new_list,
                         negated: *negated,
-                    }))
+                    })))
                 } else {
-                    Ok(expr)
+                    Ok(Transformed::no(expr))
                 }
             }
 
-            _ => Ok(expr),
+            _ => Ok(Transformed::no(expr)),
         }
     }
 }
@@ -196,8 +204,9 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::DataType;
-    use datafusion_common::{tree_node::TreeNode, ScalarValue};
-    use datafusion_expr::{col, lit, Operator};
+    use datafusion_common::tree_node::{TransformedResult, TreeNode};
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::{col, Operator};
 
     #[test]
     fn test_null_handling() {
@@ -208,7 +217,7 @@ mod tests {
             (
                 col("x"),
                 NullableInterval::NotNull {
-                    values: Default::default(),
+                    values: Interval::make_unbounded(&DataType::Boolean).unwrap(),
                 },
             ),
         ];
@@ -216,12 +225,12 @@ mod tests {
 
         // x IS NULL => guaranteed false
         let expr = col("x").is_null();
-        let output = expr.clone().rewrite(&mut rewriter).unwrap();
+        let output = expr.rewrite(&mut rewriter).data().unwrap();
         assert_eq!(output, lit(false));
 
         // x IS NOT NULL => guaranteed true
         let expr = col("x").is_not_null();
-        let output = expr.clone().rewrite(&mut rewriter).unwrap();
+        let output = expr.rewrite(&mut rewriter).data().unwrap();
         assert_eq!(output, lit(true));
     }
 
@@ -231,7 +240,7 @@ mod tests {
         T: Clone,
     {
         for (expr, expected_value) in cases {
-            let output = expr.clone().rewrite(rewriter).unwrap();
+            let output = expr.clone().rewrite(rewriter).data().unwrap();
             let expected = lit(ScalarValue::from(expected_value.clone()));
             assert_eq!(
                 output, expected,
@@ -243,7 +252,7 @@ mod tests {
 
     fn validate_unchanged_cases(rewriter: &mut GuaranteeRewriter, cases: &[Expr]) {
         for expr in cases {
-            let output = expr.clone().rewrite(rewriter).unwrap();
+            let output = expr.clone().rewrite(rewriter).data().unwrap();
             assert_eq!(
                 &output, expr,
                 "{} was simplified to {}, but expected it to be unchanged",
@@ -253,76 +262,17 @@ mod tests {
     }
 
     #[test]
-    fn test_inequalities_non_null_bounded() {
-        let guarantees = vec![
-            // x ∈ (1, 3] (not null)
-            (
-                col("x"),
-                NullableInterval::NotNull {
-                    values: Interval::make(Some(1_i32), Some(3_i32), (true, false)),
-                },
-            ),
-        ];
-
-        let mut rewriter = GuaranteeRewriter::new(guarantees.iter());
-
-        // (original_expr, expected_simplification)
-        let simplified_cases = &[
-            (col("x").lt_eq(lit(1)), false),
-            (col("x").lt_eq(lit(3)), true),
-            (col("x").gt(lit(3)), false),
-            (col("x").gt(lit(1)), true),
-            (col("x").eq(lit(0)), false),
-            (col("x").not_eq(lit(0)), true),
-            (col("x").between(lit(2), lit(5)), true),
-            (col("x").between(lit(2), lit(3)), true),
-            (col("x").between(lit(5), lit(10)), false),
-            (col("x").not_between(lit(2), lit(5)), false),
-            (col("x").not_between(lit(2), lit(3)), false),
-            (col("x").not_between(lit(5), lit(10)), true),
-            (
-                Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(col("x")),
-                    op: Operator::IsDistinctFrom,
-                    right: Box::new(lit(ScalarValue::Null)),
-                }),
-                true,
-            ),
-            (
-                Expr::BinaryExpr(BinaryExpr {
-                    left: Box::new(col("x")),
-                    op: Operator::IsDistinctFrom,
-                    right: Box::new(lit(5)),
-                }),
-                true,
-            ),
-        ];
-
-        validate_simplified_cases(&mut rewriter, simplified_cases);
-
-        let unchanged_cases = &[
-            col("x").gt(lit(2)),
-            col("x").lt_eq(lit(2)),
-            col("x").eq(lit(2)),
-            col("x").not_eq(lit(2)),
-            col("x").between(lit(3), lit(5)),
-            col("x").not_between(lit(3), lit(10)),
-        ];
-
-        validate_unchanged_cases(&mut rewriter, unchanged_cases);
-    }
-
-    #[test]
     fn test_inequalities_non_null_unbounded() {
         let guarantees = vec![
             // y ∈ [2021-01-01, ∞) (not null)
             (
                 col("x"),
                 NullableInterval::NotNull {
-                    values: Interval::new(
-                        IntervalBound::new(ScalarValue::Date32(Some(18628)), false),
-                        IntervalBound::make_unbounded(DataType::Date32).unwrap(),
-                    ),
+                    values: Interval::try_new(
+                        ScalarValue::Date32(Some(18628)),
+                        ScalarValue::Date32(None),
+                    )
+                    .unwrap(),
                 },
             ),
         ];
@@ -397,7 +347,11 @@ mod tests {
             (
                 col("x"),
                 NullableInterval::MaybeNull {
-                    values: Interval::make(Some("abc"), Some("def"), (true, false)),
+                    values: Interval::try_new(
+                        ScalarValue::from("abc"),
+                        ScalarValue::from("def"),
+                    )
+                    .unwrap(),
                 },
             ),
         ];
@@ -451,7 +405,7 @@ mod tests {
             ScalarValue::Int32(Some(1)),
             ScalarValue::Boolean(Some(true)),
             ScalarValue::Boolean(None),
-            ScalarValue::Utf8(Some("abc".to_string())),
+            ScalarValue::from("abc"),
             ScalarValue::LargeUtf8(Some("def".to_string())),
             ScalarValue::Date32(Some(18628)),
             ScalarValue::Date32(None),
@@ -462,7 +416,7 @@ mod tests {
             let guarantees = vec![(col("x"), NullableInterval::from(scalar.clone()))];
             let mut rewriter = GuaranteeRewriter::new(guarantees.iter());
 
-            let output = col("x").rewrite(&mut rewriter).unwrap();
+            let output = col("x").rewrite(&mut rewriter).data().unwrap();
             assert_eq!(output, Expr::Literal(scalar.clone()));
         }
     }
@@ -470,11 +424,15 @@ mod tests {
     #[test]
     fn test_in_list() {
         let guarantees = vec![
-            // x ∈ [1, 10) (not null)
+            // x ∈ [1, 10] (not null)
             (
                 col("x"),
                 NullableInterval::NotNull {
-                    values: Interval::make(Some(1_i32), Some(10_i32), (false, true)),
+                    values: Interval::try_new(
+                        ScalarValue::Int32(Some(1)),
+                        ScalarValue::Int32(Some(10)),
+                    )
+                    .unwrap(),
                 },
             ),
         ];
@@ -486,8 +444,8 @@ mod tests {
         let cases = &[
             // x IN (9, 11) => x IN (9)
             ("x", vec![9, 11], false, vec![9]),
-            // x IN (10, 2) => x IN (2)
-            ("x", vec![10, 2], false, vec![2]),
+            // x IN (10, 2) => x IN (10, 2)
+            ("x", vec![10, 2], false, vec![10, 2]),
             // x NOT IN (9, 11) => x NOT IN (9)
             ("x", vec![9, 11], true, vec![9]),
             // x NOT IN (0, 22) => x NOT IN ()
@@ -502,7 +460,7 @@ mod tests {
                     .collect(),
                 *negated,
             );
-            let output = expr.clone().rewrite(&mut rewriter).unwrap();
+            let output = expr.clone().rewrite(&mut rewriter).data().unwrap();
             let expected_list = expected_list
                 .iter()
                 .map(|v| lit(ScalarValue::Int32(Some(*v))))

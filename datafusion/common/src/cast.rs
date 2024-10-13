@@ -24,17 +24,19 @@ use crate::{downcast_value, DataFusionError, Result};
 use arrow::{
     array::{
         Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array,
-        Float64Array, GenericBinaryArray, GenericListArray, GenericStringArray,
-        Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
-        IntervalYearMonthArray, LargeListArray, ListArray, MapArray, NullArray,
-        OffsetSizeTrait, PrimitiveArray, StringArray, StructArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt32Array, UInt64Array, UInt8Array, UnionArray,
+        Decimal256Array, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Float32Array, Float64Array, GenericBinaryArray, GenericListArray,
+        GenericStringArray, Int32Array, Int64Array, IntervalDayTimeArray,
+        IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeListArray, ListArray,
+        MapArray, NullArray, OffsetSizeTrait, PrimitiveArray, StringArray, StructArray,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt32Array, UInt64Array,
+        UInt8Array, UnionArray,
     },
     datatypes::{ArrowDictionaryKeyType, ArrowPrimitiveType},
 };
-use arrow_array::Decimal256Array;
+use arrow_array::{BinaryViewArray, StringViewArray};
 
 // Downcast ArrayRef to Date32Array
 pub fn as_date32_array(array: &dyn Array) -> Result<&Date32Array> {
@@ -84,6 +86,11 @@ pub fn as_float64_array(array: &dyn Array) -> Result<&Float64Array> {
 // Downcast ArrayRef to StringArray
 pub fn as_string_array(array: &dyn Array) -> Result<&StringArray> {
     Ok(downcast_value!(array, StringArray))
+}
+
+// Downcast ArrayRef to StringViewArray
+pub fn as_string_view_array(array: &dyn Array) -> Result<&StringViewArray> {
+    Ok(downcast_value!(array, StringViewArray))
 }
 
 // Downcast ArrayRef to UInt32Array
@@ -154,6 +161,26 @@ pub fn as_union_array(array: &dyn Array) -> Result<&UnionArray> {
     Ok(downcast_value!(array, UnionArray))
 }
 
+// Downcast ArrayRef to Time32SecondArray
+pub fn as_time32_second_array(array: &dyn Array) -> Result<&Time32SecondArray> {
+    Ok(downcast_value!(array, Time32SecondArray))
+}
+
+// Downcast ArrayRef to Time32MillisecondArray
+pub fn as_time32_millisecond_array(array: &dyn Array) -> Result<&Time32MillisecondArray> {
+    Ok(downcast_value!(array, Time32MillisecondArray))
+}
+
+// Downcast ArrayRef to Time64MicrosecondArray
+pub fn as_time64_microsecond_array(array: &dyn Array) -> Result<&Time64MicrosecondArray> {
+    Ok(downcast_value!(array, Time64MicrosecondArray))
+}
+
+// Downcast ArrayRef to Time64NanosecondArray
+pub fn as_time64_nanosecond_array(array: &dyn Array) -> Result<&Time64NanosecondArray> {
+    Ok(downcast_value!(array, Time64NanosecondArray))
+}
+
 // Downcast ArrayRef to TimestampNanosecondArray
 pub fn as_timestamp_nanosecond_array(
     array: &dyn Array,
@@ -181,29 +208,28 @@ pub fn as_timestamp_second_array(array: &dyn Array) -> Result<&TimestampSecondAr
 }
 
 // Downcast ArrayRef to IntervalYearMonthArray
-pub fn as_interval_ym_array(
-    array: &dyn Array,
-) -> Result<&IntervalYearMonthArray, DataFusionError> {
+pub fn as_interval_ym_array(array: &dyn Array) -> Result<&IntervalYearMonthArray> {
     Ok(downcast_value!(array, IntervalYearMonthArray))
 }
 
 // Downcast ArrayRef to IntervalDayTimeArray
-pub fn as_interval_dt_array(
-    array: &dyn Array,
-) -> Result<&IntervalDayTimeArray, DataFusionError> {
+pub fn as_interval_dt_array(array: &dyn Array) -> Result<&IntervalDayTimeArray> {
     Ok(downcast_value!(array, IntervalDayTimeArray))
 }
 
 // Downcast ArrayRef to IntervalMonthDayNanoArray
-pub fn as_interval_mdn_array(
-    array: &dyn Array,
-) -> Result<&IntervalMonthDayNanoArray, DataFusionError> {
+pub fn as_interval_mdn_array(array: &dyn Array) -> Result<&IntervalMonthDayNanoArray> {
     Ok(downcast_value!(array, IntervalMonthDayNanoArray))
 }
 
 // Downcast ArrayRef to BinaryArray
 pub fn as_binary_array(array: &dyn Array) -> Result<&BinaryArray> {
     Ok(downcast_value!(array, BinaryArray))
+}
+
+// Downcast ArrayRef to BinaryViewArray
+pub fn as_binary_view_array(array: &dyn Array) -> Result<&BinaryViewArray> {
+    Ok(downcast_value!(array, BinaryViewArray))
 }
 
 // Downcast ArrayRef to FixedSizeListArray
