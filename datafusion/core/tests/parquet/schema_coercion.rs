@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_array::types::Int32Type;
@@ -25,13 +27,12 @@ use datafusion::datasource::physical_plan::{FileScanConfig, ParquetExec};
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
-use datafusion_common::Statistics;
 use datafusion_execution::object_store::ObjectStoreUrl;
+
 use object_store::path::Path;
 use object_store::ObjectMeta;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 /// Test for reading data from multiple parquet files with different schemas and coercing them into a single schema.
@@ -50,7 +51,7 @@ async fn multi_parquet_coercion() {
     let batch2 = RecordBatch::try_from_iter(vec![("c2", c2), ("c3", c3)]).unwrap();
 
     let (meta, _files) = store_parquet(vec![batch1, batch2]).await.unwrap();
-    let file_groups = meta.into_iter().map(Into::into).collect();
+    let file_group = meta.into_iter().map(Into::into).collect();
 
     // cast c1 to utf8, c2 to int32, c3 to float64
     let file_schema = Arc::new(Schema::new(vec![
@@ -58,21 +59,11 @@ async fn multi_parquet_coercion() {
         Field::new("c2", DataType::Int32, true),
         Field::new("c3", DataType::Float64, true),
     ]));
-    let parquet_exec = ParquetExec::new(
-        FileScanConfig {
-            object_store_url: ObjectStoreUrl::local_filesystem(),
-            file_groups: vec![file_groups],
-            file_schema,
-            statistics: Statistics::default(),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-            infinite_source: false,
-        },
-        None,
-        None,
-    );
+    let parquet_exec = ParquetExec::builder(
+        FileScanConfig::new(ObjectStoreUrl::local_filesystem(), file_schema)
+            .with_file_group(file_group),
+    )
+    .build();
 
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();
@@ -114,7 +105,7 @@ async fn multi_parquet_coercion_projection() {
         RecordBatch::try_from_iter(vec![("c2", c2), ("c1", c1s), ("c3", c3)]).unwrap();
 
     let (meta, _files) = store_parquet(vec![batch1, batch2]).await.unwrap();
-    let file_groups = meta.into_iter().map(Into::into).collect();
+    let file_group = meta.into_iter().map(Into::into).collect();
 
     // cast c1 to utf8, c2 to int32, c3 to float64
     let file_schema = Arc::new(Schema::new(vec![
@@ -122,21 +113,12 @@ async fn multi_parquet_coercion_projection() {
         Field::new("c2", DataType::Int32, true),
         Field::new("c3", DataType::Float64, true),
     ]));
-    let parquet_exec = ParquetExec::new(
-        FileScanConfig {
-            object_store_url: ObjectStoreUrl::local_filesystem(),
-            file_groups: vec![file_groups],
-            file_schema,
-            statistics: Statistics::default(),
-            projection: Some(vec![1, 0, 2]),
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-            infinite_source: false,
-        },
-        None,
-        None,
-    );
+    let parquet_exec = ParquetExec::builder(
+        FileScanConfig::new(ObjectStoreUrl::local_filesystem(), file_schema)
+            .with_file_group(file_group)
+            .with_projection(Some(vec![1, 0, 2])),
+    )
+    .build();
 
     let session_ctx = SessionContext::new();
     let task_ctx = session_ctx.task_ctx();
@@ -193,5 +175,6 @@ pub fn local_unpartitioned_file(path: impl AsRef<std::path::Path>) -> ObjectMeta
         last_modified: metadata.modified().map(chrono::DateTime::from).unwrap(),
         size: metadata.len() as usize,
         e_tag: None,
+        version: None,
     }
 }

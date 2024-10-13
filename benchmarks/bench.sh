@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -34,8 +34,9 @@ COMMAND=
 BENCHMARK=all
 DATAFUSION_DIR=${DATAFUSION_DIR:-$SCRIPT_DIR/..}
 DATA_DIR=${DATA_DIR:-$SCRIPT_DIR/data}
-#CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --release"}
-CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --profile release-nonlto"}  # for faster iterations
+CARGO_COMMAND=${CARGO_COMMAND:-"cargo run --release"}
+PREFER_HASH_JOIN=${PREFER_HASH_JOIN:-true}
+VIRTUAL_ENV=${VIRTUAL_ENV:-$SCRIPT_DIR/venv}
 
 usage() {
     echo "
@@ -45,6 +46,7 @@ Usage:
 $0 data [benchmark]
 $0 run [benchmark]
 $0 compare <branch1> <branch2>
+$0 venv
 
 **********
 Examples:
@@ -52,35 +54,40 @@ Examples:
 # Create the datasets for all benchmarks in $DATA_DIR
 ./bench.sh data
 
-# Run the 'tpch' benchmark on the datafusion checkout in /source/arrow-datafusion
-DATAFASION_DIR=/source/arrow-datafusion ./bench.sh run tpch
+# Run the 'tpch' benchmark on the datafusion checkout in /source/datafusion
+DATAFUSION_DIR=/source/datafusion ./bench.sh run tpch
 
 **********
 * Commands
 **********
-data:         Generates data needed for benchmarking
+data:         Generates or downloads data needed for benchmarking
 run:          Runs the named benchmark
-compare:      Comares results from benchmark runs
+compare:      Compares results from benchmark runs
+venv:         Creates new venv (unless already exists) and installs compare's requirements into it
 
 **********
 * Benchmarks
 **********
 all(default): Data/Run/Compare for all benchmarks
-tpch:                   TPCH inspired benchmark on Scale Factor (SF) 1 (~1GB), single parquet file per table
+tpch:                   TPCH inspired benchmark on Scale Factor (SF) 1 (~1GB), single parquet file per table, hash join
 tpch_mem:               TPCH inspired benchmark on Scale Factor (SF) 1 (~1GB), query from memory
-tpch10:                 TPCH inspired benchmark on Scale Factor (SF) 10 (~10GB), single parquet file per table
-tpch10_mem:             TPCH inspired benchmark on Scale Factor (SF) 10 (~10GB), query from memory
+tpch10:                 TPCH inspired benchmark on Scale Factor (SF) 10 (~10GB), single parquet file per table, hash join
+tpch_mem10:             TPCH inspired benchmark on Scale Factor (SF) 10 (~10GB), query from memory
 parquet:                Benchmark of parquet reader's filtering speed
 sort:                   Benchmark of sorting speed
 clickbench_1:           ClickBench queries against a single parquet file
 clickbench_partitioned: ClickBench queries against a partitioned (100 files) parquet
+clickbench_extended:    ClickBench \"inspired\" queries against a single parquet (DataFusion specific)
 
 **********
 * Supported Configuration (Environment Variables)
 **********
-DATA_DIR        directory to store datasets
-CARGO_COMMAND   command that runs the benchmark binary
-DATAFASION_DIR  directory to use (default $DATAFUSION_DIR)
+DATA_DIR            directory to store datasets
+CARGO_COMMAND       command that runs the benchmark binary
+DATAFUSION_DIR      directory to use (default $DATAFUSION_DIR)
+RESULTS_NAME        folder where the benchmark files are stored
+PREFER_HASH_JOIN    Prefer hash join algorithm (default true)
+VENV_PATH           Python venv to use for compare and venv commands (default ./venv, override by <your-venv>/bin/activate)
 "
     exit 1
 }
@@ -99,7 +106,7 @@ while [[ $# -gt 0 ]]; do
             shift # past argument
             usage
             ;;
-        -*|--*)
+        -*)
             echo "Unknown option $1"
             exit 1
             ;;
@@ -127,6 +134,7 @@ main() {
             echo "BENCHMARK: ${BENCHMARK}"
             echo "DATA_DIR: ${DATA_DIR}"
             echo "CARGO_COMMAND: ${CARGO_COMMAND}"
+            echo "PREFER_HASH_JOIN: ${PREFER_HASH_JOIN}"
             echo "***************************"
             case "$BENCHMARK" in
                 all)
@@ -155,6 +163,9 @@ main() {
                 clickbench_partitioned)
                     data_clickbench_partitioned
                     ;;
+                clickbench_extended)
+                    data_clickbench_1
+                    ;;
                 *)
                     echo "Error: unknown benchmark '$BENCHMARK' for data generation"
                     usage
@@ -162,21 +173,23 @@ main() {
             esac
             ;;
         run)
-            # Parse positional paraleters
+            # Parse positional parameters
             BENCHMARK=${ARG2:-"${BENCHMARK}"}
-            BRANCH_NAME=$(cd ${DATAFUSION_DIR} && git rev-parse --abbrev-ref HEAD)
+            BRANCH_NAME=$(cd "${DATAFUSION_DIR}" && git rev-parse --abbrev-ref HEAD)
             BRANCH_NAME=${BRANCH_NAME//\//_} # mind blowing syntax to replace / with _
-            RESULTS_DIR=${RESULTS_DIR:-"$SCRIPT_DIR/results/$BRANCH_NAME"}
+            RESULTS_NAME=${RESULTS_NAME:-"${BRANCH_NAME}"}
+            RESULTS_DIR=${RESULTS_DIR:-"$SCRIPT_DIR/results/$RESULTS_NAME"}
 
             echo "***************************"
             echo "DataFusion Benchmark Script"
             echo "COMMAND: ${COMMAND}"
             echo "BENCHMARK: ${BENCHMARK}"
             echo "DATAFUSION_DIR: ${DATAFUSION_DIR}"
-            echo "BRACH_NAME: ${BRANCH_NAME}"
+            echo "BRANCH_NAME: ${BRANCH_NAME}"
             echo "DATA_DIR: ${DATA_DIR}"
             echo "RESULTS_DIR: ${RESULTS_DIR}"
             echo "CARGO_COMMAND: ${CARGO_COMMAND}"
+            echo "PREFER_HASH_JOIN: ${PREFER_HASH_JOIN}"
             echo "***************************"
 
             # navigate to the appropriate directory
@@ -193,6 +206,7 @@ main() {
                     run_sort
                     run_clickbench_1
                     run_clickbench_partitioned
+                    run_clickbench_extended
                     ;;
                 tpch)
                     run_tpch "1"
@@ -218,6 +232,9 @@ main() {
                 clickbench_partitioned)
                     run_clickbench_partitioned
                     ;;
+                clickbench_extended)
+                    run_clickbench_extended
+                    ;;
                 *)
                     echo "Error: unknown benchmark '$BENCHMARK' for run"
                     usage
@@ -227,9 +244,13 @@ main() {
             echo "Done"
             ;;
         compare)
-            BRANCH1=$1
-            BRANCH2=$2
-            compare_benchmarks
+            compare_benchmarks "$ARG2" "$ARG3"
+            ;;
+        venv)
+            setup_venv
+            ;;
+        "")
+            usage
             ;;
         *)
             echo "Error: unknown command: $COMMAND"
@@ -267,7 +288,7 @@ data_tpch() {
         echo " tbl files exist ($FILE exists)."
     else
         echo " creating tbl files with tpch_dbgen..."
-        docker run -v "${TPCH_DIR}":/data -it --rm ghcr.io/databloom-ai/tpch-docker:main -vf -s ${SCALE_FACTOR}
+        docker run -v "${TPCH_DIR}":/data -it --rm ghcr.io/scalytics/tpch-docker:main -vf -s "${SCALE_FACTOR}"
     fi
 
     # Copy expected answers into the ./data/answers directory if it does not already exist
@@ -277,7 +298,7 @@ data_tpch() {
     else
         echo " Copying answers to ${TPCH_DIR}/answers"
         mkdir -p "${TPCH_DIR}/answers"
-        docker run -v "${TPCH_DIR}":/data -it --entrypoint /bin/bash --rm ghcr.io/databloom-ai/tpch-docker:main -c "cp -f /opt/tpch/2.18.0_rc2/dbgen/answers/* /data/answers/"
+        docker run -v "${TPCH_DIR}":/data -it --entrypoint /bin/bash --rm ghcr.io/scalytics/tpch-docker:main  -c "cp -f /opt/tpch/2.18.0_rc2/dbgen/answers/* /data/answers/"
     fi
 
     # Create 'parquet' files from tbl
@@ -301,10 +322,10 @@ run_tpch() {
     fi
     TPCH_DIR="${DATA_DIR}/tpch_sf${SCALE_FACTOR}"
 
-    RESULTS_FILE="${RESULTS_DIR}/tpch.json"
+    RESULTS_FILE="${RESULTS_DIR}/tpch_sf${SCALE_FACTOR}.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running tpch benchmark..."
-    $CARGO_COMMAND --bin tpch -- benchmark datafusion --iterations 5 --path "${TPCH_DIR}" --format parquet -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin tpch -- benchmark datafusion --iterations 5 --path "${TPCH_DIR}" --prefer_hash_join "${PREFER_HASH_JOIN}" --format parquet -o "${RESULTS_FILE}"
 }
 
 # Runs the tpch in memory
@@ -316,11 +337,11 @@ run_tpch_mem() {
     fi
     TPCH_DIR="${DATA_DIR}/tpch_sf${SCALE_FACTOR}"
 
-    RESULTS_FILE="${RESULTS_DIR}/tpch_mem.json"
+    RESULTS_FILE="${RESULTS_DIR}/tpch_mem_sf${SCALE_FACTOR}.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running tpch_mem benchmark..."
     # -m means in memory
-    $CARGO_COMMAND --bin tpch -- benchmark datafusion --iterations 5 --path "${TPCH_DIR}" -m --format parquet -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin tpch -- benchmark datafusion --iterations 5 --path "${TPCH_DIR}" --prefer_hash_join "${PREFER_HASH_JOIN}" -m --format parquet -o "${RESULTS_FILE}"
 }
 
 # Runs the parquet filter benchmark
@@ -328,7 +349,7 @@ run_parquet() {
     RESULTS_FILE="${RESULTS_DIR}/parquet.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running parquet filter benchmark..."
-    $CARGO_COMMAND --bin parquet -- filter --path "${DATA_DIR}" --scale-factor 1.0 --iterations 5 -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin parquet -- filter --path "${DATA_DIR}" --prefer_hash_join "${PREFER_HASH_JOIN}" --scale-factor 1.0 --iterations 5 -o "${RESULTS_FILE}"
 }
 
 # Runs the sort benchmark
@@ -336,7 +357,7 @@ run_sort() {
     RESULTS_FILE="${RESULTS_DIR}/sort.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running sort benchmark..."
-    $CARGO_COMMAND --bin parquet -- sort --path "${DATA_DIR}" --scale-factor 1.0 --iterations 5 -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin parquet -- sort --path "${DATA_DIR}" --prefer_hash_join "${PREFER_HASH_JOIN}" --scale-factor 1.0 --iterations 5 -o "${RESULTS_FILE}"
 }
 
 
@@ -348,7 +369,7 @@ data_clickbench_1() {
     pushd "${DATA_DIR}" > /dev/null
 
     # Avoid downloading if it already exists and is the right size
-    OUTPUT_SIZE=`wc -c hits.parquet  2>/dev/null  | awk '{print $1}' || true`
+    OUTPUT_SIZE=$(wc -c hits.parquet  2>/dev/null  | awk '{print $1}' || true)
     echo -n "Checking hits.parquet..."
     if test "${OUTPUT_SIZE}" = "14779976446"; then
         echo -n "... found ${OUTPUT_SIZE} bytes ..."
@@ -372,7 +393,7 @@ data_clickbench_partitioned() {
     pushd "${DATA_DIR}/hits_partitioned" > /dev/null
 
     echo -n "Checking hits_partitioned..."
-    OUTPUT_SIZE=`wc -c * 2>/dev/null | tail -n 1  | awk '{print $1}' || true`
+    OUTPUT_SIZE=$(wc -c -- * 2>/dev/null | tail -n 1  | awk '{print $1}' || true)
     if test "${OUTPUT_SIZE}" = "14737666736"; then
         echo -n "... found ${OUTPUT_SIZE} bytes ..."
     else
@@ -390,21 +411,29 @@ run_clickbench_1() {
     RESULTS_FILE="${RESULTS_DIR}/clickbench_1.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running clickbench (1 file) benchmark..."
-    $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries.sql" -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits.parquet"  --queries-path "${SCRIPT_DIR}/queries/clickbench/queries.sql" -o "${RESULTS_FILE}"
 }
 
- # Runs the clickbench benchmark with a single large parquet file
+ # Runs the clickbench benchmark with the partitioned parquet files
 run_clickbench_partitioned() {
-    RESULTS_FILE="${RESULTS_DIR}/clickbench_1.json"
+    RESULTS_FILE="${RESULTS_DIR}/clickbench_partitioned.json"
     echo "RESULTS_FILE: ${RESULTS_FILE}"
     echo "Running clickbench (partitioned, 100 files) benchmark..."
-    $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries.sql" -o ${RESULTS_FILE}
+    $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits_partitioned" --queries-path "${SCRIPT_DIR}/queries/clickbench/queries.sql" -o "${RESULTS_FILE}"
+}
+
+# Runs the clickbench "extended" benchmark with a single large parquet file
+run_clickbench_extended() {
+    RESULTS_FILE="${RESULTS_DIR}/clickbench_extended.json"
+    echo "RESULTS_FILE: ${RESULTS_FILE}"
+    echo "Running clickbench (1 file) extended benchmark..."
+    $CARGO_COMMAND --bin dfbench -- clickbench  --iterations 5 --path "${DATA_DIR}/hits.parquet" --queries-path "${SCRIPT_DIR}/queries/clickbench/extended.sql" -o "${RESULTS_FILE}"
 }
 
 compare_benchmarks() {
     BASE_RESULTS_DIR="${SCRIPT_DIR}/results"
-    BRANCH1="${ARG2}"
-    BRANCH2="${ARG3}"
+    BRANCH1="$1"
+    BRANCH2="$2"
     if [ -z "$BRANCH1" ] ; then
         echo "<branch1> not specified. Available branches:"
         ls -1 "${BASE_RESULTS_DIR}"
@@ -418,19 +447,24 @@ compare_benchmarks() {
     fi
 
     echo "Comparing ${BRANCH1} and ${BRANCH2}"
-    for bench in `ls ${BASE_RESULTS_DIR}/${BRANCH1}` ; do
-        RESULTS_FILE1="${BASE_RESULTS_DIR}/${BRANCH1}/${bench}"
-        RESULTS_FILE2="${BASE_RESULTS_DIR}/${BRANCH2}/${bench}"
+    for RESULTS_FILE1 in "${BASE_RESULTS_DIR}/${BRANCH1}"/*.json ; do
+	BENCH=$(basename "${RESULTS_FILE1}")
+        RESULTS_FILE2="${BASE_RESULTS_DIR}/${BRANCH2}/${BENCH}"
         if test -f "${RESULTS_FILE2}" ; then
             echo "--------------------"
-            echo "Benchmark ${bench}"
+            echo "Benchmark ${BENCH}"
             echo "--------------------"
-            python3 "${SCRIPT_DIR}"/compare.py "${RESULTS_FILE1}" "${RESULTS_FILE2}"
+            PATH=$VIRTUAL_ENV/bin:$PATH python3 "${SCRIPT_DIR}"/compare.py "${RESULTS_FILE1}" "${RESULTS_FILE2}"
         else
             echo "Note: Skipping ${RESULTS_FILE1} as ${RESULTS_FILE2} does not exist"
         fi
     done
 
+}
+
+setup_venv() {
+    python3 -m venv "$VIRTUAL_ENV"
+    PATH=$VIRTUAL_ENV/bin:$PATH python3 -m pip install -r requirements.txt
 }
 
 # And start the process up

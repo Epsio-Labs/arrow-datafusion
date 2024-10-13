@@ -19,33 +19,43 @@
 name = "datafusion-sql"
 description = "DataFusion SQL Query Planner"
 keywords = ["datafusion", "sql", "parser", "planner"]
+readme = "README.md"
 version = { workspace = true }
 edition = { workspace = true }
-readme = { workspace = true }
 homepage = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 rust-version = { workspace = true }
 
+[lints]
+workspace = true
+
 [lib]
 name = "datafusion_sql"
 path = "src/lib.rs"
 
 [features]
-default = ["unicode_expressions"]
+default = ["unicode_expressions", "unparser"]
 unicode_expressions = []
+unparser = []
 
 [dependencies]
 arrow = { workspace = true }
+arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-datafusion-common = { path = "../common", version = "31.0.0" }
-datafusion-expr = { path = "../expr", version = "31.0.0" }
-log = "^0.4"
+datafusion-common = { workspace = true, default-features = true }
+datafusion-expr = { workspace = true }
+log = { workspace = true }
+regex = { workspace = true }
 sqlparser = { workspace = true }
+strum = { version = "0.26.1", features = ["derive"] }
 
 [dev-dependencies]
-ctor = "0.2.0"
-env_logger = "0.10"
+ctor = { workspace = true }
+datafusion-functions = { workspace = true, default-features = true }
+datafusion-functions-aggregate = { workspace = true }
+datafusion-functions-window = { workspace = true }
+env_logger = { workspace = true }
 paste = "^1.0"
-rstest = "0.18"
+rstest = { workspace = true }

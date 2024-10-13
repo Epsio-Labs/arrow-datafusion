@@ -13,7 +13,7 @@
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
-// under the License.pub},
+// under the License.
 
 //! DataFusion "prelude" to simplify importing common types.
 //!
@@ -38,3 +38,11 @@ pub use datafusion_expr::{
     logical_plan::{JoinType, Partitioning},
     Expr,
 };
+pub use datafusion_functions::expr_fn::*;
+#[cfg(feature = "nested_expressions")]
+pub use datafusion_functions_nested::expr_fn::*;
+
+pub use std::ops::Not;
+pub use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
+pub use std::ops::{BitAnd, BitOr, BitXor};
+pub use std::ops::{Shl, Shr};

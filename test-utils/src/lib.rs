@@ -16,14 +16,19 @@
 // under the License.
 
 //! Common functions used for testing
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_int32_array;
 use rand::prelude::StdRng;
 use rand::{Rng, SeedableRng};
 
 mod data_gen;
+mod string_gen;
+pub mod tpcds;
+pub mod tpch;
 
 pub use data_gen::AccessLogGenerator;
+pub use string_gen::StringBatchGenerator;
 
 pub use env_logger;
 
@@ -38,7 +43,7 @@ pub fn batches_to_vec(batches: &[RecordBatch]) -> Vec<Option<i32>> {
         .collect()
 }
 
-/// extract values from batches and sort them
+/// extract i32 values from batches and sort them
 pub fn partitions_to_sorted_vec(partitions: &[Vec<RecordBatch>]) -> Vec<Option<i32>> {
     let mut values: Vec<_> = partitions
         .iter()
@@ -70,13 +75,23 @@ pub fn add_empty_batches(
 }
 
 /// "stagger" batches: split the batches into random sized batches
+///
+/// For example, if the input batch has 1000 rows, [`stagger_batch`] might return
+/// multiple batches
+/// ```text
+/// [
+///   RecordBatch(123 rows),
+///   RecordBatch(234 rows),
+///   RecordBatch(634 rows),
+/// ]
+/// ```
 pub fn stagger_batch(batch: RecordBatch) -> Vec<RecordBatch> {
     let seed = 42;
     stagger_batch_with_seed(batch, seed)
 }
 
-/// "stagger" batches: split the batches into random sized batches
-/// using the specified value for a rng seed
+/// "stagger" batches: split the batches into random sized batches using the
+/// specified value for a rng seed. See [`stagger_batch`] for more detail.
 pub fn stagger_batch_with_seed(batch: RecordBatch, seed: u64) -> Vec<RecordBatch> {
     let mut batches = vec![];
 
@@ -92,4 +107,19 @@ pub fn stagger_batch_with_seed(batch: RecordBatch, seed: u64) -> Vec<RecordBatch
     }
 
     add_empty_batches(batches, &mut rng)
+}
+
+/// Table definition of a name/schema
+pub struct TableDef {
+    pub name: String,
+    pub schema: Schema,
+}
+
+impl TableDef {
+    fn new(name: impl Into<String>, schema: Schema) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+        }
+    }
 }

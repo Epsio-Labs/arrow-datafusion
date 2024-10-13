@@ -57,10 +57,7 @@ fi
 # 1. cargo clippy
 
 echo -e "$(GREEN INFO): cargo clippy ..."
-
-# Cargo clippy always return exit code 0, and `tee` doesn't work.
-# So let's just run cargo clippy.
-cargo clippy
+./ci/scripts/rust_clippy.sh
 echo -e "$(GREEN INFO): cargo clippy done"
 
 # 2. cargo fmt: format with nightly and stable.

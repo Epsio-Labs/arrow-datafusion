@@ -16,35 +16,58 @@
 # under the License.
 
 development-process:
-  - dev/**.*
-  - .github/**.*
-  - ci/**.*
-  - .asf.yaml
+- changed-files:
+  - any-glob-to-any-file: ['dev/**/*', '.github/**/*', 'ci/**/*', '.asf.yaml']
 
 documentation:
-  - docs/**.*
-  - README.md
-  - ./**/README.md
-  - DEVELOPERS.md
-  - datafusion/docs/**.*
+- changed-files:
+  - any-glob-to-any-file: ['docs/**/*', 'README.md', './**/README.md', 'DEVELOPERS.md', 'datafusion/docs/**/*']
 
 sql:
-  - datafusion/sql/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/sql/**/*']
 
 logical-expr:
-  - datafusion/expr/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/expr/**/*']
 
 physical-expr:
-  - datafusion/physical-expr/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/physical-expr/**/*', 'datafusion/physical-expr-common/**/*', 'datafusion/physical-expr-aggregate/**/*', 'datafusion/physical-plan/**/*']
+
+catalog:
+  - changed-files:
+      - any-glob-to-any-file: ['datafusion/catalog/**/*']
+
+common:
+  - changed-files:
+      - any-glob-to-any-file: ['datafusion/common/**/*', 'datafusion/common-runtime/**/*']
+
+execution:
+  - changed-files:
+      - any-glob-to-any-file: ['datafusion/execution/**/*']
+
+functions:
+  - changed-files:
+      - any-glob-to-any-file: ['datafusion/functions/**/*', 'datafusion/functions-aggregate/**/*', 'datafusion/functions-aggregate-common', 'datafusion/functions-nested']
+
 
 optimizer:
-  - datafusion/optimizer/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/optimizer/**/*', 'datafusion/physical-optimizer/**/*']
 
 core:
-  - datafusion/core/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/core/**/*']
+
+proto:
+  - changed-files:
+      - any-glob-to-any-file: ['datafusion/proto/**/*', 'datafusion/proto-common/**/*']
 
 substrait:
-  - datafusion/substrait/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/substrait/**/*']
 
 sqllogictest:
-  - datafusion/sqllogictest/**/*
+- changed-files:
+  - any-glob-to-any-file: ['datafusion/sqllogictest/**/*']

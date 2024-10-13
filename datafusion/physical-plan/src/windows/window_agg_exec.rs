@@ -17,36 +17,34 @@
 
 //! Stream and channel implementations for window function expressions.
 
-use crate::common::transpose;
-use crate::expressions::PhysicalSortExpr;
-use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use crate::windows::{
-    calc_requirements, get_ordered_partition_by_indices, window_ordering_equivalence,
-};
-use crate::{
-    ColumnStatistics, DisplayAs, DisplayFormatType, Distribution, EquivalenceProperties,
-    ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream,
-    SendableRecordBatchStream, Statistics, WindowExpr,
-};
-use arrow::compute::{concat, concat_batches};
-use arrow::datatypes::SchemaBuilder;
-use arrow::error::ArrowError;
-use arrow::{
-    array::ArrayRef,
-    datatypes::{Schema, SchemaRef},
-    record_batch::RecordBatch,
-};
-use datafusion_common::utils::{evaluate_partition_ranges, get_at_indices};
-use datafusion_common::Result;
-use datafusion_common::{internal_err, plan_err, DataFusionError};
-use datafusion_execution::TaskContext;
-use datafusion_physical_expr::{OrderingEquivalenceProperties, PhysicalSortRequirement};
-use futures::stream::Stream;
-use futures::{ready, StreamExt};
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+
+use super::utils::create_schema;
+use crate::expressions::PhysicalSortExpr;
+use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use crate::windows::{
+    calc_requirements, get_ordered_partition_by_indices, get_partition_by_sort_exprs,
+    window_equivalence_properties,
+};
+use crate::{
+    ColumnStatistics, DisplayAs, DisplayFormatType, Distribution, ExecutionMode,
+    ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, PlanProperties,
+    RecordBatchStream, SendableRecordBatchStream, Statistics, WindowExpr,
+};
+use arrow::array::ArrayRef;
+use arrow::compute::{concat, concat_batches};
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+use datafusion_common::stats::Precision;
+use datafusion_common::utils::{evaluate_partition_ranges, transpose};
+use datafusion_common::{internal_err, Result};
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr_common::sort_expr::LexRequirement;
+use futures::{ready, Stream, StreamExt};
 
 /// Window execution plan
 #[derive(Debug)]
@@ -57,8 +55,6 @@ pub struct WindowAggExec {
     window_expr: Vec<Arc<dyn WindowExpr>>,
     /// Schema after the window is run
     schema: SchemaRef,
-    /// Schema before the window
-    input_schema: SchemaRef,
     /// Partition Keys
     pub partition_keys: Vec<Arc<dyn PhysicalExpr>>,
     /// Execution metrics
@@ -66,6 +62,8 @@ pub struct WindowAggExec {
     /// Partition by indices that defines preset for existing ordering
     // see `get_ordered_partition_by_indices` for more details.
     ordered_partition_by_indices: Vec<usize>,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl WindowAggExec {
@@ -73,22 +71,22 @@ impl WindowAggExec {
     pub fn try_new(
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: Arc<dyn ExecutionPlan>,
-        input_schema: SchemaRef,
         partition_keys: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Self> {
-        let schema = create_schema(&input_schema, &window_expr)?;
+        let schema = create_schema(&input.schema(), &window_expr)?;
         let schema = Arc::new(schema);
 
         let ordered_partition_by_indices =
             get_ordered_partition_by_indices(window_expr[0].partition_by(), &input);
+        let cache = Self::compute_properties(Arc::clone(&schema), &input, &window_expr);
         Ok(Self {
             input,
             window_expr,
             schema,
-            input_schema,
             partition_keys,
             metrics: ExecutionPlanMetricsSet::new(),
             ordered_partition_by_indices,
+            cache,
         })
     }
 
@@ -102,20 +100,44 @@ impl WindowAggExec {
         &self.input
     }
 
-    /// Get the input schema before any window functions are applied
-    pub fn input_schema(&self) -> SchemaRef {
-        self.input_schema.clone()
-    }
-
     /// Return the output sort order of partition keys: For example
     /// OVER(PARTITION BY a, ORDER BY b) -> would give sorting of the column a
     // We are sure that partition by columns are always at the beginning of sort_keys
     // Hence returned `PhysicalSortExpr` corresponding to `PARTITION BY` columns can be used safely
     // to calculate partition separation points
     pub fn partition_by_sort_keys(&self) -> Result<Vec<PhysicalSortExpr>> {
-        // Partition by sort keys indices are stored in self.ordered_partition_by_indices.
-        let sort_keys = self.input.output_ordering().unwrap_or(&[]);
-        get_at_indices(sort_keys, &self.ordered_partition_by_indices)
+        let partition_by = self.window_expr()[0].partition_by();
+        get_partition_by_sort_exprs(
+            &self.input,
+            partition_by,
+            &self.ordered_partition_by_indices,
+        )
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        schema: SchemaRef,
+        input: &Arc<dyn ExecutionPlan>,
+        window_expr: &[Arc<dyn WindowExpr>],
+    ) -> PlanProperties {
+        // Calculate equivalence properties:
+        let eq_properties = window_equivalence_properties(&schema, input, window_expr);
+
+        // Get output partitioning:
+        // Because we can have repartitioning using the partition keys this
+        // would be either 1 or more than 1 depending on the presence of repartitioning.
+        let output_partitioning = input.output_partitioning().clone();
+
+        // Determine execution mode:
+        let mode = match input.execution_mode() {
+            ExecutionMode::Bounded => ExecutionMode::Bounded,
+            ExecutionMode::Unbounded | ExecutionMode::PipelineBreaking => {
+                ExecutionMode::PipelineBreaking
+            }
+        };
+
+        // Construct properties cache:
+        PlanProperties::new(eq_properties, output_partitioning, mode)
     }
 }
 
@@ -148,49 +170,28 @@ impl DisplayAs for WindowAggExec {
 }
 
 impl ExecutionPlan for WindowAggExec {
+    fn name(&self) -> &'static str {
+        "WindowAggExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        // because we can have repartitioning using the partition keys
-        // this would be either 1 or more than 1 depending on the presense of
-        // repartitioning
-        self.input.output_partitioning()
-    }
-
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        if children[0] {
-            plan_err!(
-                "Window Error: Windowing is not currently support for unbounded inputs."
-            )
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input().output_ordering()
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
         let partition_bys = self.window_expr()[0].partition_by();
         let order_keys = self.window_expr()[0].order_by();
         if self.ordered_partition_by_indices.len() < partition_bys.len() {
@@ -212,23 +213,13 @@ impl ExecutionPlan for WindowAggExec {
         }
     }
 
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input().equivalence_properties()
-    }
-
-    /// Get the OrderingEquivalenceProperties within the plan
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        window_ordering_equivalence(&self.schema, &self.input, &self.window_expr)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(WindowAggExec::try_new(
             self.window_expr.clone(),
-            children[0].clone(),
-            self.input_schema.clone(),
+            Arc::clone(&children[0]),
             self.partition_keys.clone(),
         )?))
     }
@@ -240,7 +231,7 @@ impl ExecutionPlan for WindowAggExec {
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
         let stream = Box::pin(WindowAggStream::new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             self.window_expr.clone(),
             input,
             BaselineMetrics::new(&self.metrics, partition),
@@ -254,39 +245,23 @@ impl ExecutionPlan for WindowAggExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        let input_stat = self.input.statistics();
+    fn statistics(&self) -> Result<Statistics> {
+        let input_stat = self.input.statistics()?;
         let win_cols = self.window_expr.len();
-        let input_cols = self.input_schema.fields().len();
+        let input_cols = self.input.schema().fields().len();
         // TODO stats: some windowing function will maintain invariants such as min, max...
         let mut column_statistics = Vec::with_capacity(win_cols + input_cols);
-        if let Some(input_col_stats) = input_stat.column_statistics {
-            column_statistics.extend(input_col_stats);
-        } else {
-            column_statistics.extend(vec![ColumnStatistics::default(); input_cols]);
+        // copy stats of the input to the beginning of the schema.
+        column_statistics.extend(input_stat.column_statistics);
+        for _ in 0..win_cols {
+            column_statistics.push(ColumnStatistics::new_unknown())
         }
-        column_statistics.extend(vec![ColumnStatistics::default(); win_cols]);
-        Statistics {
-            is_exact: input_stat.is_exact,
+        Ok(Statistics {
             num_rows: input_stat.num_rows,
-            column_statistics: Some(column_statistics),
-            total_byte_size: None,
-        }
+            column_statistics,
+            total_byte_size: Precision::Absent,
+        })
     }
-}
-
-fn create_schema(
-    input_schema: &Schema,
-    window_expr: &[Arc<dyn WindowExpr>],
-) -> Result<Schema> {
-    let capacity = input_schema.fields().len() + window_expr.len();
-    let mut builder = SchemaBuilder::with_capacity(capacity);
-    builder.extend(input_schema.fields().iter().cloned());
-    // append results to the schema
-    for expr in window_expr {
-        builder.push(expr.field()?);
-    }
-    Ok(builder.finish())
 }
 
 /// Compute the window aggregate columns
@@ -343,7 +318,7 @@ impl WindowAggStream {
         let _timer = self.baseline_metrics.elapsed_compute().timer();
         let batch = concat_batches(&self.input.schema(), &self.batches)?;
         if batch.num_rows() == 0 {
-            return Ok(RecordBatch::new_empty(self.schema.clone()));
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.schema)));
         }
 
         let partition_by_sort_keys = self
@@ -376,7 +351,10 @@ impl WindowAggStream {
         let mut batch_columns = batch.columns().to_vec();
         // calculate window cols
         batch_columns.extend_from_slice(&columns);
-        Ok(RecordBatch::try_new(self.schema.clone(), batch_columns)?)
+        Ok(RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            batch_columns,
+        )?)
     }
 }
 
@@ -422,6 +400,6 @@ impl WindowAggStream {
 impl RecordBatchStream for WindowAggStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }

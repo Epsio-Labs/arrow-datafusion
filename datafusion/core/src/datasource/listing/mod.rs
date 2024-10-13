@@ -22,18 +22,16 @@ mod helpers;
 mod table;
 mod url;
 
-use crate::error::Result;
 use chrono::TimeZone;
-use datafusion_common::ScalarValue;
+use datafusion_common::Result;
+use datafusion_common::{ScalarValue, Statistics};
 use futures::Stream;
 use object_store::{path::Path, ObjectMeta};
 use std::pin::Pin;
 use std::sync::Arc;
 
 pub use self::url::ListingTableUrl;
-pub use table::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableInsertMode,
-};
+pub use table::{ListingOptions, ListingTable, ListingTableConfig};
 
 /// Stream of files get listed from object store
 pub type PartitionedFileStream =
@@ -42,12 +40,19 @@ pub type PartitionedFileStream =
 /// Only scan a subset of Row Groups from the Parquet file whose data "midpoint"
 /// lies within the [start, end) byte offsets. This option can be used to scan non-overlapping
 /// sections of a Parquet file in parallel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, PartialOrd, Ord)]
 pub struct FileRange {
     /// Range start
     pub start: i64,
     /// Range end
     pub end: i64,
+}
+
+impl FileRange {
+    /// returns true if this file range contains the specified offset
+    pub fn contains(&self, offset: i64) -> bool {
+        offset >= self.start && offset < self.end
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,22 +74,29 @@ pub struct PartitionedFile {
     pub partition_values: Vec<ScalarValue>,
     /// An optional file range for a more fine-grained parallel execution
     pub range: Option<FileRange>,
+    /// Optional statistics that describe the data in this file if known.
+    ///
+    /// DataFusion relies on these statistics for planning (in particular to sort file groups),
+    /// so if they are incorrect, incorrect answers may result.
+    pub statistics: Option<Statistics>,
     /// An optional field for user defined per object metadata
     pub extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl PartitionedFile {
     /// Create a simple file without metadata or partition
-    pub fn new(path: String, size: u64) -> Self {
+    pub fn new(path: impl Into<String>, size: u64) -> Self {
         Self {
             object_meta: ObjectMeta {
-                location: Path::from(path),
+                location: Path::from(path.into()),
                 last_modified: chrono::Utc.timestamp_nanos(0),
                 size: size as usize,
                 e_tag: None,
+                version: None,
             },
             partition_values: vec![],
             range: None,
+            statistics: None,
             extensions: None,
         }
     }
@@ -97,17 +109,42 @@ impl PartitionedFile {
                 last_modified: chrono::Utc.timestamp_nanos(0),
                 size: size as usize,
                 e_tag: None,
+                version: None,
             },
             partition_values: vec![],
             range: Some(FileRange { start, end }),
+            statistics: None,
             extensions: None,
         }
+        .with_range(start, end)
     }
 
     /// Return a file reference from the given path
     pub fn from_path(path: String) -> Result<Self> {
         let size = std::fs::metadata(path.clone())?.len();
         Ok(Self::new(path, size))
+    }
+
+    /// Return the path of this partitioned file
+    pub fn path(&self) -> &Path {
+        &self.object_meta.location
+    }
+
+    /// Update the file to only scan the specified range (in bytes)
+    pub fn with_range(mut self, start: i64, end: i64) -> Self {
+        self.range = Some(FileRange { start, end });
+        self
+    }
+
+    /// Update the user defined extensions for this file.
+    ///
+    /// This can be used to pass reader specific information.
+    pub fn with_extensions(
+        mut self,
+        extensions: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        self.extensions = Some(extensions);
+        self
     }
 }
 
@@ -117,6 +154,7 @@ impl From<ObjectMeta> for PartitionedFile {
             object_meta,
             partition_values: vec![],
             range: None,
+            statistics: None,
             extensions: None,
         }
     }
@@ -124,12 +162,12 @@ impl From<ObjectMeta> for PartitionedFile {
 
 #[cfg(test)]
 mod tests {
-    use crate::datasource::listing::ListingTableUrl;
+    use super::ListingTableUrl;
     use datafusion_execution::object_store::{
         DefaultObjectStoreRegistry, ObjectStoreRegistry,
     };
-    use object_store::local::LocalFileSystem;
-    use std::sync::Arc;
+    use object_store::{local::LocalFileSystem, path::Path};
+    use std::{ops::Not, sync::Arc};
     use url::Url;
 
     #[test]
@@ -173,5 +211,57 @@ mod tests {
         let sut = DefaultObjectStoreRegistry::default();
         let url = ListingTableUrl::parse("../").unwrap();
         sut.get_store(url.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn test_url_contains() {
+        let url = ListingTableUrl::parse("file:///var/data/mytable/").unwrap();
+
+        // standard case with default config
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/data.parquet").unwrap(),
+            true
+        ));
+
+        // standard case with `ignore_subdirectory` set to false
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/data.parquet").unwrap(),
+            false
+        ));
+
+        // as per documentation, when `ignore_subdirectory` is true, we should ignore files that aren't
+        // a direct child of the `url`
+        assert!(url
+            .contains(
+                &Path::parse("/var/data/mytable/mysubfolder/data.parquet").unwrap(),
+                true
+            )
+            .not());
+
+        // when we set `ignore_subdirectory` to false, we should not ignore the file
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/mysubfolder/data.parquet").unwrap(),
+            false
+        ));
+
+        // as above, `ignore_subdirectory` is false, so we include the file
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/year=2024/data.parquet").unwrap(),
+            false
+        ));
+
+        // in this case, we include the file even when `ignore_subdirectory` is true because the
+        // path segment is a hive partition which doesn't count as a subdirectory for the purposes
+        // of `Url::contains`
+        assert!(url.contains(
+            &Path::parse("/var/data/mytable/year=2024/data.parquet").unwrap(),
+            true
+        ));
+
+        // testing an empty path with default config
+        assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), true));
+
+        // testing an empty path with `ignore_subdirectory` set to false
+        assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), false));
     }
 }

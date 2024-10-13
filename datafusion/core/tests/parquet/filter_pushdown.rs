@@ -26,15 +26,15 @@
 //! select * from data limit 10;
 //! ```
 
-use std::time::Instant;
-
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::collect;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::prelude::{col, lit, lit_timestamp_nano, Expr, SessionContext};
 use datafusion::test_util::parquet::{ParquetScanOptions, TestParquetFile};
-use datafusion_optimizer::utils::{conjunction, disjunction, split_conjunction};
+use datafusion_common::instant::Instant;
+use datafusion_expr::utils::{conjunction, disjunction, split_conjunction};
+
 use itertools::Itertools;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
@@ -63,7 +63,6 @@ fn generate_file(tempdir: &TempDir, props: WriterProperties) -> TestParquetFile 
     test_parquet_file
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file() {
     // Only create the parquet file once as it is fairly large
@@ -222,7 +221,6 @@ async fn single_file() {
     case.run().await;
 }
 
-#[cfg(not(target_family = "windows"))]
 #[tokio::test]
 async fn single_file_small_data_pages() {
     let tempdir = TempDir::new().unwrap();
@@ -507,10 +505,10 @@ impl<'a> TestCase<'a> {
     ) -> RecordBatch {
         println!("  scan options: {scan_options:?}");
         println!("  reading with filter {filter:?}");
-        let ctx = SessionContext::with_config(scan_options.config());
+        let ctx = SessionContext::new_with_config(scan_options.config());
         let exec = self
             .test_parquet_file
-            .create_scan(Some(filter.clone()))
+            .create_scan(&ctx, Some(filter.clone()))
             .await
             .unwrap();
         let result = collect(exec.clone(), ctx.task_ctx()).await.unwrap();
@@ -531,7 +529,7 @@ impl<'a> TestCase<'a> {
 
         // verify expected pushdown
         let metrics =
-            TestParquetFile::parquet_metrics(exec).expect("found parquet metrics");
+            TestParquetFile::parquet_metrics(&exec).expect("found parquet metrics");
 
         let pushdown_expected = if scan_options.pushdown_filters {
             self.pushdown_expected

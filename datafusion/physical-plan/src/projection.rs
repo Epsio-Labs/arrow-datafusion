@@ -26,30 +26,27 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::expressions::{Column, PhysicalSortExpr};
+use super::expressions::Column;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use super::{DisplayAs, RecordBatchStream, SendableRecordBatchStream, Statistics};
-use crate::{
-    ColumnStatistics, DisplayFormatType, EquivalenceProperties, ExecutionPlan,
-    Partitioning, PhysicalExpr,
+use super::{
+    DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
+use crate::{ColumnStatistics, DisplayFormatType, ExecutionPlan, PhysicalExpr};
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion_common::stats::Precision;
 use datafusion_common::Result;
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::expressions::{Literal, UnKnownColumn};
-use datafusion_physical_expr::{
-    normalize_out_expr_with_columns_map, project_equivalence_properties,
-    project_ordering_equivalence_properties, OrderingEquivalenceProperties,
-};
+use datafusion_physical_expr::equivalence::ProjectionMapping;
+use datafusion_physical_expr::expressions::Literal;
 
-use datafusion_physical_expr::utils::find_orderings_of_exprs;
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
 /// Execution plan for a projection
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProjectionExec {
     /// The projection expressions stored as tuples of (expression, output column name)
     pub(crate) expr: Vec<(Arc<dyn PhysicalExpr>, String)>,
@@ -57,17 +54,10 @@ pub struct ProjectionExec {
     schema: SchemaRef,
     /// The input plan
     input: Arc<dyn ExecutionPlan>,
-    /// The output ordering
-    output_ordering: Option<Vec<PhysicalSortExpr>>,
-    /// The columns map used to normalize out expressions like Partitioning and PhysicalSortExpr
-    /// The key is the column from the input schema and the values are the columns from the output schema
-    columns_map: HashMap<Column, Vec<Column>>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// Expressions' normalized orderings (as given by the output ordering API
-    /// and normalized with respect to equivalence classes of input plan). The
-    /// projected expressions are mapped by their indices to this vector.
-    orderings: Vec<Option<PhysicalSortExpr>>,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl ProjectionExec {
@@ -99,65 +89,16 @@ impl ProjectionExec {
             input_schema.metadata().clone(),
         ));
 
-        // construct a map from the input columns to the output columns of the Projection
-        let mut columns_map: HashMap<Column, Vec<Column>> = HashMap::new();
-        for (expr_idx, (expression, name)) in expr.iter().enumerate() {
-            if let Some(column) = expression.as_any().downcast_ref::<Column>() {
-                // For some executors, logical and physical plan schema fields
-                // are not the same. The information in a `Column` comes from
-                // the logical plan schema. Therefore, to produce correct results
-                // we use the field in the input schema with the same index. This
-                // corresponds to the physical plan `Column`.
-                let idx = column.index();
-                let matching_input_field = input_schema.field(idx);
-                let matching_input_column = Column::new(matching_input_field.name(), idx);
-                let entry = columns_map
-                    .entry(matching_input_column)
-                    .or_insert_with(Vec::new);
-                entry.push(Column::new(name, expr_idx));
-            };
-        }
-
-        // Output Ordering need to respect the alias
-        let child_output_ordering = input.output_ordering();
-        let output_ordering = match child_output_ordering {
-            Some(sort_exprs) => {
-                let normalized_exprs = sort_exprs
-                    .iter()
-                    .map(|sort_expr| {
-                        let expr = normalize_out_expr_with_columns_map(
-                            sort_expr.expr.clone(),
-                            &columns_map,
-                        );
-                        PhysicalSortExpr {
-                            expr,
-                            options: sort_expr.options,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                Some(normalized_exprs)
-            }
-            None => None,
-        };
-
-        let orderings = find_orderings_of_exprs(
-            &expr,
-            input.output_ordering(),
-            input.equivalence_properties(),
-            input.ordering_equivalence_properties(),
-        )?;
-
-        let output_ordering =
-            validate_output_ordering(output_ordering, &orderings, &expr);
-
+        // construct a map from the input expressions to the output expression of the Projection
+        let projection_mapping = ProjectionMapping::try_new(&expr, &input_schema)?;
+        let cache =
+            Self::compute_properties(&input, &projection_mapping, Arc::clone(&schema))?;
         Ok(Self {
             expr,
             schema,
             input,
-            output_ordering,
-            columns_map,
             metrics: ExecutionPlanMetricsSet::new(),
-            orderings,
+            cache,
         })
     }
 
@@ -169,6 +110,29 @@ impl ProjectionExec {
     /// The input plan
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        projection_mapping: &ProjectionMapping,
+        schema: SchemaRef,
+    ) -> Result<PlanProperties> {
+        // Calculate equivalence properties:
+        let mut input_eq_properties = input.equivalence_properties().clone();
+        input_eq_properties.substitute_oeq_class(projection_mapping)?;
+        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+
+        // Calculate output partitioning, which needs to respect aliases:
+        let input_partition = input.output_partitioning();
+        let output_partitioning =
+            input_partition.project(projection_mapping, &input_eq_properties);
+
+        Ok(PlanProperties::new(
+            eq_properties,
+            output_partitioning,
+            input.execution_mode(),
+        ))
     }
 }
 
@@ -200,48 +164,21 @@ impl DisplayAs for ProjectionExec {
 }
 
 impl ExecutionPlan for ProjectionExec {
+    fn name(&self) -> &'static str {
+        "ProjectionExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    /// Get the schema for this execution plan
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, children: &[bool]) -> Result<bool> {
-        Ok(children[0])
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        // Output partition need to respect the alias
-        let input_partition = self.input.output_partitioning();
-        match input_partition {
-            Partitioning::Hash(exprs, part) => {
-                let normalized_exprs = exprs
-                    .into_iter()
-                    .map(|expr| {
-                        normalize_out_expr_with_columns_map(expr, &self.columns_map)
-                    })
-                    .collect::<Vec<_>>();
-
-                Partitioning::Hash(normalized_exprs, part)
-            }
-            _ => input_partition,
-        }
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.output_ordering.as_deref()
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -249,59 +186,12 @@ impl ExecutionPlan for ProjectionExec {
         vec![true]
     }
 
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        let mut new_properties = EquivalenceProperties::new(self.schema());
-        project_equivalence_properties(
-            self.input.equivalence_properties(),
-            &self.columns_map,
-            &mut new_properties,
-        );
-        new_properties
-    }
-
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        let mut new_properties = OrderingEquivalenceProperties::new(self.schema());
-        if self.output_ordering.is_none() {
-            // If there is no output ordering, return an "empty" equivalence set:
-            return new_properties;
-        }
-
-        let input_oeq = self.input().ordering_equivalence_properties();
-
-        project_ordering_equivalence_properties(
-            input_oeq,
-            &self.columns_map,
-            &mut new_properties,
-        );
-
-        if let Some(leading_ordering) = self
-            .output_ordering
-            .as_ref()
-            .map(|output_ordering| &output_ordering[0])
-        {
-            for order in self.orderings.iter().flatten() {
-                if !order.eq(leading_ordering)
-                    && !new_properties.satisfies_leading_ordering(order)
-                {
-                    new_properties.add_equal_conditions((
-                        &vec![leading_ordering.clone()],
-                        &vec![order.clone()],
-                    ));
-                }
-            }
-        }
-
-        new_properties
-    }
-
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ProjectionExec::try_new(
-            self.expr.clone(),
-            children[0].clone(),
-        )?))
+        ProjectionExec::try_new(self.expr.clone(), children.swap_remove(0))
+            .map(|p| Arc::new(p) as _)
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -321,8 +211,8 @@ impl ExecutionPlan for ProjectionExec {
     ) -> Result<SendableRecordBatchStream> {
         trace!("Start ProjectionExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
         Ok(Box::pin(ProjectionStream {
-            schema: self.schema.clone(),
-            expr: self.expr.iter().map(|x| x.0.clone()).collect(),
+            schema: Arc::clone(&self.schema),
+            expr: self.expr.iter().map(|x| Arc::clone(&x.0)).collect(),
             input: self.input.execute(partition, context)?,
             baseline_metrics: BaselineMetrics::new(&self.metrics, partition),
         }))
@@ -332,47 +222,17 @@ impl ExecutionPlan for ProjectionExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        stats_projection(
-            self.input.statistics(),
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(stats_projection(
+            self.input.statistics()?,
             self.expr.iter().map(|(e, _)| Arc::clone(e)),
-            self.schema.clone(),
-        )
+            Arc::clone(&self.schema),
+        ))
     }
-}
 
-/// This function takes the current `output_ordering`, the `orderings` based on projected expressions,
-/// and the `expr` representing the projected expressions themselves. It aims to ensure that the output
-/// ordering is valid and correctly corresponds to the projected columns.
-///
-/// If the leading expression in the `output_ordering` is an [`UnKnownColumn`], it indicates that the column
-/// referenced in the ordering is not found among the projected expressions. In such cases, this function
-/// attempts to create a new output ordering by referring to valid columns from the leftmost side of the
-/// expressions that have an ordering specified.
-fn validate_output_ordering(
-    output_ordering: Option<Vec<PhysicalSortExpr>>,
-    orderings: &[Option<PhysicalSortExpr>],
-    expr: &[(Arc<dyn PhysicalExpr>, String)],
-) -> Option<Vec<PhysicalSortExpr>> {
-    output_ordering.and_then(|ordering| {
-        // If the leading expression is invalid column, change output
-        // ordering of the projection so that it refers to valid columns if
-        // possible.
-        if ordering[0].expr.as_any().is::<UnKnownColumn>() {
-            for (idx, order) in orderings.iter().enumerate() {
-                if let Some(sort_expr) = order {
-                    let (_, col_name) = &expr[idx];
-                    return Some(vec![PhysicalSortExpr {
-                        expr: Arc::new(Column::new(col_name, idx)),
-                        options: sort_expr.options,
-                    }]);
-                }
-            }
-            None
-        } else {
-            Some(ordering)
-        }
-    })
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
 }
 
 /// If e is a direct column reference, returns the field level
@@ -381,70 +241,46 @@ fn get_field_metadata(
     e: &Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
 ) -> Option<HashMap<String, String>> {
-    let name = if let Some(column) = e.as_any().downcast_ref::<Column>() {
-        column.name()
-    } else {
-        return None;
-    };
-
-    input_schema
-        .field_with_name(name)
-        .ok()
-        .map(|f| f.metadata().clone())
+    // Look up field by index in schema (not NAME as there can be more than one
+    // column with the same name)
+    e.as_any()
+        .downcast_ref::<Column>()
+        .map(|column| input_schema.field(column.index()).metadata())
+        .cloned()
 }
 
 fn stats_projection(
-    stats: Statistics,
+    mut stats: Statistics,
     exprs: impl Iterator<Item = Arc<dyn PhysicalExpr>>,
     schema: SchemaRef,
 ) -> Statistics {
-    let inner_exprs = exprs.collect::<Vec<_>>();
-    let column_statistics = stats.column_statistics.map(|input_col_stats| {
-        inner_exprs
-            .clone()
-            .into_iter()
-            .map(|e| {
-                if let Some(col) = e.as_any().downcast_ref::<Column>() {
-                    input_col_stats[col.index()].clone()
-                } else {
-                    // TODO stats: estimate more statistics from expressions
-                    // (expressions should compute their statistics themselves)
-                    ColumnStatistics::default()
-                }
-            })
-            .collect()
-    });
-
-    let primitive_row_size = inner_exprs
-        .into_iter()
-        .map(|e| match e.data_type(schema.as_ref()) {
-            Ok(data_type) => data_type.primitive_width(),
-            Err(_) => None,
-        })
-        .try_fold(0usize, |init, v| v.map(|value| init + value));
-
-    match (primitive_row_size, stats.num_rows) {
-        (Some(row_size), Some(row_count)) => {
-            Statistics {
-                is_exact: stats.is_exact,
-                num_rows: stats.num_rows,
-                column_statistics,
-                // Use the row_size * row_count as the total byte size
-                total_byte_size: Some(row_size * row_count),
+    let mut primitive_row_size = 0;
+    let mut primitive_row_size_possible = true;
+    let mut column_statistics = vec![];
+    for expr in exprs {
+        let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+            stats.column_statistics[col.index()].clone()
+        } else {
+            // TODO stats: estimate more statistics from expressions
+            // (expressions should compute their statistics themselves)
+            ColumnStatistics::new_unknown()
+        };
+        column_statistics.push(col_stats);
+        if let Ok(data_type) = expr.data_type(&schema) {
+            if let Some(value) = data_type.primitive_width() {
+                primitive_row_size += value;
+                continue;
             }
         }
-        _ => {
-            Statistics {
-                is_exact: stats.is_exact,
-                num_rows: stats.num_rows,
-                column_statistics,
-                // TODO stats: knowing the type of the new columns we can guess the output size
-                // If we can't get the exact statistics for the project
-                // Before we get the exact result, we just use the child status
-                total_byte_size: stats.total_byte_size,
-            }
-        }
+        primitive_row_size_possible = false;
     }
+
+    if primitive_row_size_possible {
+        stats.total_byte_size =
+            Precision::Exact(primitive_row_size).multiply(&stats.num_rows);
+    }
+    stats.column_statistics = column_statistics;
+    stats
 }
 
 impl ProjectionStream {
@@ -454,17 +290,19 @@ impl ProjectionStream {
         let arrays = self
             .expr
             .iter()
-            .map(|expr| expr.evaluate(batch))
-            .map(|r| r.map(|v| v.into_array(batch.num_rows())))
+            .map(|expr| {
+                expr.evaluate(batch)
+                    .and_then(|v| v.into_array(batch.num_rows()))
+            })
             .collect::<Result<Vec<_>>>()?;
 
         if arrays.is_empty() {
             let options =
                 RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-            RecordBatch::try_new_with_options(self.schema.clone(), arrays, &options)
+            RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
                 .map_err(Into::into)
         } else {
-            RecordBatch::try_new(self.schema.clone(), arrays).map_err(Into::into)
+            RecordBatch::try_new(Arc::clone(&self.schema), arrays).map_err(Into::into)
         }
     }
 }
@@ -501,7 +339,7 @@ impl Stream for ProjectionStream {
 impl RecordBatchStream for ProjectionStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -511,6 +349,7 @@ mod tests {
     use crate::common::collect;
     use crate::expressions;
     use crate::test;
+
     use arrow_schema::DataType;
     use datafusion_common::ScalarValue;
 
@@ -519,10 +358,12 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
 
         let exec = test::scan_partitioned(1);
-        let expected = collect(exec.execute(0, task_ctx.clone())?).await.unwrap();
+        let expected = collect(exec.execute(0, Arc::clone(&task_ctx))?)
+            .await
+            .unwrap();
 
         let projection = ProjectionExec::try_new(vec![], exec)?;
-        let stream = projection.execute(0, task_ctx.clone())?;
+        let stream = projection.execute(0, Arc::clone(&task_ctx))?;
         let output = collect(stream).await.unwrap();
         assert_eq!(output.len(), expected.len());
 
@@ -531,29 +372,28 @@ mod tests {
 
     fn get_stats() -> Statistics {
         Statistics {
-            is_exact: true,
-            num_rows: Some(5),
-            total_byte_size: Some(23),
-            column_statistics: Some(vec![
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(23),
+            column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: Some(5),
-                    max_value: Some(ScalarValue::Int64(Some(21))),
-                    min_value: Some(ScalarValue::Int64(Some(-4))),
-                    null_count: Some(0),
+                    distinct_count: Precision::Exact(5),
+                    max_value: Precision::Exact(ScalarValue::Int64(Some(21))),
+                    min_value: Precision::Exact(ScalarValue::Int64(Some(-4))),
+                    null_count: Precision::Exact(0),
                 },
                 ColumnStatistics {
-                    distinct_count: Some(1),
-                    max_value: Some(ScalarValue::Utf8(Some(String::from("x")))),
-                    min_value: Some(ScalarValue::Utf8(Some(String::from("a")))),
-                    null_count: Some(3),
+                    distinct_count: Precision::Exact(1),
+                    max_value: Precision::Exact(ScalarValue::from("x")),
+                    min_value: Precision::Exact(ScalarValue::from("a")),
+                    null_count: Precision::Exact(3),
                 },
                 ColumnStatistics {
-                    distinct_count: None,
-                    max_value: Some(ScalarValue::Float32(Some(1.1))),
-                    min_value: Some(ScalarValue::Float32(Some(0.1))),
-                    null_count: None,
+                    distinct_count: Precision::Absent,
+                    max_value: Precision::Exact(ScalarValue::Float32(Some(1.1))),
+                    min_value: Precision::Exact(ScalarValue::Float32(Some(0.1))),
+                    null_count: Precision::Absent,
                 },
-            ]),
+            ],
         }
     }
 
@@ -576,23 +416,22 @@ mod tests {
         let result = stats_projection(source, exprs.into_iter(), Arc::new(schema));
 
         let expected = Statistics {
-            is_exact: true,
-            num_rows: Some(5),
-            total_byte_size: Some(23),
-            column_statistics: Some(vec![
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(23),
+            column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: Some(1),
-                    max_value: Some(ScalarValue::Utf8(Some(String::from("x")))),
-                    min_value: Some(ScalarValue::Utf8(Some(String::from("a")))),
-                    null_count: Some(3),
+                    distinct_count: Precision::Exact(1),
+                    max_value: Precision::Exact(ScalarValue::from("x")),
+                    min_value: Precision::Exact(ScalarValue::from("a")),
+                    null_count: Precision::Exact(3),
                 },
                 ColumnStatistics {
-                    distinct_count: Some(5),
-                    max_value: Some(ScalarValue::Int64(Some(21))),
-                    min_value: Some(ScalarValue::Int64(Some(-4))),
-                    null_count: Some(0),
+                    distinct_count: Precision::Exact(5),
+                    max_value: Precision::Exact(ScalarValue::Int64(Some(21))),
+                    min_value: Precision::Exact(ScalarValue::Int64(Some(-4))),
+                    null_count: Precision::Exact(0),
                 },
-            ]),
+            ],
         };
 
         assert_eq!(result, expected);
@@ -611,23 +450,22 @@ mod tests {
         let result = stats_projection(source, exprs.into_iter(), Arc::new(schema));
 
         let expected = Statistics {
-            is_exact: true,
-            num_rows: Some(5),
-            total_byte_size: Some(60),
-            column_statistics: Some(vec![
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(60),
+            column_statistics: vec![
                 ColumnStatistics {
-                    distinct_count: None,
-                    max_value: Some(ScalarValue::Float32(Some(1.1))),
-                    min_value: Some(ScalarValue::Float32(Some(0.1))),
-                    null_count: None,
+                    distinct_count: Precision::Absent,
+                    max_value: Precision::Exact(ScalarValue::Float32(Some(1.1))),
+                    min_value: Precision::Exact(ScalarValue::Float32(Some(0.1))),
+                    null_count: Precision::Absent,
                 },
                 ColumnStatistics {
-                    distinct_count: Some(5),
-                    max_value: Some(ScalarValue::Int64(Some(21))),
-                    min_value: Some(ScalarValue::Int64(Some(-4))),
-                    null_count: Some(0),
+                    distinct_count: Precision::Exact(5),
+                    max_value: Precision::Exact(ScalarValue::Int64(Some(21))),
+                    min_value: Precision::Exact(ScalarValue::Int64(Some(-4))),
+                    null_count: Precision::Exact(0),
                 },
-            ]),
+            ],
         };
 
         assert_eq!(result, expected);

@@ -19,6 +19,7 @@
 //! user defined window functions
 
 use std::{
+    any::Any,
     ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -32,13 +33,16 @@ use arrow_schema::DataType;
 use datafusion::{assert_batches_eq, prelude::SessionContext};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{
-    function::PartitionEvaluatorFactory, PartitionEvaluator, ReturnTypeFunction,
-    Signature, Volatility, WindowUDF,
+    PartitionEvaluator, Signature, Volatility, WindowUDF, WindowUDFImpl,
 };
 
 /// A query with a window function evaluated over the entire partition
 const UNBOUNDED_WINDOW_QUERY: &str = "SELECT x, y, val, \
      odd_counter(val) OVER (PARTITION BY x ORDER BY y) \
+     from t ORDER BY x, y";
+
+const UNBOUNDED_WINDOW_QUERY_WITH_ALIAS: &str = "SELECT x, y, val, \
+     odd_counter_alias(val) OVER (PARTITION BY x ORDER BY y) \
      from t ORDER BY x, y";
 
 /// A query with a window function evaluated over a moving window
@@ -101,6 +105,50 @@ async fn test_udwf() {
     );
     // evaluated on two distinct batches
     assert_eq!(test_state.evaluate_all_called(), 2);
+}
+
+#[tokio::test]
+async fn test_deregister_udwf() -> Result<()> {
+    let test_state = Arc::new(TestState::new());
+    let mut ctx = SessionContext::new();
+    OddCounter::register(&mut ctx, Arc::clone(&test_state));
+
+    assert!(ctx.state().window_functions().contains_key("odd_counter"));
+
+    ctx.deregister_udwf("odd_counter");
+
+    assert!(!ctx.state().window_functions().contains_key("odd_counter"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udwf_with_alias() {
+    let test_state = TestState::new();
+    let TestContext { ctx, .. } = TestContext::new(test_state);
+
+    let expected = vec![
+        "+---+---+-----+-----------------------------------------------------------------------------------------------------------------------+",
+        "| x | y | val | odd_counter(t.val) PARTITION BY [t.x] ORDER BY [t.y ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW |",
+        "+---+---+-----+-----------------------------------------------------------------------------------------------------------------------+",
+        "| 1 | a | 0   | 1                                                                                                                     |",
+        "| 1 | b | 1   | 1                                                                                                                     |",
+        "| 1 | c | 2   | 1                                                                                                                     |",
+        "| 2 | d | 3   | 2                                                                                                                     |",
+        "| 2 | e | 4   | 2                                                                                                                     |",
+        "| 2 | f | 5   | 2                                                                                                                     |",
+        "| 2 | g | 6   | 2                                                                                                                     |",
+        "| 2 | h | 6   | 2                                                                                                                     |",
+        "| 2 | i | 6   | 2                                                                                                                     |",
+        "| 2 | j | 6   | 2                                                                                                                     |",
+        "+---+---+-----+-----------------------------------------------------------------------------------------------------------------------+",
+    ];
+    assert_batches_eq!(
+        expected,
+        &execute(&ctx, UNBOUNDED_WINDOW_QUERY_WITH_ALIAS)
+            .await
+            .unwrap()
+    );
 }
 
 /// Basic user defined window function with bounded window
@@ -471,24 +519,55 @@ impl OddCounter {
     }
 
     fn register(ctx: &mut SessionContext, test_state: Arc<TestState>) {
-        let name = "odd_counter";
-        let volatility = Volatility::Immutable;
+        #[derive(Debug, Clone)]
+        struct SimpleWindowUDF {
+            signature: Signature,
+            return_type: DataType,
+            test_state: Arc<TestState>,
+            aliases: Vec<String>,
+        }
 
-        let signature = Signature::exact(vec![DataType::Int64], volatility);
+        impl SimpleWindowUDF {
+            fn new(test_state: Arc<TestState>) -> Self {
+                let signature =
+                    Signature::exact(vec![DataType::Float64], Volatility::Immutable);
+                let return_type = DataType::Int64;
+                Self {
+                    signature,
+                    return_type,
+                    test_state,
+                    aliases: vec!["odd_counter_alias".to_string()],
+                }
+            }
+        }
 
-        let return_type = Arc::new(DataType::Int64);
-        let return_type: ReturnTypeFunction =
-            Arc::new(move |_| Ok(Arc::clone(&return_type)));
+        impl WindowUDFImpl for SimpleWindowUDF {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
 
-        let partition_evaluator_factory: PartitionEvaluatorFactory =
-            Arc::new(move || Ok(Box::new(OddCounter::new(Arc::clone(&test_state)))));
+            fn name(&self) -> &str {
+                "odd_counter"
+            }
 
-        ctx.register_udwf(WindowUDF::new(
-            name,
-            &signature,
-            &return_type,
-            &partition_evaluator_factory,
-        ))
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+
+            fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+                Ok(self.return_type.clone())
+            }
+
+            fn partition_evaluator(&self) -> Result<Box<dyn PartitionEvaluator>> {
+                Ok(Box::new(OddCounter::new(Arc::clone(&self.test_state))))
+            }
+
+            fn aliases(&self) -> &[String] {
+                &self.aliases
+            }
+        }
+
+        ctx.register_udwf(WindowUDF::from(SimpleWindowUDF::new(test_state)))
     }
 }
 

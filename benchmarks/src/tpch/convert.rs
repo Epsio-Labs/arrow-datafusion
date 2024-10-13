@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::instant::Instant;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use datafusion::common::not_impl_err;
-use datafusion::error::DataFusionError;
+
 use datafusion::error::Result;
 use datafusion::prelude::*;
 use parquet::basic::Compression;
@@ -78,7 +78,7 @@ impl ConvertOpt {
                 .file_extension(".tbl");
 
             let config = SessionConfig::new().with_batch_size(self.batch_size);
-            let ctx = SessionContext::with_config(config);
+            let ctx = SessionContext::new_with_config(config);
 
             // build plan to read the TBL file
             let mut csv = ctx.read_csv(&input_path, options).await?;
@@ -86,10 +86,9 @@ impl ConvertOpt {
             // Select all apart from the padding column
             let selection = csv
                 .schema()
-                .fields()
                 .iter()
                 .take(schema.fields.len() - 1)
-                .map(|d| Expr::Column(d.qualified_column()))
+                .map(Expr::from)
                 .collect();
 
             csv = csv.select(selection)?;

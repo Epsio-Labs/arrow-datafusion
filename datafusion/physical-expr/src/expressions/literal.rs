@@ -21,16 +21,17 @@ use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::physical_expr::down_cast_any_ref;
-use crate::sort_properties::SortProperties;
-use crate::PhysicalExpr;
+use crate::physical_expr::{down_cast_any_ref, PhysicalExpr};
 
 use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::{ColumnarValue, Expr};
+use datafusion_expr::Expr;
+use datafusion_expr_common::columnar_value::ColumnarValue;
+use datafusion_expr_common::interval_arithmetic::Interval;
+use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 
 /// Represents a literal value
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -74,7 +75,7 @@ impl PhysicalExpr for Literal {
         Ok(ColumnarValue::Scalar(self.value.clone()))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         vec![]
     }
 
@@ -90,8 +91,11 @@ impl PhysicalExpr for Literal {
         self.hash(&mut s);
     }
 
-    fn get_ordering(&self, _children: &[SortProperties]) -> SortProperties {
-        SortProperties::Singleton
+    fn get_properties(&self, _children: &[ExprProperties]) -> Result<ExprProperties> {
+        Ok(ExprProperties {
+            sort_properties: SortProperties::Singleton,
+            range: Interval::try_new(self.value().clone(), self.value().clone())?,
+        })
     }
 }
 
@@ -115,10 +119,10 @@ pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use arrow::array::Int32Array;
     use arrow::datatypes::*;
     use datafusion_common::cast::as_int32_array;
-    use datafusion_common::Result;
 
     #[test]
     fn literal_i32() -> Result<()> {
@@ -131,7 +135,10 @@ mod tests {
         let literal_expr = lit(42i32);
         assert_eq!("42", format!("{literal_expr}"));
 
-        let literal_array = literal_expr.evaluate(&batch)?.into_array(batch.num_rows());
+        let literal_array = literal_expr
+            .evaluate(&batch)?
+            .into_array(batch.num_rows())
+            .expect("Failed to convert to array");
         let literal_array = as_int32_array(&literal_array)?;
 
         // note that the contents of the literal array are unrelated to the batch contents except for the length of the array

@@ -15,18 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer rule to replace `LIMIT 0` or
-//! `LIMIT whose ancestor LIMIT's skip is greater than or equal to current's fetch`
-//! on a plan with an empty relation.
-//! This rule also removes OFFSET 0 from the [LogicalPlan]
-//! This saves time in planning and executing the query.
+//! [`EliminateLimit`] eliminates `LIMIT` when possible
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::tree_node::Transformed;
 use datafusion_common::Result;
 use datafusion_expr::logical_plan::{EmptyRelation, LogicalPlan};
+use std::sync::Arc;
 
-/// Optimization rule that eliminate LIMIT 0 or useless LIMIT(skip:0, fetch:None).
-/// It can cooperate with `propagate_empty_relation` and `limit_push_down`.
+/// Optimizer rule to replace `LIMIT 0` or `LIMIT` whose ancestor LIMIT's skip is
+/// greater than or equal to current's fetch
+///
+/// It can cooperate with `propagate_empty_relation` and `limit_push_down`. on a
+/// plan with an empty relation.
+///
+/// This rule also removes OFFSET 0 from the [LogicalPlan]
 #[derive(Default)]
 pub struct EliminateLimit;
 
@@ -38,42 +41,47 @@ impl EliminateLimit {
 }
 
 impl OptimizerRule for EliminateLimit {
-    fn try_optimize(
-        &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        if let LogicalPlan::Limit(limit) = plan {
-            match limit.fetch {
-                Some(fetch) => {
-                    if fetch == 0 {
-                        return Ok(Some(LogicalPlan::EmptyRelation(EmptyRelation {
-                            produce_one_row: false,
-                            schema: limit.input.schema().clone(),
-                        })));
-                    }
-                }
-                None => {
-                    if limit.skip == 0 {
-                        let input = limit.input.as_ref();
-                        // input also can be Limit, so we should apply again.
-                        return Ok(Some(
-                            self.try_optimize(input, _config)?
-                                .unwrap_or_else(|| input.clone()),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
     fn name(&self) -> &str {
         "eliminate_limit"
     }
 
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::BottomUp)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<
+        datafusion_common::tree_node::Transformed<LogicalPlan>,
+        datafusion_common::DataFusionError,
+    > {
+        match plan {
+            LogicalPlan::Limit(limit) => {
+                if let Some(fetch) = limit.fetch {
+                    if fetch == 0 {
+                        return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                            EmptyRelation {
+                                produce_one_row: false,
+                                schema: Arc::clone(limit.input.schema()),
+                            },
+                        )));
+                    }
+                } else if limit.skip == 0 {
+                    // input also can be Limit, so we should apply again.
+                    return Ok(self
+                        .rewrite(Arc::unwrap_or_clone(limit.input), _config)
+                        .unwrap());
+                }
+                Ok(Transformed::no(LogicalPlan::Limit(limit)))
+            }
+            _ => Ok(Transformed::no(plan)),
+        }
     }
 }
 
@@ -87,30 +95,25 @@ mod tests {
     use datafusion_expr::{
         col,
         logical_plan::{builder::LogicalPlanBuilder, JoinType},
-        sum,
     };
     use std::sync::Arc;
 
     use crate::push_down_limit::PushDownLimit;
+    use datafusion_expr::test::function_stub::sum;
 
-    fn assert_optimized_plan_eq(plan: &LogicalPlan, expected: &str) -> Result<()> {
+    fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
+    fn assert_optimized_plan_eq(plan: LogicalPlan, expected: &str) -> Result<()> {
         let optimizer = Optimizer::with_rules(vec![Arc::new(EliminateLimit::new())]);
-        let optimized_plan = optimizer
-            .optimize_recursively(
-                optimizer.rules.get(0).unwrap(),
-                plan,
-                &OptimizerContext::new(),
-            )?
-            .unwrap_or_else(|| plan.clone());
+        let optimized_plan =
+            optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
 
-        let formatted_plan = format!("{optimized_plan:?}");
+        let formatted_plan = format!("{optimized_plan}");
         assert_eq!(formatted_plan, expected);
-        assert_eq!(plan.schema(), optimized_plan.schema());
         Ok(())
     }
 
     fn assert_optimized_plan_eq_with_pushdown(
-        plan: &LogicalPlan,
+        plan: LogicalPlan,
         expected: &str,
     ) -> Result<()> {
         fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
@@ -122,9 +125,8 @@ mod tests {
         let optimized_plan = optimizer
             .optimize(plan, &config, observe)
             .expect("failed to optimize plan");
-        let formatted_plan = format!("{optimized_plan:?}");
+        let formatted_plan = format!("{optimized_plan}");
         assert_eq!(formatted_plan, expected);
-        assert_eq!(plan.schema(), optimized_plan.schema());
         Ok(())
     }
 
@@ -137,7 +139,7 @@ mod tests {
             .build()?;
         // No aggregate / scan / limit
         let expected = "EmptyRelation";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -155,9 +157,9 @@ mod tests {
         // Left side is removed
         let expected = "Union\
             \n  EmptyRelation\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+            \n  Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n    TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -171,7 +173,7 @@ mod tests {
 
         // No aggregate / scan / limit
         let expected = "EmptyRelation";
-        assert_optimized_plan_eq_with_pushdown(&plan, expected)
+        assert_optimized_plan_eq_with_pushdown(plan, expected)
     }
 
     #[test]
@@ -180,18 +182,18 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(vec![col("a")], vec![sum(col("b"))])?
             .limit(0, Some(2))?
-            .sort(vec![col("a")])?
+            .sort_by(vec![col("a")])?
             .limit(2, Some(1))?
             .build()?;
 
         // After remove global-state, we don't record the parent <skip, fetch>
         // So, bottom don't know parent info, so can't eliminate.
         let expected = "Limit: skip=2, fetch=1\
-        \n  Sort: test.a, fetch=3\
+        \n  Sort: test.a ASC NULLS LAST, fetch=3\
         \n    Limit: skip=0, fetch=2\
-        \n      Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+        \n      Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
         \n        TableScan: test";
-        assert_optimized_plan_eq_with_pushdown(&plan, expected)
+        assert_optimized_plan_eq_with_pushdown(plan, expected)
     }
 
     #[test]
@@ -200,16 +202,16 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(vec![col("a")], vec![sum(col("b"))])?
             .limit(0, Some(2))?
-            .sort(vec![col("a")])?
+            .sort_by(vec![col("a")])?
             .limit(0, Some(1))?
             .build()?;
 
         let expected = "Limit: skip=0, fetch=1\
-            \n  Sort: test.a\
+            \n  Sort: test.a ASC NULLS LAST\
             \n    Limit: skip=0, fetch=2\
-            \n      Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+            \n      Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n        TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -218,16 +220,16 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan)
             .aggregate(vec![col("a")], vec![sum(col("b"))])?
             .limit(2, Some(1))?
-            .sort(vec![col("a")])?
+            .sort_by(vec![col("a")])?
             .limit(3, Some(1))?
             .build()?;
 
         let expected = "Limit: skip=3, fetch=1\
-        \n  Sort: test.a\
+        \n  Sort: test.a ASC NULLS LAST\
         \n    Limit: skip=2, fetch=1\
-        \n      Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+        \n      Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
         \n        TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -249,7 +251,7 @@ mod tests {
             \n    Limit: skip=2, fetch=1\
             \n      TableScan: test\
             \n    TableScan: test1";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 
     #[test]
@@ -260,8 +262,8 @@ mod tests {
             .limit(0, None)?
             .build()?;
 
-        let expected = "Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b)]]\
+        let expected = "Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b)]]\
             \n  TableScan: test";
-        assert_optimized_plan_eq(&plan, expected)
+        assert_optimized_plan_eq(plan, expected)
     }
 }

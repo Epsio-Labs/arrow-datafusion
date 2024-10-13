@@ -17,21 +17,24 @@
 
 //! Defines the ANALYZE operator
 
+use std::any::Any;
 use std::sync::Arc;
-use std::{any::Any, time::Instant};
 
-use crate::{
-    display::DisplayableExecutionPlan, DisplayFormatType, ExecutionPlan, Partitioning,
-    Statistics,
-};
-use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::{internal_err, DataFusionError, Result};
-use futures::StreamExt;
-
-use super::expressions::PhysicalSortExpr;
 use super::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
-use super::{DisplayAs, Distribution, SendableRecordBatchStream};
+use super::{
+    DisplayAs, Distribution, ExecutionPlanProperties, PlanProperties,
+    SendableRecordBatchStream,
+};
+use crate::display::DisplayableExecutionPlan;
+use crate::{DisplayFormatType, ExecutionPlan, Partitioning};
+
+use arrow::{array::StringBuilder, datatypes::SchemaRef, record_batch::RecordBatch};
+use datafusion_common::instant::Instant;
+use datafusion_common::{internal_err, DataFusionError, Result};
 use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
+
+use futures::StreamExt;
 
 /// `EXPLAIN ANALYZE` execution plan operator. This operator runs its input,
 /// discards the results, and then prints out an annotated plan with metrics
@@ -45,6 +48,7 @@ pub struct AnalyzeExec {
     pub(crate) input: Arc<dyn ExecutionPlan>,
     /// The output schema for RecordBatches of this exec node
     schema: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl AnalyzeExec {
@@ -55,12 +59,40 @@ impl AnalyzeExec {
         input: Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
     ) -> Self {
+        let cache = Self::compute_properties(&input, Arc::clone(&schema));
         AnalyzeExec {
             verbose,
             show_statistics,
             input,
             schema,
+            cache,
         }
+    }
+
+    /// access to verbose
+    pub fn verbose(&self) -> bool {
+        self.verbose
+    }
+
+    /// access to show_statistics
+    pub fn show_statistics(&self) -> bool {
+        self.show_statistics
+    }
+
+    /// The input plan
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        schema: SchemaRef,
+    ) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        let output_partitioning = Partitioning::UnknownPartitioning(1);
+        let exec_mode = input.execution_mode();
+        PlanProperties::new(eq_properties, output_partitioning, exec_mode)
     }
 }
 
@@ -79,38 +111,26 @@ impl DisplayAs for AnalyzeExec {
 }
 
 impl ExecutionPlan for AnalyzeExec {
+    fn name(&self) -> &'static str {
+        "AnalyzeExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     /// AnalyzeExec is handled specially so this value is ignored
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![]
-    }
-
-    /// Specifies whether this plan generates an infinite stream of records.
-    /// If the plan does not support pipelining, but its input(s) are
-    /// infinite, returns an error to indicate this.
-    fn unbounded_output(&self, _children: &[bool]) -> Result<bool> {
-        internal_err!("Optimization not supported for ANALYZE")
-    }
-
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
     }
 
     fn with_new_children(
@@ -121,7 +141,7 @@ impl ExecutionPlan for AnalyzeExec {
             self.verbose,
             self.show_statistics,
             children.pop().unwrap(),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
         )))
     }
 
@@ -144,13 +164,17 @@ impl ExecutionPlan for AnalyzeExec {
             RecordBatchReceiverStream::builder(self.schema(), num_input_partitions);
 
         for input_partition in 0..num_input_partitions {
-            builder.run_input(self.input.clone(), input_partition, context.clone());
+            builder.run_input(
+                Arc::clone(&self.input),
+                input_partition,
+                Arc::clone(&context),
+            );
         }
 
         // Create future that computes thefinal output
         let start = Instant::now();
-        let captured_input = self.input.clone();
-        let captured_schema = self.schema.clone();
+        let captured_input = Arc::clone(&self.input);
+        let captured_schema = Arc::clone(&self.schema);
         let verbose = self.verbose;
         let show_statistics = self.show_statistics;
 
@@ -176,18 +200,13 @@ impl ExecutionPlan for AnalyzeExec {
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             futures::stream::once(output),
         )))
     }
-
-    fn statistics(&self) -> Statistics {
-        // Statistics an an ANALYZE plan are not relevant
-        Statistics::default()
-    }
 }
 
-/// Creates the ouput of AnalyzeExec as a RecordBatch
+/// Creates the output of AnalyzeExec as a RecordBatch
 fn create_output_batch(
     verbose: bool,
     show_statistics: bool,
@@ -238,9 +257,7 @@ fn create_output_batch(
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field, Schema};
-    use futures::FutureExt;
-
+    use super::*;
     use crate::{
         collect,
         test::{
@@ -249,7 +266,8 @@ mod tests {
         },
     };
 
-    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use futures::FutureExt;
 
     #[tokio::test]
     async fn test_drop_cancel() -> Result<()> {

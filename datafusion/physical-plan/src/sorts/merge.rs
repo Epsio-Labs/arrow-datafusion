@@ -18,87 +18,29 @@
 //! Merge that deals with an arbitrary size of streaming inputs.
 //! This is an order-preserving merge.
 
-use crate::metrics::BaselineMetrics;
-use crate::sorts::builder::BatchBuilder;
-use crate::sorts::cursor::Cursor;
-use crate::sorts::stream::{FieldCursorStream, PartitionedStream, RowCursorStream};
-use crate::{PhysicalSortExpr, RecordBatchStream, SendableRecordBatchStream};
-use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use arrow_array::*;
-use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
-use futures::Stream;
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-macro_rules! primitive_merge_helper {
-    ($t:ty, $($v:ident),+) => {
-        merge_helper!(PrimitiveArray<$t>, $($v),+)
-    };
-}
+use crate::metrics::BaselineMetrics;
+use crate::sorts::builder::BatchBuilder;
+use crate::sorts::cursor::{Cursor, CursorValues};
+use crate::sorts::stream::PartitionedStream;
+use crate::RecordBatchStream;
 
-macro_rules! merge_helper {
-    ($t:ty, $sort:ident, $streams:ident, $schema:ident, $tracking_metrics:ident, $batch_size:ident, $fetch:ident, $reservation:ident) => {{
-        let streams = FieldCursorStream::<$t>::new($sort, $streams);
-        return Ok(Box::pin(SortPreservingMergeStream::new(
-            Box::new(streams),
-            $schema,
-            $tracking_metrics,
-            $batch_size,
-            $fetch,
-            $reservation,
-        )));
-    }};
-}
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use datafusion_common::Result;
+use datafusion_execution::memory_pool::MemoryReservation;
 
-/// Perform a streaming merge of [`SendableRecordBatchStream`] based on provided sort expressions
-/// while preserving order.
-pub fn streaming_merge(
-    streams: Vec<SendableRecordBatchStream>,
-    schema: SchemaRef,
-    expressions: &[PhysicalSortExpr],
-    metrics: BaselineMetrics,
-    batch_size: usize,
-    fetch: Option<usize>,
-    reservation: MemoryReservation,
-) -> Result<SendableRecordBatchStream> {
-    // Special case single column comparisons with optimized cursor implementations
-    if expressions.len() == 1 {
-        let sort = expressions[0].clone();
-        let data_type = sort.expr.data_type(schema.as_ref())?;
-        downcast_primitive! {
-            data_type => (primitive_merge_helper, sort, streams, schema, metrics, batch_size, fetch, reservation),
-            DataType::Utf8 => merge_helper!(StringArray, sort, streams, schema, metrics, batch_size, fetch, reservation)
-            DataType::LargeUtf8 => merge_helper!(LargeStringArray, sort, streams, schema, metrics, batch_size, fetch, reservation)
-            DataType::Binary => merge_helper!(BinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation)
-            DataType::LargeBinary => merge_helper!(LargeBinaryArray, sort, streams, schema, metrics, batch_size, fetch, reservation)
-            _ => {}
-        }
-    }
-
-    let streams = RowCursorStream::try_new(
-        schema.as_ref(),
-        expressions,
-        streams,
-        reservation.new_empty(),
-    )?;
-
-    Ok(Box::pin(SortPreservingMergeStream::new(
-        Box::new(streams),
-        schema,
-        metrics,
-        batch_size,
-        fetch,
-        reservation,
-    )))
-}
+use futures::Stream;
 
 /// A fallible [`PartitionedStream`] of [`Cursor`] and [`RecordBatch`]
 type CursorStream<C> = Box<dyn PartitionedStream<Output = Result<(C, RecordBatch)>>>;
 
 #[derive(Debug)]
-struct SortPreservingMergeStream<C> {
+pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
     in_progress: BatchBuilder,
 
     /// The sorted input streams to merge together
@@ -148,21 +90,27 @@ struct SortPreservingMergeStream<C> {
     /// been updated
     loser_tree_adjusted: bool,
 
-    /// target batch size
+    /// Target batch size
     batch_size: usize,
 
-    /// Vector that holds cursors for each non-exhausted input partition
-    cursors: Vec<Option<C>>,
+    /// Cursors for each input partition. `None` means the input is exhausted
+    cursors: Vec<Option<Cursor<C>>>,
 
     /// Optional number of rows to fetch
     fetch: Option<usize>,
 
     /// number of rows produced
     produced: usize,
+
+    /// This queue contains partition indices in order. When a partition is polled and returns `Poll::Ready`,
+    /// it is removed from the vector. If a partition returns `Poll::Pending`, it is moved to the end of the
+    /// vector to ensure the next iteration starts with a different partition, preventing the same partition
+    /// from being continuously polled.
+    uninitiated_partitions: VecDeque<usize>,
 }
 
-impl<C: Cursor> SortPreservingMergeStream<C> {
-    fn new(
+impl<C: CursorValues> SortPreservingMergeStream<C> {
+    pub(crate) fn new(
         streams: CursorStream<C>,
         schema: SchemaRef,
         metrics: BaselineMetrics,
@@ -183,6 +131,7 @@ impl<C: Cursor> SortPreservingMergeStream<C> {
             batch_size,
             fetch,
             produced: 0,
+            uninitiated_partitions: (0..stream_count).collect(),
         }
     }
 
@@ -203,7 +152,7 @@ impl<C: Cursor> SortPreservingMergeStream<C> {
             None => Poll::Ready(Ok(())),
             Some(Err(e)) => Poll::Ready(Err(e)),
             Some(Ok((cursor, batch))) => {
-                self.cursors[idx] = Some(cursor);
+                self.cursors[idx] = Some(Cursor::new(cursor));
                 Poll::Ready(self.in_progress.push_batch(idx, batch))
             }
         }
@@ -216,14 +165,36 @@ impl<C: Cursor> SortPreservingMergeStream<C> {
         if self.aborted {
             return Poll::Ready(None);
         }
-        // try to initialize the loser tree
+        // Once all partitions have set their corresponding cursors for the loser tree,
+        // we skip the following block. Until then, this function may be called multiple
+        // times and can return Poll::Pending if any partition returns Poll::Pending.
         if self.loser_tree.is_empty() {
-            // Ensure all non-exhausted streams have a cursor from which
-            // rows can be pulled
-            for i in 0..self.streams.partitions() {
-                if let Err(e) = ready!(self.maybe_poll_stream(cx, i)) {
-                    self.aborted = true;
-                    return Poll::Ready(Some(Err(e)));
+            let remaining_partitions = self.uninitiated_partitions.clone();
+            for i in remaining_partitions {
+                match self.maybe_poll_stream(cx, i) {
+                    Poll::Ready(Err(e)) => {
+                        self.aborted = true;
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Pending => {
+                        // If a partition returns Poll::Pending, to avoid continuously polling it
+                        // and potentially increasing upstream buffer sizes, we move it to the
+                        // back of the polling queue.
+                        if let Some(front) = self.uninitiated_partitions.pop_front() {
+                            // This pop_front can never return `None`.
+                            self.uninitiated_partitions.push_back(front);
+                        }
+                        // This function could remain in a pending state, so we manually wake it here.
+                        // However, this approach can be investigated further to find a more natural way
+                        // to avoid disrupting the runtime scheduler.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    _ => {
+                        // If the polling result is Poll::Ready(Some(batch)) or Poll::Ready(None),
+                        // we remove this partition from the queue so it is not polled again.
+                        self.uninitiated_partitions.retain(|idx| *idx != i);
+                    }
                 }
             }
             self.init_loser_tree();
@@ -373,7 +344,7 @@ impl<C: Cursor> SortPreservingMergeStream<C> {
     }
 }
 
-impl<C: Cursor + Unpin> Stream for SortPreservingMergeStream<C> {
+impl<C: CursorValues + Unpin> Stream for SortPreservingMergeStream<C> {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
@@ -385,8 +356,8 @@ impl<C: Cursor + Unpin> Stream for SortPreservingMergeStream<C> {
     }
 }
 
-impl<C: Cursor + Unpin> RecordBatchStream for SortPreservingMergeStream<C> {
+impl<C: CursorValues + Unpin> RecordBatchStream for SortPreservingMergeStream<C> {
     fn schema(&self) -> SchemaRef {
-        self.in_progress.schema().clone()
+        Arc::clone(self.in_progress.schema())
     }
 }

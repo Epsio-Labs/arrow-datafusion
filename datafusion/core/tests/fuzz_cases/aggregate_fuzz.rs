@@ -17,56 +17,62 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use arrow::compute::{concat_batches, SortOptions};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
+use arrow_array::types::Int64Type;
+use datafusion::common::Result;
+use datafusion::datasource::MemTable;
+use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
-use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_physical_expr::expressions::{col, Sum};
-use datafusion_physical_expr::{AggregateExpr, PhysicalSortExpr};
-use test_utils::add_empty_batches;
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion_functions_aggregate::sum::sum_udaf;
+use datafusion_physical_expr::expressions::col;
+use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_physical_plan::InputOrderMode;
+use test_utils::{add_empty_batches, StringBatchGenerator};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+use hashbrown::HashMap;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use tokio::task::JoinSet;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn aggregate_test() {
-        let test_cases = vec![
-            vec!["a"],
-            vec!["b", "a"],
-            vec!["c", "a"],
-            vec!["c", "b", "a"],
-            vec!["d", "a"],
-            vec!["d", "b", "a"],
-            vec!["d", "c", "a"],
-            vec!["d", "c", "b", "a"],
-        ];
-        let n = 300;
-        let distincts = vec![10, 20];
-        for distinct in distincts {
-            let mut handles = Vec::new();
-            for i in 0..n {
-                let test_idx = i % test_cases.len();
-                let group_by_columns = test_cases[test_idx].clone();
-                let job = tokio::spawn(run_aggregate_test(
-                    make_staggered_batches::<true>(1000, distinct, i as u64),
-                    group_by_columns,
-                ));
-                handles.push(job);
-            }
-            for job in handles {
-                job.await.unwrap();
-            }
+/// Tests that streaming aggregate and batch (non streaming) aggregate produce
+/// same results
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_aggregate_test() {
+    let test_cases = [
+        vec!["a"],
+        vec!["b", "a"],
+        vec!["c", "a"],
+        vec!["c", "b", "a"],
+        vec!["d", "a"],
+        vec!["d", "b", "a"],
+        vec!["d", "c", "a"],
+        vec!["d", "c", "b", "a"],
+    ];
+    let n = 300;
+    let distincts = vec![10, 20];
+    for distinct in distincts {
+        let mut join_set = JoinSet::new();
+        for i in 0..n {
+            let test_idx = i % test_cases.len();
+            let group_by_columns = test_cases[test_idx].clone();
+            join_set.spawn(run_aggregate_test(
+                make_staggered_batches::<true>(1000, distinct, i as u64),
+                group_by_columns,
+            ));
+        }
+        while let Some(join_handle) = join_set.join_next().await {
+            // propagate errors
+            join_handle.unwrap();
         }
     }
 }
@@ -77,7 +83,7 @@ mod tests {
 async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str>) {
     let schema = input1[0].schema();
     let session_config = SessionConfig::new().with_batch_size(50);
-    let ctx = SessionContext::with_config(session_config);
+    let ctx = SessionContext::new_with_config(session_config);
     let mut sort_keys = vec![];
     for ordering_col in ["a", "b", "c"] {
         sort_keys.push(PhysicalSortExpr {
@@ -97,11 +103,14 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
             .with_sort_information(vec![sort_keys]),
     );
 
-    let aggregate_expr = vec![Arc::new(Sum::new(
-        col("d", &schema).unwrap(),
-        "sum1",
-        DataType::Int64,
-    )) as Arc<dyn AggregateExpr>];
+    let aggregate_expr =
+        vec![
+            AggregateExprBuilder::new(sum_udaf(), vec![col("d", &schema).unwrap()])
+                .schema(Arc::clone(&schema))
+                .alias("sum1")
+                .build()
+                .unwrap(),
+        ];
     let expr = group_by_columns
         .iter()
         .map(|elem| (col(elem, &schema).unwrap(), elem.to_string()))
@@ -114,7 +123,6 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
             group_by.clone(),
             aggregate_expr.clone(),
             vec![None],
-            vec![None],
             running_source,
             schema.clone(),
         )
@@ -126,7 +134,6 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
             AggregateMode::Partial,
             group_by.clone(),
             aggregate_expr.clone(),
-            vec![None],
             vec![None],
             usual_source,
             schema.clone(),
@@ -240,4 +247,160 @@ pub(crate) fn make_staggered_batches<const STREAM: bool>(
         }
     }
     add_empty_batches(batches, &mut rng)
+}
+
+/// Test group by with string/large string columns
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_strings() {
+    let mut join_set = JoinSet::new();
+    for large in [true, false] {
+        for sorted in [true, false] {
+            for generator in StringBatchGenerator::interesting_cases() {
+                join_set.spawn(group_by_string_test(generator, sorted, large));
+            }
+        }
+    }
+    while let Some(join_handle) = join_set.join_next().await {
+        // propagate errors
+        join_handle.unwrap();
+    }
+}
+
+/// Run GROUP BY <x> using SQL and ensure the results are correct
+///
+/// If sorted is true, the input batches will be sorted by the group by column
+/// to test the streaming group by case
+///
+/// if large is true, the input batches will be LargeStringArray
+async fn group_by_string_test(
+    mut generator: StringBatchGenerator,
+    sorted: bool,
+    large: bool,
+) {
+    let column_name = "a";
+    let input = if sorted {
+        generator.make_sorted_input_batches(large)
+    } else {
+        generator.make_input_batches()
+    };
+
+    let expected = compute_counts(&input, column_name);
+
+    let schema = input[0].schema();
+    let session_config = SessionConfig::new().with_batch_size(50);
+    let ctx = SessionContext::new_with_config(session_config);
+
+    let provider = MemTable::try_new(schema.clone(), vec![input]).unwrap();
+    let provider = if sorted {
+        let sort_expr = datafusion::prelude::col("a").sort(true, true);
+        provider.with_sort_order(vec![vec![sort_expr]])
+    } else {
+        provider
+    };
+
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let df = ctx
+        .sql("SELECT a, COUNT(*) FROM t GROUP BY a")
+        .await
+        .unwrap();
+    verify_ordered_aggregate(&df, sorted).await;
+    let results = df.collect().await.unwrap();
+
+    // verify that the results are correct
+    let actual = extract_result_counts(results);
+    assert_eq!(expected, actual);
+}
+async fn verify_ordered_aggregate(frame: &DataFrame, expected_sort: bool) {
+    struct Visitor {
+        expected_sort: bool,
+    }
+    let mut visitor = Visitor { expected_sort };
+
+    impl<'n> TreeNodeVisitor<'n> for Visitor {
+        type Node = Arc<dyn ExecutionPlan>;
+
+        fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
+            if let Some(exec) = node.as_any().downcast_ref::<AggregateExec>() {
+                if self.expected_sort {
+                    assert!(matches!(
+                        exec.input_order_mode(),
+                        InputOrderMode::PartiallySorted(_) | InputOrderMode::Sorted
+                    ));
+                } else {
+                    assert!(matches!(exec.input_order_mode(), InputOrderMode::Linear));
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        }
+    }
+
+    let plan = frame.clone().create_physical_plan().await.unwrap();
+    plan.visit(&mut visitor).unwrap();
+}
+
+/// Compute the count of each distinct value in the specified column
+///
+/// ```text
+/// +---------------+---------------+
+/// | a             | b             |
+/// +---------------+---------------+
+/// | 𭏷񬝜󓴻𼇪󄶛𑩁򽵐󦊟    | 󺚤𘱦𫎛񐕿        |
+/// | 󂌿󶴬񰶨񺹭𿑵󖺉       | 񥼧􋽐󮋋󑤐𬿪𜋃       |
+/// ```
+fn compute_counts(batches: &[RecordBatch], col: &str) -> HashMap<Option<String>, i64> {
+    let mut output = HashMap::new();
+    for arr in batches
+        .iter()
+        .map(|batch| batch.column_by_name(col).unwrap())
+    {
+        for value in to_str_vec(arr) {
+            output.entry(value).and_modify(|e| *e += 1).or_insert(1);
+        }
+    }
+    output
+}
+
+fn to_str_vec(array: &ArrayRef) -> Vec<Option<String>> {
+    match array.data_type() {
+        DataType::Utf8 => array
+            .as_string::<i32>()
+            .iter()
+            .map(|x| x.map(|x| x.to_string()))
+            .collect(),
+        DataType::LargeUtf8 => array
+            .as_string::<i64>()
+            .iter()
+            .map(|x| x.map(|x| x.to_string()))
+            .collect(),
+        _ => panic!("unexpected type"),
+    }
+}
+
+/// extracts the value of the first column and the count of the second column
+/// ```text
+/// +----------------+----------+
+/// | a              | COUNT(*) |
+/// +----------------+----------+
+/// | 񩢰񴠍             | 8        |
+/// | 󇿺򷜄򩨝񜖫𑟑񣶏󣥽𹕉      | 11       |
+/// ```
+fn extract_result_counts(results: Vec<RecordBatch>) -> HashMap<Option<String>, i64> {
+    let group_arrays = results.iter().map(|batch| batch.column(0));
+
+    let count_arrays = results
+        .iter()
+        .map(|batch| batch.column(1).as_primitive::<Int64Type>());
+
+    let mut output = HashMap::new();
+    for (group_arr, count_arr) in group_arrays.zip(count_arrays) {
+        assert_eq!(group_arr.len(), count_arr.len());
+        let group_values = to_str_vec(group_arr);
+        for (group, count) in group_values.into_iter().zip(count_arr.iter()) {
+            assert!(output.get(&group).is_none());
+            let count = count.unwrap(); // counts can never be null
+            output.insert(group, count);
+        }
+    }
+    output
 }

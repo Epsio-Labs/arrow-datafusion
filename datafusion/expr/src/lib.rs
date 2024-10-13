@@ -14,8 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// Make cheap clones clear: https://github.com/apache/datafusion/issues/11143
+#![deny(clippy::clone_on_ref_ptr)]
 
-//! [DataFusion](https://github.com/apache/arrow-datafusion)
+//! [DataFusion](https://github.com/apache/datafusion)
 //! is an extensible query execution framework that uses
 //! [Apache Arrow](https://arrow.apache.org) as its in-memory format.
 //!
@@ -25,44 +27,61 @@
 //!
 //! The [expr_fn] module contains functions for creating expressions.
 
-mod accumulator;
-pub mod aggregate_function;
-pub mod array_expressions;
-mod built_in_function;
-mod columnar_value;
+mod built_in_window_function;
+mod literal;
+mod operation;
+mod partition_evaluator;
+mod table_source;
+mod udaf;
+mod udf;
+mod udwf;
+
 pub mod conditional_expressions;
+pub mod execution_props;
 pub mod expr;
 pub mod expr_fn;
 pub mod expr_rewriter;
 pub mod expr_schema;
-pub mod field_util;
 pub mod function;
-mod literal;
+pub mod groups_accumulator {
+    pub use datafusion_expr_common::groups_accumulator::*;
+}
+
+pub mod interval_arithmetic {
+    pub use datafusion_expr_common::interval_arithmetic::*;
+}
 pub mod logical_plan;
-mod nullif;
-mod operator;
-mod partition_evaluator;
-mod signature;
-pub mod struct_expressions;
-mod table_source;
+pub mod planner;
+pub mod registry;
+pub mod simplify;
+pub mod sort_properties {
+    pub use datafusion_expr_common::sort_properties::*;
+}
+pub mod test;
 pub mod tree_node;
 pub mod type_coercion;
-mod udaf;
-mod udf;
-mod udwf;
 pub mod utils;
+pub mod var_provider;
 pub mod window_frame;
 pub mod window_function;
 pub mod window_state;
 
 pub use crate::type_coercion::binary::json_type;
-pub use accumulator::Accumulator;
 pub use aggregate_function::AggregateFunction;
 pub use built_in_function::BuiltinScalarFunction;
+pub use built_in_window_function::BuiltInWindowFunction;
 pub use columnar_value::ColumnarValue;
+pub use datafusion_expr_common::accumulator::Accumulator;
+pub use datafusion_expr_common::columnar_value::ColumnarValue;
+pub use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+pub use datafusion_expr_common::operator::Operator;
+pub use datafusion_expr_common::signature::{
+    ArrayFunctionSignature, Signature, TypeSignature, Volatility, TIMEZONE_WILDCARD,
+};
+pub use datafusion_expr_common::type_coercion::binary;
 pub use expr::{
-    Between, BinaryExpr, Case, Cast, Expr, GetFieldAccess, GetIndexedField, GroupingSet,
-    Like, TryCast,
+    Between, BinaryExpr, Case, Cast, Expr, GetFieldAccess, GroupingSet, Like,
+    Sort as SortExpr, TryCast, WindowFunctionDefinition,
 };
 pub use expr_fn::*;
 pub use expr_schema::ExprSchemable;
@@ -72,16 +91,13 @@ pub use function::{
 };
 pub use literal::{lit, lit_timestamp_nano, Literal, TimestampLiteral};
 pub use logical_plan::*;
-pub use nullif::SUPPORTED_NULLIF_TYPES;
-pub use operator::Operator;
 pub use partition_evaluator::PartitionEvaluator;
-pub use signature::{Signature, TypeSignature, Volatility};
+pub use sqlparser;
 pub use table_source::{TableProviderFilterPushDown, TableSource, TableType};
-pub use udaf::AggregateUDF;
-pub use udf::ScalarUDF;
-pub use udwf::WindowUDF;
+pub use udaf::{AggregateUDF, AggregateUDFImpl, ReversedUDAF};
+pub use udf::{ScalarUDF, ScalarUDFImpl};
+pub use udwf::{WindowUDF, WindowUDFImpl};
 pub use window_frame::{WindowFrame, WindowFrameBound, WindowFrameUnits};
-pub use window_function::{BuiltInWindowFunction, WindowFunction};
 
 #[cfg(test)]
 #[ctor::ctor]

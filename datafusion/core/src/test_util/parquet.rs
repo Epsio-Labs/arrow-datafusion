@@ -28,13 +28,16 @@ use crate::datasource::listing::{ListingTableUrl, PartitionedFile};
 use crate::datasource::object_store::ObjectStoreUrl;
 use crate::datasource::physical_plan::{FileScanConfig, ParquetExec};
 use crate::error::Result;
-use crate::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use crate::logical_expr::execution_props::ExecutionProps;
+use crate::logical_expr::simplify::SimplifyContext;
+use crate::optimizer::simplify_expressions::ExprSimplifier;
 use crate::physical_expr::create_physical_expr;
-use crate::physical_expr::execution_props::ExecutionProps;
 use crate::physical_plan::filter::FilterExec;
 use crate::physical_plan::metrics::MetricsSet;
 use crate::physical_plan::ExecutionPlan;
-use crate::prelude::{Expr, SessionConfig};
+use crate::prelude::{Expr, SessionConfig, SessionContext};
+
+use crate::datasource::physical_plan::parquet::ParquetExecBuilder;
 use object_store::path::Path;
 use object_store::ObjectMeta;
 use parquet::arrow::ArrowWriter;
@@ -110,6 +113,7 @@ impl TestParquetFile {
             last_modified: Default::default(),
             size,
             e_tag: None,
+            version: None,
         };
 
         Ok(Self {
@@ -136,49 +140,43 @@ impl TestParquetFile {
     /// Otherwise if `maybe_filter` is None, return just a `ParquetExec`
     pub async fn create_scan(
         &self,
+        ctx: &SessionContext,
         maybe_filter: Option<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let scan_config = FileScanConfig {
-            object_store_url: self.object_store_url.clone(),
-            file_schema: self.schema.clone(),
-            file_groups: vec![vec![PartitionedFile {
-                object_meta: self.object_meta.clone(),
-                partition_values: vec![],
-                range: None,
-                extensions: None,
-            }]],
-            statistics: Default::default(),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-            infinite_source: false,
-        };
+        let scan_config =
+            FileScanConfig::new(self.object_store_url.clone(), self.schema.clone())
+                .with_file(PartitionedFile {
+                    object_meta: self.object_meta.clone(),
+                    partition_values: vec![],
+                    range: None,
+                    statistics: None,
+                    extensions: None,
+                });
 
         let df_schema = self.schema.clone().to_dfschema_ref()?;
 
         // run coercion on the filters to coerce types etc.
         let props = ExecutionProps::new();
         let context = SimplifyContext::new(&props).with_schema(df_schema.clone());
+        let parquet_options = ctx.copied_table_options().parquet;
         if let Some(filter) = maybe_filter {
             let simplifier = ExprSimplifier::new(context);
-            let filter = simplifier.coerce(filter, df_schema.clone()).unwrap();
-            let physical_filter_expr = create_physical_expr(
-                &filter,
-                &df_schema,
-                self.schema.as_ref(),
-                &ExecutionProps::default(),
-            )?;
-            let parquet_exec = Arc::new(ParquetExec::new(
-                scan_config,
-                Some(physical_filter_expr.clone()),
-                None,
-            ));
+            let filter = simplifier.coerce(filter, &df_schema).unwrap();
+            let physical_filter_expr =
+                create_physical_expr(&filter, &df_schema, &ExecutionProps::default())?;
+
+            let parquet_exec =
+                ParquetExecBuilder::new_with_options(scan_config, parquet_options)
+                    .with_predicate(physical_filter_expr.clone())
+                    .build_arc();
 
             let exec = Arc::new(FilterExec::try_new(physical_filter_expr, parquet_exec)?);
             Ok(exec)
         } else {
-            Ok(Arc::new(ParquetExec::new(scan_config, None, None)))
+            Ok(
+                ParquetExecBuilder::new_with_options(scan_config, parquet_options)
+                    .build_arc(),
+            )
         }
     }
 
@@ -186,7 +184,7 @@ impl TestParquetFile {
     ///
     /// Recursively searches for ParquetExec and returns the metrics
     /// on the first one it finds
-    pub fn parquet_metrics(plan: Arc<dyn ExecutionPlan>) -> Option<MetricsSet> {
+    pub fn parquet_metrics(plan: &Arc<dyn ExecutionPlan>) -> Option<MetricsSet> {
         if let Some(parquet) = plan.as_any().downcast_ref::<ParquetExec>() {
             return parquet.metrics();
         }

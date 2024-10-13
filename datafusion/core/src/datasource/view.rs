@@ -17,20 +17,23 @@
 
 //! View data source which uses a LogicalPlan as it's input.
 
-use std::{any::Any, sync::Arc};
-
-use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
-use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use std::{any::Any, borrow::Cow, sync::Arc};
 
 use crate::{
     error::Result,
     logical_expr::{Expr, LogicalPlan},
     physical_plan::ExecutionPlan,
 };
+use arrow::datatypes::SchemaRef;
+use async_trait::async_trait;
+use datafusion_catalog::Session;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::Column;
+use datafusion_expr::{LogicalPlanBuilder, TableProviderFilterPushDown};
+use datafusion_optimizer::analyzer::expand_wildcard_rule::ExpandWildcardRule;
+use datafusion_optimizer::Analyzer;
 
 use crate::datasource::{TableProvider, TableType};
-use crate::execution::context::SessionState;
 
 /// An implementation of `TableProvider` that uses another logical plan.
 pub struct ViewTable {
@@ -49,6 +52,7 @@ impl ViewTable {
         logical_plan: LogicalPlan,
         definition: Option<String>,
     ) -> Result<Self> {
+        let logical_plan = Self::apply_required_rule(logical_plan)?;
         let table_schema = logical_plan.schema().as_ref().to_owned().into();
 
         let view = Self {
@@ -58,6 +62,15 @@ impl ViewTable {
         };
 
         Ok(view)
+    }
+
+    fn apply_required_rule(logical_plan: LogicalPlan) -> Result<LogicalPlan> {
+        let options = ConfigOptions::default();
+        Analyzer::with_rules(vec![Arc::new(ExpandWildcardRule::new())]).execute_and_check(
+            logical_plan,
+            &options,
+            |_, _| {},
+        )
     }
 
     /// Get definition ref
@@ -77,8 +90,8 @@ impl TableProvider for ViewTable {
         self
     }
 
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        Some(&self.logical_plan)
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        Some(Cow::Borrowed(&self.logical_plan))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -92,50 +105,49 @@ impl TableProvider for ViewTable {
     fn get_table_definition(&self) -> Option<&str> {
         self.definition.as_deref()
     }
-
-    fn supports_filter_pushdown(
+    fn supports_filters_pushdown(
         &self,
-        _filter: &Expr,
-    ) -> Result<TableProviderFilterPushDown> {
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A filter is added on the View when given
-        Ok(TableProviderFilterPushDown::Exact)
+        Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
     }
 
     async fn scan(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = if let Some(projection) = projection {
-            // avoiding adding a redundant projection (e.g. SELECT * FROM view)
-            let current_projection =
-                (0..self.logical_plan.schema().fields().len()).collect::<Vec<usize>>();
-            if projection == &current_projection {
-                self.logical_plan().clone()
-            } else {
-                let fields: Vec<Expr> = projection
-                    .iter()
-                    .map(|i| {
-                        Expr::Column(
-                            self.logical_plan.schema().field(*i).qualified_column(),
-                        )
-                    })
-                    .collect();
-                LogicalPlanBuilder::from(self.logical_plan.clone())
-                    .project(fields)?
-                    .build()?
-            }
-        } else {
-            self.logical_plan().clone()
-        };
-        let mut plan = LogicalPlanBuilder::from(plan);
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
+        let plan = self.logical_plan().clone();
+        let mut plan = LogicalPlanBuilder::from(plan);
 
         if let Some(filter) = filter {
             plan = plan.filter(filter)?;
         }
+
+        let mut plan = if let Some(projection) = projection {
+            // avoiding adding a redundant projection (e.g. SELECT * FROM view)
+            let current_projection =
+                (0..plan.schema().fields().len()).collect::<Vec<usize>>();
+            if projection == &current_projection {
+                plan
+            } else {
+                let fields: Vec<Expr> = projection
+                    .iter()
+                    .map(|i| {
+                        Expr::Column(Column::from(
+                            self.logical_plan.schema().qualified_field(*i),
+                        ))
+                    })
+                    .collect();
+                plan.project(fields)?
+            }
+        } else {
+            plan
+        };
 
         if let Some(limit) = limit {
             plan = plan.limit(0, Some(limit))?;
@@ -158,8 +170,8 @@ mod tests {
 
     #[tokio::test]
     async fn issue_3242() -> Result<()> {
-        // regression test for https://github.com/apache/arrow-datafusion/pull/3242
-        let session_ctx = SessionContext::with_config(
+        // regression test for https://github.com/apache/datafusion/pull/3242
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -199,7 +211,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_view() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -232,12 +244,32 @@ mod tests {
 
         assert_batches_eq!(expected, &results);
 
+        let view_sql =
+            "CREATE VIEW replace_xyz AS SELECT * REPLACE (column1*2 as column1) FROM xyz";
+        session_ctx.sql(view_sql).await?.collect().await?;
+
+        let results = session_ctx
+            .sql("SELECT * FROM replace_xyz")
+            .await?
+            .collect()
+            .await?;
+
+        let expected = [
+            "+---------+---------+---------+",
+            "| column1 | column2 | column3 |",
+            "+---------+---------+---------+",
+            "| 2       | 2       | 3       |",
+            "| 8       | 5       | 6       |",
+            "+---------+---------+---------+",
+        ];
+
+        assert_batches_eq!(expected, &results);
         Ok(())
     }
 
     #[tokio::test]
     async fn query_view_with_alias() -> Result<()> {
-        let session_ctx = SessionContext::with_config(SessionConfig::new());
+        let session_ctx = SessionContext::new_with_config(SessionConfig::new());
 
         session_ctx
             .sql("CREATE TABLE abc AS VALUES (1,2,3), (4,5,6)")
@@ -270,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_view_with_inline_alias() -> Result<()> {
-        let session_ctx = SessionContext::with_config(SessionConfig::new());
+        let session_ctx = SessionContext::new_with_config(SessionConfig::new());
 
         session_ctx
             .sql("CREATE TABLE abc AS VALUES (1,2,3), (4,5,6)")
@@ -303,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_view_with_projection() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -341,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_view_with_filter() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -378,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_join_views() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -439,6 +471,7 @@ mod tests {
             .select_columns(&["bool_col", "int_col"])?;
 
         let plan = df.explain(false, false)?.collect().await?;
+
         // Filters all the way to Parquet
         let formatted = arrow::util::pretty::pretty_format_batches(&plan)
             .unwrap()
@@ -480,7 +513,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_view_plan() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 
@@ -533,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_or_replace_view() -> Result<()> {
-        let session_ctx = SessionContext::with_config(
+        let session_ctx = SessionContext::new_with_config(
             SessionConfig::new().with_information_schema(true),
         );
 

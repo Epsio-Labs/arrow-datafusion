@@ -22,12 +22,14 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
+use super::metrics::BaselineMetrics;
+use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use crate::displayable;
+
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use datafusion_common::DataFusionError;
-use datafusion_common::Result;
-use datafusion_common::{exec_err, internal_err};
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
+
 use futures::stream::BoxStream;
 use futures::{Future, Stream, StreamExt};
 use log::debug;
@@ -35,47 +37,43 @@ use pin_project_lite::pin_project;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinSet;
 
-use super::metrics::BaselineMetrics;
-use super::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+/// Creates a stream from a collection of producing tasks, routing panics to the stream.
+///
+/// Note that this is similar to  [`ReceiverStream` from tokio-stream], with the differences being:
+///
+/// 1. Methods to bound and "detach"  tasks (`spawn()` and `spawn_blocking()`).
+///
+/// 2. Propagates panics, whereas the `tokio` version doesn't propagate panics to the receiver.
+///
+/// 3. Automatically cancels any outstanding tasks when the receiver stream is dropped.
+///
+/// [`ReceiverStream` from tokio-stream]: https://docs.rs/tokio-stream/latest/tokio_stream/wrappers/struct.ReceiverStream.html
 
-/// Builder for [`RecordBatchReceiverStream`] that propagates errors
-/// and panic's correctly.
-///
-/// [`RecordBatchReceiverStream`] is used to spawn one or more tasks
-/// that produce `RecordBatch`es and send them to a single
-/// `Receiver` which can improve parallelism.
-///
-/// This also handles propagating panic`s and canceling the tasks.
-pub struct RecordBatchReceiverStreamBuilder {
-    tx: Sender<Result<RecordBatch>>,
-    rx: Receiver<Result<RecordBatch>>,
-    schema: SchemaRef,
+pub(crate) struct ReceiverStreamBuilder<O> {
+    tx: Sender<Result<O>>,
+    rx: Receiver<Result<O>>,
     join_set: JoinSet<Result<()>>,
 }
 
-impl RecordBatchReceiverStreamBuilder {
+impl<O: Send + 'static> ReceiverStreamBuilder<O> {
     /// create new channels with the specified buffer size
-    pub fn new(schema: SchemaRef, capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
 
         Self {
             tx,
             rx,
-            schema,
             join_set: JoinSet::new(),
         }
     }
 
-    /// Get a handle for sending [`RecordBatch`]es to the output
-    pub fn tx(&self) -> Sender<Result<RecordBatch>> {
+    /// Get a handle for sending data to the output
+    pub fn tx(&self) -> Sender<Result<O>> {
         self.tx.clone()
     }
 
     /// Spawn task that will be aborted if this builder (or the stream
     /// built from it) are dropped
-    ///
-    /// this is often used to spawn tasks that write to the sender
-    /// retrieved from `Self::tx`
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = Result<()>>,
@@ -97,7 +95,168 @@ impl RecordBatchReceiverStreamBuilder {
         self.join_set.spawn_blocking(f);
     }
 
-    /// runs the input_partition of the `input` ExecutionPlan on the
+    /// Create a stream of all data written to `tx`
+    pub fn build(self) -> BoxStream<'static, Result<O>> {
+        let Self {
+            tx,
+            rx,
+            mut join_set,
+        } = self;
+
+        // don't need tx
+        drop(tx);
+
+        // future that checks the result of the join set, and propagates panic if seen
+        let check = async move {
+            while let Some(result) = join_set.join_next().await {
+                match result {
+                    Ok(task_result) => {
+                        match task_result {
+                            // nothing to report
+                            Ok(_) => continue,
+                            // This means a blocking task error
+                            Err(error) => return Some(Err(error)),
+                        }
+                    }
+                    // This means a tokio task error, likely a panic
+                    Err(e) => {
+                        if e.is_panic() {
+                            // resume on the main thread
+                            std::panic::resume_unwind(e.into_panic());
+                        } else {
+                            // This should only occur if the task is
+                            // cancelled, which would only occur if
+                            // the JoinSet were aborted, which in turn
+                            // would imply that the receiver has been
+                            // dropped and this code is not running
+                            return Some(internal_err!("Non Panic Task error: {e}"));
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let check_stream = futures::stream::once(check)
+            // unwrap Option / only return the error
+            .filter_map(|item| async move { item });
+
+        // Convert the receiver into a stream
+        let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
+            let next_item = rx.recv().await;
+            next_item.map(|next_item| (next_item, rx))
+        });
+
+        // Merge the streams together so whichever is ready first
+        // produces the batch
+        futures::stream::select(rx_stream, check_stream).boxed()
+    }
+}
+
+/// Builder for `RecordBatchReceiverStream` that propagates errors
+/// and panic's correctly.
+///
+/// [`RecordBatchReceiverStreamBuilder`] is used to spawn one or more tasks
+/// that produce [`RecordBatch`]es and send them to a single
+/// `Receiver` which can improve parallelism.
+///
+/// This also handles propagating panic`s and canceling the tasks.
+///
+/// # Example
+///
+/// The following example spawns 2 tasks that will write [`RecordBatch`]es to
+/// the `tx` end of the builder, after building the stream, we can receive
+/// those batches with calling `.next()`
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use datafusion_common::arrow::datatypes::{Schema, Field, DataType};
+/// # use datafusion_common::arrow::array::RecordBatch;
+/// # use datafusion_physical_plan::stream::RecordBatchReceiverStreamBuilder;
+/// # use futures::stream::StreamExt;
+/// # use tokio::runtime::Builder;
+/// # let rt = Builder::new_current_thread().build().unwrap();
+/// #
+/// # rt.block_on(async {
+/// let schema = Arc::new(Schema::new(vec![Field::new("foo", DataType::Int8, false)]));
+/// let mut builder = RecordBatchReceiverStreamBuilder::new(Arc::clone(&schema), 10);
+///
+/// // task 1
+/// let tx_1 = builder.tx();
+/// let schema_1 = Arc::clone(&schema);
+/// builder.spawn(async move {
+///     // Your task needs to send batches to the tx
+///     tx_1.send(Ok(RecordBatch::new_empty(schema_1))).await.unwrap();
+///
+///     Ok(())
+/// });
+///
+/// // task 2
+/// let tx_2 = builder.tx();
+/// let schema_2 = Arc::clone(&schema);
+/// builder.spawn(async move {
+///     // Your task needs to send batches to the tx
+///     tx_2.send(Ok(RecordBatch::new_empty(schema_2))).await.unwrap();
+///
+///     Ok(())
+/// });
+///
+/// let mut stream = builder.build();
+/// while let Some(res_batch) = stream.next().await {
+///     // `res_batch` can either from task 1 or 2
+///
+///     // do something with `res_batch`
+/// }
+/// # });
+/// ```
+pub struct RecordBatchReceiverStreamBuilder {
+    schema: SchemaRef,
+    inner: ReceiverStreamBuilder<RecordBatch>,
+}
+
+impl RecordBatchReceiverStreamBuilder {
+    /// create new channels with the specified buffer size
+    pub fn new(schema: SchemaRef, capacity: usize) -> Self {
+        Self {
+            schema,
+            inner: ReceiverStreamBuilder::new(capacity),
+        }
+    }
+
+    /// Get a handle for sending [`RecordBatch`] to the output
+    pub fn tx(&self) -> Sender<Result<RecordBatch>> {
+        self.inner.tx()
+    }
+
+    /// Spawn task that will be aborted if this builder (or the stream
+    /// built from it) are dropped
+    ///
+    /// This is often used to spawn tasks that write to the sender
+    /// retrieved from [`Self::tx`], for examples, see the document
+    /// of this type.
+    pub fn spawn<F>(&mut self, task: F)
+    where
+        F: Future<Output = Result<()>>,
+        F: Send + 'static,
+    {
+        self.inner.spawn(task)
+    }
+
+    /// Spawn a blocking task that will be aborted if this builder (or the stream
+    /// built from it) are dropped
+    ///
+    /// This is often used to spawn tasks that write to the sender
+    /// retrieved from [`Self::tx`], for examples, see the document
+    /// of this type.
+    pub fn spawn_blocking<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> Result<()>,
+        F: Send + 'static,
+    {
+        self.inner.spawn_blocking(f)
+    }
+
+    /// runs the `partition` of the `input` ExecutionPlan on the
     /// tokio threadpool and writes its outputs to this stream
     ///
     /// If the input partition produces an error, the error will be
@@ -110,7 +269,7 @@ impl RecordBatchReceiverStreamBuilder {
     ) {
         let output = self.tx();
 
-        self.spawn(async move {
+        self.inner.spawn(async move {
             let mut stream = match input.execute(partition, context) {
                 Err(e) => {
                     // If send fails, the plan being torn down, there
@@ -155,80 +314,17 @@ impl RecordBatchReceiverStreamBuilder {
         });
     }
 
-    /// Create a stream of all `RecordBatch`es written to `tx`
+    /// Create a stream of all [`RecordBatch`] written to `tx`
     pub fn build(self) -> SendableRecordBatchStream {
-        let Self {
-            tx,
-            rx,
-            schema,
-            mut join_set,
-        } = self;
-
-        // don't need tx
-        drop(tx);
-
-        // future that checks the result of the join set, and propagates panic if seen
-        let check = async move {
-            while let Some(result) = join_set.join_next().await {
-                match result {
-                    Ok(task_result) => {
-                        match task_result {
-                            // nothing to report
-                            Ok(_) => continue,
-                            // This means a blocking task error
-                            Err(e) => {
-                                return Some(exec_err!("Spawned Task error: {e}"));
-                            }
-                        }
-                    }
-                    // This means a tokio task error, likely a panic
-                    Err(e) => {
-                        if e.is_panic() {
-                            // resume on the main thread
-                            std::panic::resume_unwind(e.into_panic());
-                        } else {
-                            // This should only occur if the task is
-                            // cancelled, which would only occur if
-                            // the JoinSet were aborted, which in turn
-                            // would imply that the receiver has been
-                            // dropped and this code is not running
-                            return Some(internal_err!("Non Panic Task error: {e}"));
-                        }
-                    }
-                }
-            }
-            None
-        };
-
-        let check_stream = futures::stream::once(check)
-            // unwrap Option / only return the error
-            .filter_map(|item| async move { item });
-
-        // Convert the receiver into a stream
-        let rx_stream = futures::stream::unfold(rx, |mut rx| async move {
-            let next_item = rx.recv().await;
-            next_item.map(|next_item| (next_item, rx))
-        });
-
-        // Merge the streams together so whichever is ready first
-        // produces the batch
-        let inner = futures::stream::select(rx_stream, check_stream).boxed();
-
-        Box::pin(RecordBatchReceiverStream { schema, inner })
+        Box::pin(RecordBatchStreamAdapter::new(
+            self.schema,
+            self.inner.build(),
+        ))
     }
 }
 
-/// A [`SendableRecordBatchStream`] that combines [`RecordBatch`]es from multiple inputs,
-/// on new tokio Tasks,  increasing the potential parallelism.
-///
-/// This structure also handles propagating panics and cancelling the
-/// underlying tasks correctly.
-///
-/// Use [`Self::builder`] to construct one.
-pub struct RecordBatchReceiverStream {
-    schema: SchemaRef,
-    inner: BoxStream<'static, Result<RecordBatch>>,
-}
+#[doc(hidden)]
+pub struct RecordBatchReceiverStream {}
 
 impl RecordBatchReceiverStream {
     /// Create a builder with an internal buffer of capacity batches.
@@ -237,23 +333,6 @@ impl RecordBatchReceiverStream {
         capacity: usize,
     ) -> RecordBatchReceiverStreamBuilder {
         RecordBatchReceiverStreamBuilder::new(schema, capacity)
-    }
-}
-
-impl Stream for RecordBatchReceiverStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.inner.poll_next_unpin(cx)
-    }
-}
-
-impl RecordBatchStream for RecordBatchReceiverStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
     }
 }
 
@@ -303,11 +382,11 @@ where
     S: Stream<Item = Result<RecordBatch>>,
 {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
-/// EmptyRecordBatchStream can be used to create a RecordBatchStream
+/// `EmptyRecordBatchStream` can be used to create a [`RecordBatchStream`]
 /// that will produce no results
 pub struct EmptyRecordBatchStream {
     /// Schema wrapped by Arc
@@ -323,7 +402,7 @@ impl EmptyRecordBatchStream {
 
 impl RecordBatchStream for EmptyRecordBatchStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -378,12 +457,12 @@ impl futures::Stream for ObservedStream {
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion_common::exec_err;
-
     use crate::test::exec::{
         assert_strong_count_converges_to_zero, BlockingExec, MockExec, PanicExec,
     };
+
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_common::exec_err;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]))
@@ -395,7 +474,7 @@ mod test {
         let schema = schema();
 
         let num_partitions = 10;
-        let input = PanicExec::new(schema.clone(), num_partitions);
+        let input = PanicExec::new(Arc::clone(&schema), num_partitions);
         consume(input, 10).await
     }
 
@@ -406,7 +485,7 @@ mod test {
 
         // make 2 partitions, second partition panics before the first
         let num_partitions = 2;
-        let input = PanicExec::new(schema.clone(), num_partitions)
+        let input = PanicExec::new(Arc::clone(&schema), num_partitions)
             .with_partition_panic(0, 10)
             .with_partition_panic(1, 3); // partition 1 should panic first (after 3 )
 
@@ -425,12 +504,12 @@ mod test {
         let schema = schema();
 
         // Make an input that never proceeds
-        let input = BlockingExec::new(schema.clone(), 1);
+        let input = BlockingExec::new(Arc::clone(&schema), 1);
         let refs = input.refs();
 
         // Configure a RecordBatchReceiverStream to consume the input
         let mut builder = RecordBatchReceiverStream::builder(schema, 2);
-        builder.run_input(Arc::new(input), 0, task_ctx.clone());
+        builder.run_input(Arc::new(input), 0, Arc::clone(&task_ctx));
         let stream = builder.build();
 
         // input should still be present
@@ -450,12 +529,14 @@ mod test {
         let schema = schema();
 
         // make an input that will error twice
-        let error_stream =
-            MockExec::new(vec![exec_err!("Test1"), exec_err!("Test2")], schema.clone())
-                .with_use_task(false);
+        let error_stream = MockExec::new(
+            vec![exec_err!("Test1"), exec_err!("Test2")],
+            Arc::clone(&schema),
+        )
+        .with_use_task(false);
 
         let mut builder = RecordBatchReceiverStream::builder(schema, 2);
-        builder.run_input(Arc::new(error_stream), 0, task_ctx.clone());
+        builder.run_input(Arc::new(error_stream), 0, Arc::clone(&task_ctx));
         let mut stream = builder.build();
 
         // get the first result, which should be an error
@@ -475,13 +556,17 @@ mod test {
         let task_ctx = Arc::new(TaskContext::default());
 
         let input = Arc::new(input);
-        let num_partitions = input.output_partitioning().partition_count();
+        let num_partitions = input.properties().output_partitioning().partition_count();
 
         // Configure a RecordBatchReceiverStream to consume all the input partitions
         let mut builder =
             RecordBatchReceiverStream::builder(input.schema(), num_partitions);
         for partition in 0..num_partitions {
-            builder.run_input(input.clone(), partition, task_ctx.clone());
+            builder.run_input(
+                Arc::clone(&input) as Arc<dyn ExecutionPlan>,
+                partition,
+                Arc::clone(&task_ctx),
+            );
         }
         let mut stream = builder.build();
 

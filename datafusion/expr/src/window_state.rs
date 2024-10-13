@@ -19,10 +19,12 @@
 
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
+use crate::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+
 use arrow::{
     array::ArrayRef,
-    compute::{concat, SortOptions},
-    datatypes::DataType,
+    compute::{concat, concat_batches, SortOptions},
+    datatypes::{DataType, SchemaRef},
     record_batch::RecordBatch,
 };
 use datafusion_common::{
@@ -30,8 +32,6 @@ use datafusion_common::{
     utils::{compare_rows, get_row_at_idx, search_in_slice},
     DataFusionError, Result, ScalarValue,
 };
-
-use crate::{WindowFrame, WindowFrameBound, WindowFrameUnits};
 
 /// Holds the state of evaluating a window function
 #[derive(Debug)]
@@ -98,7 +98,7 @@ impl WindowAggState {
     }
 
     pub fn new(out_type: &DataType) -> Result<Self> {
-        let empty_out_col = ScalarValue::try_from(out_type)?.to_array_of_size(0);
+        let empty_out_col = ScalarValue::try_from(out_type)?.to_array_of_size(0)?;
         Ok(Self {
             window_frame_range: Range { start: 0, end: 0 },
             window_frame_ctx: None,
@@ -246,12 +246,40 @@ impl WindowFrameContext {
 /// State for each unique partition determined according to PARTITION BY column(s)
 #[derive(Debug)]
 pub struct PartitionBatchState {
-    /// The record_batch belonging to current partition
+    /// The record batch belonging to current partition
     pub record_batch: RecordBatch,
+    /// The record batch that contains the most recent row at the input.
+    /// Please note that this batch doesn't necessarily have the same partitioning
+    /// with `record_batch`. Keeping track of this batch enables us to prune
+    /// `record_batch` when cardinality of the partition is sparse.
+    pub most_recent_row: Option<RecordBatch>,
     /// Flag indicating whether we have received all data for this partition
     pub is_end: bool,
     /// Number of rows emitted for each partition
     pub n_out_row: usize,
+}
+
+impl PartitionBatchState {
+    pub fn new(schema: SchemaRef) -> Self {
+        Self {
+            record_batch: RecordBatch::new_empty(schema),
+            most_recent_row: None,
+            is_end: false,
+            n_out_row: 0,
+        }
+    }
+
+    pub fn extend(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.record_batch =
+            concat_batches(&self.record_batch.schema(), [&self.record_batch, batch])?;
+        Ok(())
+    }
+
+    pub fn set_most_recent_row(&mut self, batch: RecordBatch) {
+        // It is enough for the batch to contain only a single row (the rest
+        // are not necessary).
+        self.most_recent_row = Some(batch);
+    }
 }
 
 /// This structure encapsulates all the state information we require as we scan
@@ -640,11 +668,8 @@ fn check_equality(current: &[ScalarValue], target: &[ScalarValue]) -> Result<boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{WindowFrame, WindowFrameBound, WindowFrameUnits};
-    use arrow::array::{ArrayRef, Float64Array};
-    use datafusion_common::{Result, ScalarValue};
-    use std::ops::Range;
-    use std::sync::Arc;
+
+    use arrow::array::Float64Array;
 
     fn get_test_data() -> (Vec<ArrayRef>, Vec<SortOptions>) {
         let range_columns: Vec<ArrayRef> = vec![Arc::new(Float64Array::from(vec![
@@ -682,11 +707,11 @@ mod tests {
 
     #[test]
     fn test_window_frame_group_boundaries() -> Result<()> {
-        let window_frame = Arc::new(WindowFrame {
-            units: WindowFrameUnits::Groups,
-            start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1))),
-            end_bound: WindowFrameBound::Following(ScalarValue::UInt64(Some(1))),
-        });
+        let window_frame = Arc::new(WindowFrame::new_bounds(
+            WindowFrameUnits::Groups,
+            WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1))),
+            WindowFrameBound::Following(ScalarValue::UInt64(Some(1))),
+        ));
         let expected_results = vec![
             (Range { start: 0, end: 2 }, 0),
             (Range { start: 0, end: 4 }, 1),
@@ -703,11 +728,11 @@ mod tests {
 
     #[test]
     fn test_window_frame_group_boundaries_both_following() -> Result<()> {
-        let window_frame = Arc::new(WindowFrame {
-            units: WindowFrameUnits::Groups,
-            start_bound: WindowFrameBound::Following(ScalarValue::UInt64(Some(1))),
-            end_bound: WindowFrameBound::Following(ScalarValue::UInt64(Some(2))),
-        });
+        let window_frame = Arc::new(WindowFrame::new_bounds(
+            WindowFrameUnits::Groups,
+            WindowFrameBound::Following(ScalarValue::UInt64(Some(1))),
+            WindowFrameBound::Following(ScalarValue::UInt64(Some(2))),
+        ));
         let expected_results = vec![
             (Range::<usize> { start: 1, end: 4 }, 0),
             (Range::<usize> { start: 2, end: 5 }, 1),
@@ -724,11 +749,11 @@ mod tests {
 
     #[test]
     fn test_window_frame_group_boundaries_both_preceding() -> Result<()> {
-        let window_frame = Arc::new(WindowFrame {
-            units: WindowFrameUnits::Groups,
-            start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(Some(2))),
-            end_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1))),
-        });
+        let window_frame = Arc::new(WindowFrame::new_bounds(
+            WindowFrameUnits::Groups,
+            WindowFrameBound::Preceding(ScalarValue::UInt64(Some(2))),
+            WindowFrameBound::Preceding(ScalarValue::UInt64(Some(1))),
+        ));
         let expected_results = vec![
             (Range::<usize> { start: 0, end: 0 }, 0),
             (Range::<usize> { start: 0, end: 1 }, 1),
