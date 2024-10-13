@@ -873,6 +873,9 @@ impl Unparser<'_> {
             Operator::StringConcat => Ok(ast::BinaryOperator::StringConcat),
             Operator::AtArrow => not_impl_err!("unsupported operation: {op:?}"),
             Operator::ArrowAt => not_impl_err!("unsupported operation: {op:?}"),
+            Operator::ArrowAccess | Operator::LongArrow => {
+                not_impl_err!("unsupported operation: {op:?}")
+            }
         }
     }
 

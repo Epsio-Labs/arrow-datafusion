@@ -48,7 +48,6 @@ mod substring;
 mod unary_op;
 mod value;
 
-use crate::expr::expr::ScalarUDF;
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     pub(crate) fn sql_expr_to_logical_expr(
         &self,
