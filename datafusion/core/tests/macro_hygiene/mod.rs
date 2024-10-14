@@ -37,4 +37,3 @@ mod plan_datafusion_err {
         plan_datafusion_err!("foo");
     }
 }
-
