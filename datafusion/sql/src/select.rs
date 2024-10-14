@@ -565,7 +565,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     &[&[plan.schema()]],
                     &plan.using_columns()?,
                 )?;
-                let name = self.ident_normalizer.normalize_column(alias);
+                let name = self.ident_normalizer.normalize(alias);
                 // avoiding adding an alias if the column name is the same.
                 let expr = match &col {
                     Expr::Column(column) if column.name.eq(&name) => col,
