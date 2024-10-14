@@ -20,11 +20,9 @@ use crate::optimizer::{ApplyOrder, ApplyOrder::BottomUp};
 use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Column, Result};
-use datafusion_expr::expr_rewriter::normalize_cols;
+use datafusion_common::Result;
 use datafusion_expr::utils::expand_wildcard;
-use datafusion_expr::{col, ExprFunctionExt, LogicalPlanBuilder};
-use datafusion_expr::{Aggregate, Distinct, DistinctOn, Expr, LogicalPlan};
+use datafusion_expr::{Aggregate, Distinct, LogicalPlan};
 
 /// Optimizer that replaces logical [[Distinct]] with a logical [[Aggregate]]
 ///
@@ -100,75 +98,77 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
                 )?);
                 Ok(Transformed::yes(aggr_plan))
             }
-            LogicalPlan::Distinct(Distinct::On(DistinctOn {
-                select_expr,
-                on_expr,
-                sort_expr,
-                input,
-                schema,
-            })) => {
-                let expr_cnt = on_expr.len();
-
-                // Construct the aggregation expression to be used to fetch the selected expressions.
-                let first_value_udaf: std::sync::Arc<datafusion_expr::AggregateUDF> =
-                    config.function_registry().unwrap().udaf("first_value")?;
-                let aggr_expr = select_expr.into_iter().map(|e| {
-                    if let Some(order_by) = &sort_expr {
-                        first_value_udaf
-                            .call(vec![e])
-                            .order_by(order_by.clone())
-                            .build()
-                            // guaranteed to be `Expr::AggregateFunction`
-                            .unwrap()
-                    } else {
-                        first_value_udaf.call(vec![e])
-                    }
-                });
-
-                let aggr_expr = normalize_cols(aggr_expr, input.as_ref())?;
-                let group_expr = normalize_cols(on_expr, input.as_ref())?;
-
-                // Build the aggregation plan
-                let plan = LogicalPlan::Aggregate(Aggregate::try_new(
-                    input, group_expr, aggr_expr,
-                )?);
-                // TODO use LogicalPlanBuilder directly rather than recreating the Aggregate
-                // when https://github.com/apache/datafusion/issues/10485 is available
-                let lpb = LogicalPlanBuilder::from(plan);
-
-                let plan = if let Some(mut sort_expr) = sort_expr {
-                    // While sort expressions were used in the `FIRST_VALUE` aggregation itself above,
-                    // this on it's own isn't enough to guarantee the proper output order of the grouping
-                    // (`ON`) expression, so we need to sort those as well.
-
-                    // truncate the sort_expr to the length of on_expr
-                    sort_expr.truncate(expr_cnt);
-
-                    lpb.sort(sort_expr)?.build()?
-                } else {
-                    lpb.build()?
-                };
-
-                // Whereas the aggregation plan by default outputs both the grouping and the aggregation
-                // expressions, for `DISTINCT ON` we only need to emit the original selection expressions.
-
-                let project_exprs = plan
-                    .schema()
-                    .iter()
-                    .skip(expr_cnt)
-                    .zip(schema.iter())
-                    .map(|((new_qualifier, new_field), (old_qualifier, old_field))| {
-                        col(Column::from((new_qualifier, new_field)))
-                            .alias_qualified(old_qualifier.cloned(), old_field.name())
-                    })
-                    .collect::<Vec<Expr>>();
-
-                let plan = LogicalPlanBuilder::from(plan)
-                    .project(project_exprs)?
-                    .build()?;
-
-                Ok(Transformed::yes(plan))
-            }
+            // Epsio comment - we dropped replace distinct on optimization because it uses
+            // first_value aggregation
+            // LogicalPlan::Distinct(Distinct::On(DistinctOn {
+            //     select_expr,
+            //     on_expr,
+            //     sort_expr,
+            //     input,
+            //     schema,
+            // })) => {
+            //     let expr_cnt = on_expr.len();
+            //
+            //     // Construct the aggregation expression to be used to fetch the selected expressions.
+            //     let first_value_udaf: std::sync::Arc<datafusion_expr::AggregateUDF> =
+            //         config.function_registry().unwrap().udaf("first_value")?;
+            //     let aggr_expr = select_expr.into_iter().map(|e| {
+            //         if let Some(order_by) = &sort_expr {
+            //             first_value_udaf
+            //                 .call(vec![e])
+            //                 .order_by(order_by.clone())
+            //                 .build()
+            //                 // guaranteed to be `Expr::AggregateFunction`
+            //                 .unwrap()
+            //         } else {
+            //             first_value_udaf.call(vec![e])
+            //         }
+            //     });
+            //
+            //     let aggr_expr = normalize_cols(aggr_expr, input.as_ref())?;
+            //     let group_expr = normalize_cols(on_expr, input.as_ref())?;
+            //
+            //     // Build the aggregation plan
+            //     let plan = LogicalPlan::Aggregate(Aggregate::try_new(
+            //         input, group_expr, aggr_expr,
+            //     )?);
+            //     // TODO use LogicalPlanBuilder directly rather than recreating the Aggregate
+            //     // when https://github.com/apache/datafusion/issues/10485 is available
+            //     let lpb = LogicalPlanBuilder::from(plan);
+            //
+            //     let plan = if let Some(mut sort_expr) = sort_expr {
+            //         // While sort expressions were used in the `FIRST_VALUE` aggregation itself above,
+            //         // this on it's own isn't enough to guarantee the proper output order of the grouping
+            //         // (`ON`) expression, so we need to sort those as well.
+            //
+            //         // truncate the sort_expr to the length of on_expr
+            //         sort_expr.truncate(expr_cnt);
+            //
+            //         lpb.sort(sort_expr)?.build()?
+            //     } else {
+            //         lpb.build()?
+            //     };
+            //
+            //     // Whereas the aggregation plan by default outputs both the grouping and the aggregation
+            //     // expressions, for `DISTINCT ON` we only need to emit the original selection expressions.
+            //
+            //     let project_exprs = plan
+            //         .schema()
+            //         .iter()
+            //         .skip(expr_cnt)
+            //         .zip(schema.iter())
+            //         .map(|((new_qualifier, new_field), (old_qualifier, old_field))| {
+            //             col(Column::from((new_qualifier, new_field)))
+            //                 .alias_qualified(old_qualifier.cloned(), old_field.name())
+            //         })
+            //         .collect::<Vec<Expr>>();
+            //
+            //     let plan = LogicalPlanBuilder::from(plan)
+            //         .project(project_exprs)?
+            //         .build()?;
+            //
+            //     Ok(Transformed::yes(plan))
+            // }
             _ => Ok(Transformed::no(plan)),
         }
     }
