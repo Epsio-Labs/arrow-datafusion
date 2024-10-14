@@ -1038,6 +1038,13 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
         (LargeUtf8, Utf8 | LargeUtf8) | (Utf8, LargeUtf8) => Some(LargeUtf8),
         // Utf8 coerces to Utf8
         (Utf8, Utf8) => Some(Utf8),
+        (Struct(f), Utf8) | (Utf8, Struct(f)) => {
+            if f.len() == 2 && f[0].name() == "enum" {
+                Some(Utf8)
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
