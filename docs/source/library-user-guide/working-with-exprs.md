@@ -17,9 +17,9 @@
   under the License.
 -->
 
-# Working with Exprs
+# Working with `Expr`s
 
-<!-- https://github.com/apache/arrow-datafusion/issues/7304 -->
+<!-- https://github.com/apache/datafusion/issues/7304 -->
 
 `Expr` is short for "expression". It is a core abstraction in DataFusion for representing a computation, and follows the standard "expression tree" abstraction found in most compilers and databases.
 
@@ -48,12 +48,11 @@ As another example, the SQL expression `a + b * c` would be represented as an `E
                     └────────────────────┘  └────────────────────┘
 ```
 
-As the writer of a library, you may want to use or create `Expr`s to represent computations that you want to perform. This guide will walk you through how to make your own scalar UDF as an `Expr` and how to rewrite `Expr`s to inline the simple UDF.
+As the writer of a library, you can use `Expr`s to represent computations that you want to perform. This guide will walk you through how to make your own scalar UDF as an `Expr` and how to rewrite `Expr`s to inline the simple UDF.
 
-There are also executable examples for working with `Expr`s:
+## Creating and Evaluating `Expr`s
 
-- [rewrite_expr.rs](../../../datafusion-examples/examples/catalog.rs)
-- [expr_api.rs](../../../datafusion-examples/examples/expr_api.rs)
+Please see [expr_api.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/expr_api.rs) for well commented code for creating, evaluating, simplifying, and analyzing `Expr`s.
 
 ## A Scalar UDF Example
 
@@ -79,7 +78,13 @@ let expr = add_one_udf.call(vec![col("my_column")]);
 
 If you'd like to learn more about `Expr`s, before we get into the details of creating and rewriting them, you can read the [expression user-guide](./../user-guide/expressions.md).
 
-## Rewriting Exprs
+## Rewriting `Expr`s
+
+There are several examples of rewriting and working with `Exprs`:
+
+- [expr_api.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/expr_api.rs)
+- [analyzer_rule.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/analyzer_rule.rs)
+- [optimizer_rule.rs](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/optimizer_rule.rs)
 
 Rewriting Expressions is the process of taking an `Expr` and transforming it into another `Expr`. This is useful for a number of reasons, including:
 
@@ -91,7 +96,7 @@ In our example, we'll use rewriting to update our `add_one` UDF, to be rewritten
 
 ### Rewriting with `transform`
 
-To implement the inlining, we'll need to write a function that takes an `Expr` and returns a `Result<Expr>`. If the expression is _not_ to be rewritten `Transformed::No` is used to wrap the original `Expr`. If the expression _is_ to be rewritten, `Transformed::Yes` is used to wrap the new `Expr`.
+To implement the inlining, we'll need to write a function that takes an `Expr` and returns a `Result<Expr>`. If the expression is _not_ to be rewritten `Transformed::no` is used to wrap the original `Expr`. If the expression _is_ to be rewritten, `Transformed::yes` is used to wrap the new `Expr`.
 
 ```rust
 fn rewrite_add_one(expr: Expr) -> Result<Expr> {
@@ -101,9 +106,9 @@ fn rewrite_add_one(expr: Expr) -> Result<Expr> {
                 let input_arg = scalar_fun.args[0].clone();
                 let new_expression = input_arg + lit(1i64);
 
-                Transformed::Yes(new_expression)
+                Transformed::yes(new_expression)
             }
-            _ => Transformed::No(expr),
+            _ => Transformed::no(expr),
         })
     })
 }
@@ -178,6 +183,34 @@ Projection: Int64(1) + Int64(1) AS added_one
 ```
 
 I.e. the `add_one` UDF has been inlined into the projection.
+
+## Getting the data type of the expression
+
+The `arrow::datatypes::DataType` of the expression can be obtained by calling the `get_type` given something that implements `Expr::Schemable`, for example a `DFschema` object:
+
+```rust
+use arrow_schema::DataType;
+use datafusion::common::{DFField, DFSchema};
+use datafusion::logical_expr::{col, ExprSchemable};
+use std::collections::HashMap;
+
+let expr = col("c1") + col("c2");
+let schema = DFSchema::new_with_metadata(
+    vec![
+        DFField::new_unqualified("c1", DataType::Int32, true),
+        DFField::new_unqualified("c2", DataType::Float32, true),
+    ],
+    HashMap::new(),
+)
+.unwrap();
+print!("type = {}", expr.get_type(&schema).unwrap());
+```
+
+This results in the following output:
+
+```text
+type = Float32
+```
 
 ## Conclusion
 

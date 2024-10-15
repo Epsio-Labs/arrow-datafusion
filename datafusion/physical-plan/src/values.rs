@@ -17,20 +17,23 @@
 
 //! Values execution plan
 
-use super::expressions::PhysicalSortExpr;
-use super::{common, DisplayAs, SendableRecordBatchStream, Statistics};
+use std::any::Any;
+use std::sync::Arc;
+
+use super::{
+    common, DisplayAs, ExecutionMode, PlanProperties, SendableRecordBatchStream,
+    Statistics,
+};
 use crate::{
     memory::MemoryStream, ColumnarValue, DisplayFormatType, ExecutionPlan, Partitioning,
     PhysicalExpr,
 };
-use arrow::array::new_null_array;
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
-use datafusion_common::{internal_err, plan_err, ScalarValue};
-use datafusion_common::{DataFusionError, Result};
+
+use arrow::datatypes::{Schema, SchemaRef};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use datafusion_common::{internal_err, plan_err, Result, ScalarValue};
 use datafusion_execution::TaskContext;
-use std::any::Any;
-use std::sync::Arc;
+use datafusion_physical_expr::EquivalenceProperties;
 
 /// Execution plan for values list based relation (produces constant rows)
 #[derive(Debug)]
@@ -39,6 +42,8 @@ pub struct ValuesExec {
     schema: SchemaRef,
     /// The data
     data: Vec<RecordBatch>,
+    /// Cache holding plan properties like equivalences, output partitioning etc.
+    cache: PlanProperties,
 }
 
 impl ValuesExec {
@@ -52,20 +57,20 @@ impl ValuesExec {
         }
         let n_row = data.len();
         let n_col = schema.fields().len();
-        // we have this single row, null, typed batch as a placeholder to satisfy evaluation argument
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            schema
-                .fields()
-                .iter()
-                .map(|field| new_null_array(field.data_type(), 1))
-                .collect::<Vec<_>>(),
+        // we have this single row batch as a placeholder to satisfy evaluation argument
+        // and generate a single output row
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(1)),
         )?;
+
         let arr = (0..n_col)
             .map(|j| {
                 (0..n_row)
                     .map(|i| {
                         let r = data[i][j].evaluate(&batch);
+
                         match r {
                             Ok(ColumnarValue::Scalar(scalar)) => Ok(scalar),
                             Ok(ColumnarValue::Array(a)) if a.len() == 1 => {
@@ -83,9 +88,13 @@ impl ValuesExec {
                     .and_then(ScalarValue::iter_to_array)
             })
             .collect::<Result<Vec<_>>>()?;
-        let batch = RecordBatch::try_new(schema.clone(), arr)?;
+        let batch = RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            arr,
+            &RecordBatchOptions::new().with_row_count(Some(n_row)),
+        )?;
         let data: Vec<RecordBatch> = vec![batch];
-        Ok(Self { schema, data })
+        Self::try_new_from_batches(schema, data)
     }
 
     /// Create a new plan using the provided schema and batches.
@@ -109,15 +118,28 @@ impl ValuesExec {
             }
         }
 
+        let cache = Self::compute_properties(Arc::clone(&schema));
         Ok(ValuesExec {
             schema,
             data: batches,
+            cache,
         })
     }
 
     /// provides the data
     pub fn data(&self) -> Vec<RecordBatch> {
         self.data.clone()
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        )
     }
 }
 
@@ -136,35 +158,29 @@ impl DisplayAs for ValuesExec {
 }
 
 impl ExecutionPlan for ValuesExec {
+    fn name(&self) -> &'static str {
+        "ValuesExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
-    }
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
     }
 
     fn with_new_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(ValuesExec {
-            schema: self.schema.clone(),
-            data: self.data.clone(),
-        }))
+        ValuesExec::try_new_from_batches(Arc::clone(&self.schema), self.data.clone())
+            .map(|e| Arc::new(e) as _)
     }
 
     fn execute(
@@ -172,7 +188,7 @@ impl ExecutionPlan for ValuesExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // GlobalLimitExec has a single output partition
+        // ValuesExec has a single output partition
         if 0 != partition {
             return internal_err!(
                 "ValuesExec invalid partition {partition} (expected 0)"
@@ -181,22 +197,28 @@ impl ExecutionPlan for ValuesExec {
 
         Ok(Box::pin(MemoryStream::try_new(
             self.data(),
-            self.schema.clone(),
+            Arc::clone(&self.schema),
             None,
         )?))
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         let batch = self.data();
-        common::compute_record_batch_statistics(&[batch], &self.schema, None)
+        Ok(common::compute_record_batch_statistics(
+            &[batch],
+            &self.schema,
+            None,
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::lit;
     use crate::test::{self, make_partition};
-    use arrow_schema::{DataType, Field, Schema};
+
+    use arrow_schema::{DataType, Field};
 
     #[tokio::test]
     async fn values_empty_case() -> Result<()> {
@@ -232,5 +254,19 @@ mod tests {
             Field::new("col1", DataType::Utf8, false),
         ]));
         let _ = ValuesExec::try_new_from_batches(invalid_schema, batches).unwrap_err();
+    }
+
+    // Test issue: https://github.com/apache/datafusion/issues/8763
+    #[test]
+    fn new_exec_with_non_nullable_schema() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::UInt32,
+            false,
+        )]));
+        let _ = ValuesExec::try_new(Arc::clone(&schema), vec![vec![lit(1u32)]]).unwrap();
+        // Test that a null value is rejected
+        let _ = ValuesExec::try_new(schema, vec![vec![lit(ScalarValue::UInt32(None))]])
+            .unwrap_err();
     }
 }

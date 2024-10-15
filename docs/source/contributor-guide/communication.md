@@ -22,53 +22,69 @@
 We welcome participation from everyone and encourage you to join us, ask
 questions, and get involved.
 
-All participation in the Apache Arrow DataFusion project is governed by the
+All participation in the Apache DataFusion project is governed by the
 Apache Software Foundation's [code of
 conduct](https://www.apache.org/foundation/policies/conduct.html).
 
+## GitHub
+
 The vast majority of communication occurs in the open on our
-[github repository](https://github.com/apache/arrow-datafusion).
+[github repository](https://github.com/apache/datafusion) in the form of tickets, issues, discussions, and Pull Requests.
 
-## Questions?
+## Slack and Discord
 
-### Mailing list
+We use the Slack and Discord platforms for informal discussions and coordination. These are great places to
+meet other contributors and get guidance on where to contribute. It is important to note that any technical designs and
+decisions are made fully in the open, on GitHub.
 
-We use arrow.apache.org's `dev@` mailing list for project management, release
-coordination and design discussions
-([subscribe](mailto:dev-subscribe@arrow.apache.org),
-[unsubscribe](mailto:dev-unsubscribe@arrow.apache.org),
-[archives](https://lists.apache.org/list.html?dev@arrow.apache.org)).
+Most of us use the [ASF Slack
+workspace](https://s.apache.org/slack-invite) and the [Arrow Rust Discord
+server](https://discord.gg/Qw5gKqHxUM) for discussions.
 
-When emailing the dev list, please make sure to prefix the subject line with a
-`[DataFusion]` tag, e.g. `"[DataFusion] New API for remote data sources"`, so
-that the appropriate people in the Apache Arrow community notice the message.
+There are specific channels for Arrow, DataFusion, and the DataFusion subprojects (Ballista, Comet, Python, etc).
 
-### Slack and Discord
+In Slack we use these channels:
 
-We use the official [ASF](https://s.apache.org/slack-invite) Slack workspace
-for informal discussions and coordination. This is a great place to meet other
-contributors and get guidance on where to contribute. Join us in the
-`#arrow-rust` channel.
+- #arrow
+- #arrow-rust
+- #datafusion
+- #datafusion-ballista
+- #datafusion-comet
+- #datafusion-python
 
-We also have a backup Arrow Rust Discord
-server ([invite link](https://discord.gg/Qw5gKqHxUM)) in case you are not able
-to join the Slack workspace. If you need an invite to the Slack workspace, you
-can also ask for one in our Discord server.
+In Discord we use these channels:
 
-### Sync up video calls
+- #ballista
+- #comet
+- #contrib-federation
+- #datafusion
+- #datafusion-python
+- #dolomite-optimizer
+- #general
+- #hiring
+- #incremental-materialized-views
 
-We have biweekly sync calls every other Thursdays at both 04:00 UTC
-and 16:00 UTC (starting September 30, 2021) depending on if there are
-items on the agenda to discuss and someone being willing to host.
+Unfortunately, due to spammers, the ASF Slack workspace requires an invitation
+to join. We are happy to invite you -- please ask for an invitation in the
+Discord server.
 
-Please see the [agenda](https://docs.google.com/document/d/1atCVnoff5SR4eM4Lwf2M1BBJTY6g3_HUNR6qswYJW_U/edit)
-for the video call link, add topics and to see what others plan to discuss.
+## Mailing Lists
 
-The goals of these calls are:
+Like other Apache projects, we use [mailing lists] for certain purposes, most
+importantly release coordination. Other than the release process, most
+DataFusion mailing list traffic will simply link to a GitHub issue or PR where
+the actual discussion occurs. The project mailing lists are:
 
-1. Help "put a face to the name" of some of other contributors we are working with
-2. Discuss / synchronize on the goals and major initiatives from different stakeholders to identify areas where more alignment is needed
+- [`dev@datafusion.apache.org`](mailto:dev@datafusion.apache.org): the main
+  mailing list for release coordination and other project-wide discussions. Links:
+  [archives](https://lists.apache.org/list.html?dev@datafusion.apache.org),
+  [subscribe](mailto:dev-subscribe@datafusion.apache.org),
+  [unsubscribe](mailto:dev-unsubscribe@datafusion.apache.org)
+- `github@datafusion.apache.org`: read-only mailing list that receives all GitHub notifications for the project. Links:
+  [archives](https://lists.apache.org/list.html?github@datafusion.apache.org)
+- `commits@datafusion.apache.org`: read-only mailing list that receives all GitHub commits for the project. Links:
+  [archives](https://lists.apache.org/list.html?commits@datafusion.apache.org)
+- `private@datafusion.apache.org`: private mailing list for PMC members. This list has very little traffic, almost exclusively discussions on growing the committer and PMC membership. Links:
+  [archives](https://lists.apache.org/list.html?private@datafusion.apache.org)
 
-No decisions are made on the call and anything of substance will be discussed on the mailing list or in github issues / google docs.
-
-We will send a summary of all sync ups to the dev@arrow.apache.org mailing list.
+[mailing lists]: https://www.apache.org/foundation/mailinglists

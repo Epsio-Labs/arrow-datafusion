@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/// Tests for user defined Scalar functions
+mod user_defined_scalar_functions;
+
 /// Tests for User Defined Aggregate Functions
 mod user_defined_aggregates;
 
@@ -23,3 +26,9 @@ mod user_defined_plan;
 
 /// Tests for User Defined Window Functions
 mod user_defined_window_functions;
+
+/// Tests for User Defined Table Functions
+mod user_defined_table_functions;
+
+/// Tests for Expression Planner
+mod expr_planner;

@@ -123,11 +123,9 @@ bool_or(expression)
 
 ### `count`
 
-Returns the number of rows in the specified column.
+Returns the number of non-null values in the specified column.
 
-Count includes _null_ values in the total count.
-To exclude _null_ values from the total count, include `<column> IS NOT NULL`
-in the `WHERE` clause.
+To include _null_ values in the total count, use `count(*)`.
 
 ```
 count(expression)
@@ -254,6 +252,7 @@ last_value(expression [ORDER BY expression])
 - [regr_sxx](#regr_sxx)
 - [regr_syy](#regr_syy)
 - [regr_sxy](#regr_sxy)
+- [kurtosis_pop](#kurtosis_pop)
 
 ### `corr`
 
@@ -527,6 +526,19 @@ regr_sxy(expression_y, expression_x)
 - **expression_y**: Dependent variable.
   Can be a constant, column, or function, and any combination of arithmetic operators.
 - **expression_x**: Independent variable.
+  Can be a constant, column, or function, and any combination of arithmetic operators.
+
+### `kurtosis_pop`
+
+Computes the excess kurtosis (Fisher’s definition) without bias correction.
+
+```
+kurtois_pop(expression)
+```
+
+#### Arguments
+
+- **expression**: Expression to operate on.
   Can be a constant, column, or function, and any combination of arithmetic operators.
 
 ## Approximate

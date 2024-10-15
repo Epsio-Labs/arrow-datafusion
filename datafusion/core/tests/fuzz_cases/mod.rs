@@ -16,8 +16,11 @@
 // under the License.
 
 mod aggregate_fuzz;
+mod distinct_count_string_fuzz;
 mod join_fuzz;
 mod merge_fuzz;
 mod sort_fuzz;
+
+mod limit_fuzz;
 mod sort_preserving_repartition_fuzz;
 mod window_fuzz;

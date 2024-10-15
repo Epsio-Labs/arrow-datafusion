@@ -20,7 +20,7 @@
 # DataFusion SQL Query Planner
 
 This crate provides a general purpose SQL query planner that can parse SQL and translate queries into logical
-plans. Although this crate is used by the [DataFusion](df) query engine, it was designed to be easily usable from any
+plans. Although this crate is used by the [DataFusion][df] query engine, it was designed to be easily usable from any
 project that requires a SQL query planner and does not make any assumptions about how the resulting logical plan
 will be translated to a physical plan. For example, there is no concept of row-based versus columnar execution in the
 logical plan.
@@ -67,8 +67,8 @@ optimizer that can be applied to plans produced by this crate.
 
 ```
 Sort: state_tax DESC NULLS FIRST
-  Projection: c.id, c.first_name, c.last_name, COUNT(UInt8(1)) AS num_orders, SUM(o.price) AS total_price, SUM(o.price * s.sales_tax) AS state_tax
-    Aggregate: groupBy=[[c.id, c.first_name, c.last_name]], aggr=[[COUNT(UInt8(1)), SUM(o.price), SUM(o.price * s.sales_tax)]]
+  Projection: c.id, c.first_name, c.last_name, COUNT(Int64(1)) AS num_orders, SUM(o.price) AS total_price, SUM(o.price * s.sales_tax) AS state_tax
+    Aggregate: groupBy=[[c.id, c.first_name, c.last_name]], aggr=[[COUNT(Int64(1)), SUM(o.price), SUM(o.price * s.sales_tax)]]
       Filter: o.price > Int64(0) AND c.last_name LIKE Utf8("G%")
         Inner Join: c.id = o.customer_id
           Inner Join: c.state = s.id

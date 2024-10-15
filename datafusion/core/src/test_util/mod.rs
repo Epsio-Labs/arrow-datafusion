@@ -17,41 +17,48 @@
 
 //! Utility functions to make testing DataFusion based crates easier
 
+#[cfg(feature = "parquet")]
 pub mod parquet;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::datasource::provider::TableProviderFactory;
-use crate::datasource::{empty::EmptyTable, provider_as_source, TableProvider};
+use crate::catalog::{TableProvider, TableProviderFactory};
+use crate::dataframe::DataFrame;
+use crate::datasource::stream::{FileStreamProvider, StreamConfig, StreamTable};
+use crate::datasource::{empty::EmptyTable, provider_as_source};
 use crate::error::Result;
-use crate::execution::context::{SessionState, TaskContext};
-use crate::execution::options::ReadOptions;
+use crate::execution::context::TaskContext;
 use crate::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
 use crate::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning,
+    PlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
 use crate::prelude::{CsvReadOptions, SessionContext};
+
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::TableReference;
+use datafusion_expr::utils::COUNT_STAR_EXPANSION;
+use datafusion_expr::{CreateExternalTable, Expr, SortExpr, TableType};
+use datafusion_functions_aggregate::count::count_udaf;
+use datafusion_physical_expr::{expressions, EquivalenceProperties, PhysicalExpr};
+
 use async_trait::async_trait;
-use datafusion_common::{Statistics, TableReference};
-use datafusion_expr::{CreateExternalTable, Expr, TableType};
-use datafusion_physical_expr::PhysicalSortExpr;
+use datafusion_catalog::Session;
+use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use futures::Stream;
-
+use tempfile::TempDir;
 // backwards compatibility
-pub use datafusion_common::test_util::{
-    arrow_test_data, get_data_dir, parquet_test_data,
-};
-
-pub use datafusion_common::assert_batches_eq;
-pub use datafusion_common::assert_batches_sorted_eq;
+#[cfg(feature = "parquet")]
+pub use datafusion_common::test_util::parquet_test_data;
+pub use datafusion_common::test_util::{arrow_test_data, get_data_dir};
 
 /// Scan an empty data source, mainly used in tests
 pub fn scan_empty(
@@ -61,7 +68,7 @@ pub fn scan_empty(
 ) -> Result<LogicalPlanBuilder> {
     let table_schema = Arc::new(table_schema.clone());
     let provider = Arc::new(EmptyTable::new(table_schema));
-    let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE).to_string());
+    let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE));
     LogicalPlanBuilder::scan(name, provider_as_source(provider), projection)
 }
 
@@ -74,7 +81,7 @@ pub fn scan_empty_with_partitions(
 ) -> Result<LogicalPlanBuilder> {
     let table_schema = Arc::new(table_schema.clone());
     let provider = Arc::new(EmptyTable::new(table_schema).with_partitions(partitions));
-    let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE).to_string());
+    let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE));
     LogicalPlanBuilder::scan(name, provider_as_source(provider), projection)
 }
 
@@ -101,6 +108,71 @@ pub fn aggr_test_schema() -> SchemaRef {
     Arc::new(schema)
 }
 
+/// Register session context for the aggregate_test_100.csv file
+pub async fn register_aggregate_csv(
+    ctx: &SessionContext,
+    table_name: &str,
+) -> Result<()> {
+    let schema = aggr_test_schema();
+    let testdata = arrow_test_data();
+    ctx.register_csv(
+        table_name,
+        &format!("{testdata}/csv/aggregate_test_100.csv"),
+        CsvReadOptions::new().schema(schema.as_ref()),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create a table from the aggregate_test_100.csv file with the specified name
+pub async fn test_table_with_name(name: &str) -> Result<DataFrame> {
+    let ctx = SessionContext::new();
+    register_aggregate_csv(&ctx, name).await?;
+    ctx.table(name).await
+}
+
+/// Create a table from the aggregate_test_100.csv file with the name "aggregate_test_100"
+pub async fn test_table() -> Result<DataFrame> {
+    test_table_with_name("aggregate_test_100").await
+}
+
+/// Execute SQL and return results
+pub async fn plan_and_collect(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<RecordBatch>> {
+    ctx.sql(sql).await?.collect().await
+}
+
+/// Generate CSV partitions within the supplied directory
+pub fn populate_csv_partitions(
+    tmp_dir: &TempDir,
+    partition_count: usize,
+    file_extension: &str,
+) -> Result<SchemaRef> {
+    // define schema for data source (csv file)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c1", DataType::UInt32, false),
+        Field::new("c2", DataType::UInt64, false),
+        Field::new("c3", DataType::Boolean, false),
+    ]));
+
+    // generate a partitioned file
+    for partition in 0..partition_count {
+        let filename = format!("partition-{partition}.{file_extension}");
+        let file_path = tmp_dir.path().join(filename);
+        let mut file = File::create(file_path)?;
+
+        // generate some data
+        for i in 0..=10 {
+            let data = format!("{},{},{}\n", partition, i, i % 2 == 0);
+            file.write_all(data.as_bytes())?;
+        }
+    }
+
+    Ok(schema)
+}
+
 /// TableFactory for tests
 pub struct TestTableFactory {}
 
@@ -108,7 +180,7 @@ pub struct TestTableFactory {}
 impl TableProviderFactory for TestTableFactory {
     async fn create(
         &self,
-        _: &SessionState,
+        _: &dyn Session,
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
         Ok(Arc::new(TestTableProvider {
@@ -144,7 +216,7 @@ impl TableProvider for TestTableProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         _projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
@@ -158,7 +230,7 @@ impl TableProvider for TestTableProvider {
 pub struct UnboundedExec {
     batch_produce: Option<usize>,
     batch: RecordBatch,
-    partitions: usize,
+    cache: PlanProperties,
 }
 impl UnboundedExec {
     /// Create new exec that clones the given record batch to its output.
@@ -169,11 +241,31 @@ impl UnboundedExec {
         batch: RecordBatch,
         partitions: usize,
     ) -> Self {
+        let cache = Self::compute_properties(batch.schema(), batch_produce, partitions);
         Self {
             batch_produce,
             batch,
-            partitions,
+            cache,
         }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(
+        schema: SchemaRef,
+        batch_produce: Option<usize>,
+        n_partitions: usize,
+    ) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        let mode = if batch_produce.is_none() {
+            ExecutionMode::Unbounded
+        } else {
+            ExecutionMode::Bounded
+        };
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(n_partitions),
+            mode,
+        )
     }
 }
 
@@ -196,26 +288,19 @@ impl DisplayAs for UnboundedExec {
 }
 
 impl ExecutionPlan for UnboundedExec {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.batch.schema()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(self.partitions)
-    }
-
-    fn unbounded_output(&self, _children: &[bool]) -> Result<bool> {
-        Ok(self.batch_produce.is_none())
-    }
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -236,10 +321,6 @@ impl ExecutionPlan for UnboundedExec {
             count: 0,
             batch: self.batch.clone(),
         }))
-    }
-
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
     }
 }
 
@@ -274,30 +355,107 @@ impl RecordBatchStream for UnboundedStream {
 }
 
 /// This function creates an unbounded sorted file for testing purposes.
-pub async fn register_unbounded_file_with_ordering(
+pub fn register_unbounded_file_with_ordering(
     ctx: &SessionContext,
     schema: SchemaRef,
     file_path: &Path,
     table_name: &str,
-    file_sort_order: Vec<Vec<Expr>>,
-    with_unbounded_execution: bool,
+    file_sort_order: Vec<Vec<SortExpr>>,
 ) -> Result<()> {
-    // Mark infinite and provide schema:
-    let fifo_options = CsvReadOptions::new()
-        .schema(schema.as_ref())
-        .mark_infinite(with_unbounded_execution);
-    // Get listing options:
-    let options_sort = fifo_options
-        .to_listing_options(&ctx.copied_config())
-        .with_file_sort_order(file_sort_order);
+    let source = FileStreamProvider::new_file(schema, file_path.into());
+    let config = StreamConfig::new(Arc::new(source)).with_order(file_sort_order);
+
     // Register table:
-    ctx.register_listing_table(
-        table_name,
-        file_path.as_os_str().to_str().unwrap(),
-        options_sort,
-        Some(schema),
-        None,
-    )
-    .await?;
+    ctx.register_table(table_name, Arc::new(StreamTable::new(Arc::new(config))))?;
     Ok(())
+}
+
+struct BoundedStream {
+    limit: usize,
+    count: usize,
+    batch: RecordBatch,
+}
+
+impl Stream for BoundedStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        if self.count >= self.limit {
+            return Poll::Ready(None);
+        }
+        self.count += 1;
+        Poll::Ready(Some(Ok(self.batch.clone())))
+    }
+}
+
+impl RecordBatchStream for BoundedStream {
+    fn schema(&self) -> SchemaRef {
+        self.batch.schema()
+    }
+}
+
+/// Creates an bounded stream for testing purposes.
+pub fn bounded_stream(batch: RecordBatch, limit: usize) -> SendableRecordBatchStream {
+    Box::pin(BoundedStream {
+        count: 0,
+        limit,
+        batch,
+    })
+}
+
+/// Describe the type of aggregate being tested
+pub enum TestAggregate {
+    /// Testing COUNT(*) type aggregates
+    CountStar,
+
+    /// Testing for COUNT(column) aggregate
+    ColumnA(Arc<Schema>),
+}
+
+impl TestAggregate {
+    /// Create a new COUNT(*) aggregate
+    pub fn new_count_star() -> Self {
+        Self::CountStar
+    }
+
+    /// Create a new COUNT(column) aggregate
+    pub fn new_count_column(schema: &Arc<Schema>) -> Self {
+        Self::ColumnA(schema.clone())
+    }
+
+    /// Return appropriate expr depending if COUNT is for col or table (*)
+    pub fn count_expr(&self, schema: &Schema) -> AggregateFunctionExpr {
+        AggregateExprBuilder::new(count_udaf(), vec![self.column()])
+            .schema(Arc::new(schema.clone()))
+            .alias(self.column_name())
+            .build()
+            .unwrap()
+    }
+
+    /// what argument would this aggregate need in the plan?
+    fn column(&self) -> Arc<dyn PhysicalExpr> {
+        match self {
+            Self::CountStar => expressions::lit(COUNT_STAR_EXPANSION),
+            Self::ColumnA(s) => expressions::col("a", s).unwrap(),
+        }
+    }
+
+    /// What name would this aggregate produce in a plan?
+    pub fn column_name(&self) -> &'static str {
+        match self {
+            Self::CountStar => "COUNT(*)",
+            Self::ColumnA(_) => "COUNT(a)",
+        }
+    }
+
+    /// What is the expected count?
+    pub fn expected_count(&self) -> i64 {
+        match self {
+            TestAggregate::CountStar => 3,
+            TestAggregate::ColumnA(_) => 2,
+        }
+    }
 }

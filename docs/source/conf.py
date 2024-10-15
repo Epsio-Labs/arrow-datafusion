@@ -33,9 +33,9 @@
 
 # -- Project information -----------------------------------------------------
 
-project = 'Arrow DataFusion'
-copyright = '2023, Apache Software Foundation'
-author = 'Arrow DataFusion Authors'
+project = 'Apache DataFusion'
+copyright = '2019-2024, Apache Software Foundation'
+author = 'Apache Software Foundation'
 
 
 # -- General configuration ---------------------------------------------------
@@ -100,9 +100,15 @@ html_context = {
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ['_static']
 
-html_logo = "_static/images/DataFusion-Logo-Background-White.png"
+html_logo = "_static/images/2x_bgwhite_original.png"
 
-html_css_files = ["theme_overrides.css"]
+html_css_files = [
+    "theme_overrides.css"
+]
+
+html_js_files = [
+    ("https://buttons.github.io/buttons.js", {'async': 'true', 'defer': 'true'}),
+]
 
 html_sidebars = {
     "**": ["docs-sidebar.html"],
@@ -112,4 +118,4 @@ html_sidebars = {
 myst_heading_anchors = 3
 
 # enable nice rendering of checkboxes for the task lists
-myst_enable_extensions = [ "tasklist"]
+myst_enable_extensions = ["colon_fence", "deflist", "tasklist"]

@@ -22,9 +22,73 @@ use std::{
     sync::Arc,
 };
 
-use datafusion_common::{config::ConfigOptions, Result, ScalarValue};
+use datafusion_common::{
+    config::{ConfigExtension, ConfigOptions},
+    Result, ScalarValue,
+};
 
-/// Configuration options for Execution context
+/// Configuration options for [`SessionContext`].
+///
+/// Can be passed to [`SessionContext::new_with_config`] to customize the configuration of DataFusion.
+///
+/// Options can be set using namespaces keys with `.` as the separator, where the
+/// namespace determines which configuration struct the value to routed to. All
+/// built-in options are under the `datafusion` namespace.
+///
+/// For example, the key `datafusion.execution.batch_size` will set [ExecutionOptions::batch_size][datafusion_common::config::ExecutionOptions::batch_size],
+/// because [ConfigOptions::execution] is [ExecutionOptions][datafusion_common::config::ExecutionOptions]. Similarly, the key
+/// `datafusion.execution.parquet.pushdown_filters` will set [ParquetOptions::pushdown_filters][datafusion_common::config::ParquetOptions::pushdown_filters],
+/// since [ExecutionOptions::parquet][datafusion_common::config::ExecutionOptions::parquet] is [ParquetOptions][datafusion_common::config::ParquetOptions].
+///
+/// Some options have convenience methods. For example [SessionConfig::with_batch_size] is
+/// shorthand for setting `datafusion.execution.batch_size`.
+///
+/// ```
+/// use datafusion_execution::config::SessionConfig;
+/// use datafusion_common::ScalarValue;
+///
+/// let config = SessionConfig::new()
+///    .set("datafusion.execution.batch_size", &ScalarValue::UInt64(Some(1234)))
+///    .set_bool("datafusion.execution.parquet.pushdown_filters", true);
+///
+/// assert_eq!(config.batch_size(), 1234);
+/// assert_eq!(config.options().execution.batch_size, 1234);
+/// assert_eq!(config.options().execution.parquet.pushdown_filters, true);
+/// ```
+///
+/// You can also directly mutate the options via [SessionConfig::options_mut].
+/// So the following is equivalent to the above:
+///
+/// ```
+/// # use datafusion_execution::config::SessionConfig;
+/// # use datafusion_common::ScalarValue;
+/// #
+/// let mut config = SessionConfig::new();
+/// config.options_mut().execution.batch_size = 1234;
+/// config.options_mut().execution.parquet.pushdown_filters = true;
+/// #
+/// # assert_eq!(config.batch_size(), 1234);
+/// # assert_eq!(config.options().execution.batch_size, 1234);
+/// # assert_eq!(config.options().execution.parquet.pushdown_filters, true);
+/// ```
+///
+/// ## Built-in options
+///
+/// | Namespace | Config struct |
+/// | --------- | ------------- |
+/// | `datafusion.catalog` | [CatalogOptions][datafusion_common::config::CatalogOptions] |
+/// | `datafusion.execution` | [ExecutionOptions][datafusion_common::config::ExecutionOptions] |
+/// | `datafusion.execution.parquet` | [ParquetOptions][datafusion_common::config::ParquetOptions] |
+/// | `datafusion.optimizer` | [OptimizerOptions][datafusion_common::config::OptimizerOptions] |
+/// | `datafusion.sql_parser` | [SqlParserOptions][datafusion_common::config::SqlParserOptions] |
+/// | `datafusion.explain` | [ExplainOptions][datafusion_common::config::ExplainOptions] |
+///
+/// ## Custom configuration
+///
+/// Configuration options can be extended. See [SessionConfig::with_extension] for details.
+///
+/// [`SessionContext`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html
+/// [`SessionContext::new_with_config`]: https://docs.rs/datafusion/latest/datafusion/execution/context/struct.SessionContext.html#method.new_with_config
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     /// Configuration options
@@ -58,35 +122,63 @@ impl SessionConfig {
     }
 
     /// Create new ConfigOptions struct, taking values from a string hash map.
-    pub fn from_string_hash_map(settings: HashMap<String, String>) -> Result<Self> {
+    pub fn from_string_hash_map(settings: &HashMap<String, String>) -> Result<Self> {
         Ok(ConfigOptions::from_string_hash_map(settings)?.into())
     }
 
+    /// Return a handle to the configuration options.
+    ///
+    /// Can be used to read the current configuration.
+    ///
+    /// ```
+    /// use datafusion_execution::config::SessionConfig;
+    ///
+    /// let config = SessionConfig::new();
+    /// assert!(config.options().execution.batch_size > 0);
+    /// ```
+    pub fn options(&self) -> &ConfigOptions {
+        &self.options
+    }
+
+    /// Return a mutable handle to the configuration options.
+    ///
+    /// Can be used to set configuration options.
+    ///
+    /// ```
+    /// use datafusion_execution::config::SessionConfig;
+    ///
+    /// let mut config = SessionConfig::new();
+    /// config.options_mut().execution.batch_size = 1024;
+    /// assert_eq!(config.options().execution.batch_size, 1024);
+    /// ```
+    pub fn options_mut(&mut self) -> &mut ConfigOptions {
+        &mut self.options
+    }
+
     /// Set a configuration option
-    pub fn set(mut self, key: &str, value: ScalarValue) -> Self {
-        self.options.set(key, &value.to_string()).unwrap();
-        self
+    pub fn set(self, key: &str, value: &ScalarValue) -> Self {
+        self.set_str(key, &value.to_string())
     }
 
     /// Set a boolean configuration option
     pub fn set_bool(self, key: &str, value: bool) -> Self {
-        self.set(key, ScalarValue::Boolean(Some(value)))
+        self.set_str(key, &value.to_string())
     }
 
     /// Set a generic `u64` configuration option
     pub fn set_u64(self, key: &str, value: u64) -> Self {
-        self.set(key, ScalarValue::UInt64(Some(value)))
+        self.set_str(key, &value.to_string())
     }
 
     /// Set a generic `usize` configuration option
     pub fn set_usize(self, key: &str, value: usize) -> Self {
-        let value: u64 = value.try_into().expect("convert usize to u64");
-        self.set(key, ScalarValue::UInt64(Some(value)))
+        self.set_str(key, &value.to_string())
     }
 
     /// Set a generic `str` configuration option
-    pub fn set_str(self, key: &str, value: &str) -> Self {
-        self.set(key, ScalarValue::Utf8(Some(value.to_string())))
+    pub fn set_str(mut self, key: &str, value: &str) -> Self {
+        self.options.set(key, value).unwrap();
+        self
     }
 
     /// Customize batch size
@@ -104,6 +196,12 @@ impl SessionConfig {
         // partition count must be greater than zero
         assert!(n > 0);
         self.options.execution.target_partitions = n;
+        self
+    }
+
+    /// Insert new [ConfigExtension]
+    pub fn with_option_extension<T: ConfigExtension>(mut self, extension: T) -> Self {
+        self.options_mut().extensions.insert(extension);
         self
     }
 
@@ -145,10 +243,12 @@ impl SessionConfig {
         self.options.optimizer.repartition_sorts
     }
 
-    /// Remove sorts by replacing with order-preserving variants of operators,
-    /// even when query is bounded?
-    pub fn bounded_order_preserving_variants(&self) -> bool {
-        self.options.optimizer.bounded_order_preserving_variants
+    /// Prefer existing sort (true) or maximize parallelism (false). See
+    /// [prefer_existing_sort] for more details
+    ///
+    /// [prefer_existing_sort]: datafusion_common::config::OptimizerOptions::prefer_existing_sort
+    pub fn prefer_existing_sort(&self) -> bool {
+        self.options.optimizer.prefer_existing_sort
     }
 
     /// Are statistics collected during execution?
@@ -221,10 +321,20 @@ impl SessionConfig {
         self
     }
 
-    /// Enables or disables the use of order-preserving variants of `CoalescePartitions`
-    /// and `RepartitionExec` operators, even when the query is bounded
-    pub fn with_bounded_order_preserving_variants(mut self, enabled: bool) -> Self {
-        self.options.optimizer.bounded_order_preserving_variants = enabled;
+    /// Prefer existing sort (true) or maximize parallelism (false). See
+    /// [prefer_existing_sort] for more details
+    ///
+    /// [prefer_existing_sort]: datafusion_common::config::OptimizerOptions::prefer_existing_sort
+    pub fn with_prefer_existing_sort(mut self, enabled: bool) -> Self {
+        self.options.optimizer.prefer_existing_sort = enabled;
+        self
+    }
+
+    /// Prefer existing union (true). See [prefer_existing_union] for more details
+    ///
+    /// [prefer_existing_union]: datafusion_common::config::OptimizerOptions::prefer_existing_union
+    pub fn with_prefer_existing_union(mut self, enabled: bool) -> Self {
+        self.options.optimizer.prefer_existing_union = enabled;
         self
     }
 
@@ -239,6 +349,28 @@ impl SessionConfig {
         self.options.execution.parquet.pruning
     }
 
+    /// Returns true if bloom filter should be used to skip parquet row groups
+    pub fn parquet_bloom_filter_pruning(&self) -> bool {
+        self.options.execution.parquet.bloom_filter_on_read
+    }
+
+    /// Enables or disables the use of bloom filter for parquet readers to skip row groups
+    pub fn with_parquet_bloom_filter_pruning(mut self, enabled: bool) -> Self {
+        self.options.execution.parquet.bloom_filter_on_read = enabled;
+        self
+    }
+
+    /// Returns true if page index should be used to skip parquet data pages
+    pub fn parquet_page_index_pruning(&self) -> bool {
+        self.options.execution.parquet.enable_page_index
+    }
+
+    /// Enables or disables the use of page index for parquet readers to skip parquet data pages
+    pub fn with_parquet_page_index_pruning(mut self, enabled: bool) -> Self {
+        self.options.execution.parquet.enable_page_index = enabled;
+        self
+    }
+
     /// Enables or disables the collection of statistics after listing files
     pub fn with_collect_statistics(mut self, enabled: bool) -> Self {
         self.options.execution.collect_statistics = enabled;
@@ -248,19 +380,6 @@ impl SessionConfig {
     /// Get the currently configured batch size
     pub fn batch_size(&self) -> usize {
         self.options.execution.batch_size
-    }
-
-    /// Get the currently configured scalar_update_factor for aggregate
-    pub fn agg_scalar_update_factor(&self) -> usize {
-        self.options.execution.aggregate.scalar_update_factor
-    }
-
-    /// Customize scalar_update_factor for aggregate
-    pub fn with_agg_scalar_update_factor(mut self, n: usize) -> Self {
-        // scalar update factor must be greater than zero
-        assert!(n > 0);
-        self.options.execution.aggregate.scalar_update_factor = n;
-        self
     }
 
     /// Enables or disables the coalescence of small batches into larger batches
@@ -317,9 +436,9 @@ impl SessionConfig {
     /// converted to strings.
     ///
     /// Note that this method will eventually be deprecated and
-    /// replaced by [`config_options`].
+    /// replaced by [`options`].
     ///
-    /// [`config_options`]: Self::config_options
+    /// [`options`]: Self::options
     pub fn to_props(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         // copy configs from config_options
@@ -328,28 +447,6 @@ impl SessionConfig {
         }
 
         map
-    }
-
-    /// Return a handle to the configuration options.
-    #[deprecated(since = "21.0.0", note = "use options() instead")]
-    pub fn config_options(&self) -> &ConfigOptions {
-        &self.options
-    }
-
-    /// Return a mutable handle to the configuration options.
-    #[deprecated(since = "21.0.0", note = "use options_mut() instead")]
-    pub fn config_options_mut(&mut self) -> &mut ConfigOptions {
-        &mut self.options
-    }
-
-    /// Return a handle to the configuration options.
-    pub fn options(&self) -> &ConfigOptions {
-        &self.options
-    }
-
-    /// Return a mutable handle to the configuration options.
-    pub fn options_mut(&mut self) -> &mut ConfigOptions {
-        &mut self.options
     }
 
     /// Add extensions.
@@ -400,10 +497,51 @@ impl SessionConfig {
     where
         T: Send + Sync + 'static,
     {
+        self.set_extension(ext);
+        self
+    }
+
+    /// Set extension. Pretty much the same as [`with_extension`](Self::with_extension), but take
+    /// mutable reference instead of owning it. Useful if you want to add another extension after
+    /// the [`SessionConfig`] is created.
+    ///
+    /// # Example
+    /// ```
+    /// use std::sync::Arc;
+    /// use datafusion_execution::config::SessionConfig;
+    ///
+    /// // application-specific extension types
+    /// struct Ext1(u8);
+    /// struct Ext2(u8);
+    /// struct Ext3(u8);
+    ///
+    /// let ext1a = Arc::new(Ext1(10));
+    /// let ext1b = Arc::new(Ext1(11));
+    /// let ext2 = Arc::new(Ext2(2));
+    ///
+    /// let mut cfg = SessionConfig::default();
+    ///
+    /// // will only remember the last Ext1
+    /// cfg.set_extension(Arc::clone(&ext1a));
+    /// cfg.set_extension(Arc::clone(&ext1b));
+    /// cfg.set_extension(Arc::clone(&ext2));
+    ///
+    /// let ext1_received = cfg.get_extension::<Ext1>().unwrap();
+    /// assert!(!Arc::ptr_eq(&ext1_received, &ext1a));
+    /// assert!(Arc::ptr_eq(&ext1_received, &ext1b));
+    ///
+    /// let ext2_received = cfg.get_extension::<Ext2>().unwrap();
+    /// assert!(Arc::ptr_eq(&ext2_received, &ext2));
+    ///
+    /// assert!(cfg.get_extension::<Ext3>().is_none());
+    /// ```
+    pub fn set_extension<T>(&mut self, ext: Arc<T>)
+    where
+        T: Send + Sync + 'static,
+    {
         let ext = ext as Arc<dyn Any + Send + Sync + 'static>;
         let id = TypeId::of::<T>();
         self.extensions.insert(id, ext);
-        self
     }
 
     /// Get extension, if any for the specified type `T` exists.

@@ -19,14 +19,17 @@
 name = "datafusion-expr"
 description = "Logical plan and expression representation for DataFusion query engine"
 keywords = ["datafusion", "logical", "plan", "expressions"]
+readme = "README.md"
 version = { workspace = true }
 edition = { workspace = true }
-readme = { workspace = true }
 homepage = { workspace = true }
 repository = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 rust-version = { workspace = true }
+
+[lints]
+workspace = true
 
 [lib]
 name = "datafusion_expr"
@@ -35,13 +38,21 @@ path = "src/lib.rs"
 [features]
 
 [dependencies]
-ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
+ahash = { workspace = true }
 arrow = { workspace = true }
-datafusion-common = { path = "../common", version = "31.0.0" }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+chrono = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr-common = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
+datafusion-physical-expr-common = { workspace = true }
+paste = "^1.0"
+serde_json = { workspace = true }
 sqlparser = { workspace = true }
-strum = { version = "0.25.0", features = ["derive"] }
-strum_macros = "0.25.0"
+strum = { version = "0.26.1", features = ["derive"] }
+strum_macros = "0.26.0"
 
 [dev-dependencies]
-ctor = "0.2.0"
-env_logger = "0.10"
+ctor = { workspace = true }
+env_logger = { workspace = true }

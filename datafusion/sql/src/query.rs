@@ -19,86 +19,59 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
-use datafusion_common::{
-    not_impl_err, plan_err, sql_err, Constraints, DataFusionError, Result, ScalarValue,
-};
-use datafusion_expr::expr_rewriter::normalize_col;
+use datafusion_common::{not_impl_err, plan_err, Constraints, Result, ScalarValue};
+use datafusion_expr::expr::Sort;
 use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Expr, LogicalPlan, LogicalPlanBuilder,
+    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
+    Operator,
 };
 use sqlparser::ast::{
-    Expr as SQLExpr, Offset as SQLOffset, OrderByExpr, Query, SetExpr, Value,
+    Expr as SQLExpr, Offset as SQLOffset, OrderBy, OrderByExpr, Query, SelectInto,
+    SetExpr, Value,
 };
 
-use crate::utils::{extract_aliases, resolve_aliases_to_exprs};
-use sqlparser::parser::ParserError::ParserError;
-
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
-    /// Generate a logical plan from an SQL query
+    /// Generate a logical plan from an SQL query/subquery
     pub(crate) fn query_to_plan(
         &self,
         query: Query,
-        planner_context: &mut PlannerContext,
+        outer_planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        self.query_to_plan_with_schema(query, planner_context)
-    }
+        // Each query has its own planner context, including CTEs that are visible within that query.
+        // It also inherits the CTEs from the outer query by cloning the outer planner context.
+        let mut query_plan_context = outer_planner_context.clone();
+        let planner_context = &mut query_plan_context;
 
-    /// Generate a logic plan from an SQL query.
-    /// It's implementation of `subquery_to_plan` and `query_to_plan`.
-    /// It shouldn't be invoked directly.
-    fn query_to_plan_with_schema(
-        &self,
-        query: Query,
-        planner_context: &mut PlannerContext,
-    ) -> Result<LogicalPlan> {
-        let set_expr = query.body;
         if let Some(with) = query.with {
-            // Process CTEs from top to bottom
-            // do not allow self-references
-            if with.recursive {
-                return not_impl_err!("Recursive CTEs are not supported");
+            self.plan_with_clause(with, planner_context)?;
+        }
+
+        let set_expr = *query.body;
+        match set_expr {
+            SetExpr::Select(mut select) => {
+                let select_into = select.into.take();
+                // Order-by expressions may refer to columns in the `FROM` clause,
+                // so we need to process `SELECT` and `ORDER BY` together.
+                let oby_exprs = to_order_by_exprs(query.order_by)?;
+                let plan = self.select_to_plan(*select, oby_exprs, planner_context)?;
+                let plan = self.limit(plan, query.offset, query.limit)?;
+                // Process the `SELECT INTO` after `LIMIT`.
+                self.select_into(plan, select_into)
             }
-
-            for cte in with.cte_tables {
-                // A `WITH` block can't use the same name more than once
-                let cte_name = self.normalizer.normalize(cte.alias.name.clone());
-                if planner_context.contains_cte(&cte_name) {
-                    return sql_err!(ParserError(format!(
-                        "WITH query name {cte_name:?} specified more than once"
-                    )));
-                }
-                // create logical plan & pass backreferencing CTEs
-                // CTE expr don't need extend outer_query_schema
-                let logical_plan =
-                    self.query_to_plan(*cte.query, &mut planner_context.clone())?;
-
-                // Each `WITH` block can change the column names in the last
-                // projection (e.g. "WITH table(t1, t2) AS SELECT 1, 2").
-                let logical_plan = self.apply_table_alias(logical_plan, cte.alias)?;
-
-                planner_context.insert_cte(cte_name, logical_plan);
+            other => {
+                let plan = self.set_expr_to_plan(other, planner_context)?;
+                let oby_exprs = to_order_by_exprs(query.order_by)?;
+                let order_by_rex = self.order_by_to_sort_expr(
+                    oby_exprs,
+                    plan.schema(),
+                    planner_context,
+                    true,
+                    None,
+                )?;
+                let plan = self.order_by(plan, order_by_rex)?;
+                self.limit(plan, query.offset, query.limit)
             }
         }
-        let plan = self.set_expr_to_plan(*(set_expr.clone()), planner_context)?;
-
-        let plan = self.order_by(plan, query.order_by, planner_context)?;
-        let plan = self.limit(plan, query.offset, query.limit)?;
-
-        let plan = match *set_expr {
-            SetExpr::Select(select) if select.into.is_some() => {
-                let select_into = select.into.unwrap();
-                LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
-                    name: self.object_name_to_table_reference(select_into.name)?,
-                    constraints: Constraints::empty(),
-                    input: Arc::new(plan),
-                    if_not_exists: false,
-                    or_replace: false,
-                }))
-            }
-            _ => plan,
-        };
-
-        Ok(plan)
     }
 
     /// Wrap a plan in a limit
@@ -113,37 +86,29 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
 
         let skip = match skip {
-            Some(skip_expr) => match self.sql_to_expr(
-                skip_expr.value,
-                input.schema(),
-                &mut PlannerContext::new(),
-            )? {
-                Expr::Literal(ScalarValue::Int64(Some(s))) => {
-                    if s < 0 {
-                        return plan_err!("Offset must be >= 0, '{s}' was provided.");
-                    }
-                    Ok(s as usize)
-                }
-                _ => plan_err!("Unexpected expression in OFFSET clause"),
-            }?,
-            _ => 0,
-        };
+            Some(skip_expr) => {
+                let expr = self.sql_to_expr(
+                    skip_expr.value,
+                    input.schema(),
+                    &mut PlannerContext::new(),
+                )?;
+                let n = get_constant_result(&expr, "OFFSET")?;
+                convert_usize_with_check(n, "OFFSET")
+            }
+            _ => Ok(0),
+        }?;
 
         let fetch = match fetch {
             Some(limit_expr)
                 if limit_expr != sqlparser::ast::Expr::Value(Value::Null) =>
             {
-                let n = match self.sql_to_expr(
+                let expr = self.sql_to_expr(
                     limit_expr,
                     input.schema(),
                     &mut PlannerContext::new(),
-                )? {
-                    Expr::Literal(ScalarValue::Int64(Some(n))) if n >= 0 => {
-                        Ok(n as usize)
-                    }
-                    _ => plan_err!("LIMIT must not be negative"),
-                }?;
-                Some(n)
+                )?;
+                let n = get_constant_result(&expr, "LIMIT")?;
+                Some(convert_usize_with_check(n, "LIMIT")?)
             }
             _ => None,
         };
@@ -152,101 +117,99 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Wrap the logical in a sort
-    fn order_by(
+    pub(super) fn order_by(
         &self,
         plan: LogicalPlan,
-        order_by: Vec<OrderByExpr>,
-        planner_context: &mut PlannerContext,
+        order_by: Vec<Sort>,
     ) -> Result<LogicalPlan> {
         if order_by.is_empty() {
             return Ok(plan);
         }
 
-        // Handle DISTINCT ON situation- this is the only situation in which we want to logically
-        // do our ordering before the DISTINCT, as the DISTINCT row that is chosen will be decided
-        // by said ordering- if we did the DISTINCT first, the order wouldn't matter
-        // So, we check if our last logical plans are Projection and Distinct, which means we had a
-        // DISTINCT ON situation (todo: this is a bit hacky, not sure how else to do it)
-        // If so, we move the sort before the distinct
-        if let LogicalPlan::Projection(mut p) = plan.clone() {
-            if let LogicalPlan::Distinct(mut d) = (*p.input).clone() {
-                if let Some(on_expr) = d.on_expr.clone() {
-                    let parent_plan = d.input;
-
-                    let order_by_expressions = self.order_by_to_sort_expr(
-                        &order_by,
-                        parent_plan.schema(),
-                        planner_context,
-                    )?;
-
-                    let alias_map = match (*parent_plan).clone() {
-                        LogicalPlan::Projection(p) => extract_aliases(p.expr.as_slice()),
-                        _ => unreachable!(),
-                    };
-
-                    let on_expr = on_expr
-                        .into_iter()
-                        .map(|e| {
-                            normalize_col(
-                                resolve_aliases_to_exprs(&e, &alias_map)?,
-                                &parent_plan,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut order_by_expressions = order_by_expressions
-                        .into_iter()
-                        .map(|e| {
-                            normalize_col(
-                                resolve_aliases_to_exprs(&e, &alias_map)?,
-                                &parent_plan,
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    // First, we need to ensure the ORDER BY expressions start with our ON expression
-                    // This is because the ON expression is used to determine the distinct key
-                    let on_expr_length = on_expr.len();
-                    for (i, expr) in on_expr.into_iter().enumerate() {
-                        let order_exp = order_by_expressions.get(i);
-                        match order_exp {
-                            None => {}
-                            Some(o) => match o {
-                                Expr::Sort(sort_expr) => {
-                                    if *sort_expr.expr != expr {
-                                        return Err(DataFusionError::Plan(format!(
-                                            "ORDER BY expression must start with ON expression for DISTINCT ON"
-                                        )));
-                                    }
-                                }
-                                _ => {
-                                    return Err(DataFusionError::Internal(format!(
-                                        "Unexpected expression in ORDER BY clause"
-                                    )));
-                                }
-                            },
-                        }
-                    }
-
-                    order_by_expressions = order_by_expressions
-                        .into_iter()
-                        .skip(on_expr_length)
-                        .collect();
-
-                    // Next, We need to move the sort BEFORE the distinct
-                    let sort_plan = LogicalPlanBuilder::from((*parent_plan).clone())
-                        .sort(order_by_expressions.clone())?
-                        .build()?;
-                    d.input = Arc::new(sort_plan);
-                    p.input = Arc::new(LogicalPlan::Distinct(d.clone()));
-                    return Ok(LogicalPlan::Projection(p));
-                }
-            }
+        if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
+            // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
+            // optimization we're effectively doing a `first_value` aggregation according to them.
+            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
+            Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
+        } else {
+            LogicalPlanBuilder::from(plan).sort(order_by)?.build()
         }
-
-        let order_by_expressions =
-            self.order_by_to_sort_expr(&order_by, plan.schema(), planner_context)?;
-        LogicalPlanBuilder::from(plan)
-            .sort(order_by_expressions)?
-            .build()
     }
+
+    /// Wrap the logical plan in a `SelectInto`
+    fn select_into(
+        &self,
+        plan: LogicalPlan,
+        select_into: Option<SelectInto>,
+    ) -> Result<LogicalPlan> {
+        match select_into {
+            Some(into) => Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+                CreateMemoryTable {
+                    name: self.object_name_to_table_reference(into.name)?,
+                    constraints: Constraints::empty(),
+                    input: Arc::new(plan),
+                    if_not_exists: false,
+                    or_replace: false,
+                    column_defaults: vec![],
+                },
+            ))),
+            _ => Ok(plan),
+        }
+    }
+}
+
+/// Retrieves the constant result of an expression, evaluating it if possible.
+///
+/// This function takes an expression and an argument name as input and returns
+/// a `Result<i64>` indicating either the constant result of the expression or an
+/// error if the expression cannot be evaluated.
+///
+/// # Arguments
+///
+/// * `expr` - An `Expr` representing the expression to evaluate.
+/// * `arg_name` - The name of the argument for error messages.
+///
+/// # Returns
+///
+/// * `Result<i64>` - An `Ok` variant containing the constant result if evaluation is successful,
+///   or an `Err` variant containing an error message if evaluation fails.
+///
+/// <https://github.com/apache/datafusion/issues/9821> tracks a more general solution
+fn get_constant_result(expr: &Expr, arg_name: &str) -> Result<i64> {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(s))) => Ok(*s),
+        Expr::BinaryExpr(binary_expr) => {
+            let lhs = get_constant_result(&binary_expr.left, arg_name)?;
+            let rhs = get_constant_result(&binary_expr.right, arg_name)?;
+            let res = match binary_expr.op {
+                Operator::Plus => lhs + rhs,
+                Operator::Minus => lhs - rhs,
+                Operator::Multiply => lhs * rhs,
+                _ => return plan_err!("Unsupported operator for {arg_name} clause"),
+            };
+            Ok(res)
+        }
+        _ => plan_err!("Unexpected expression in {arg_name} clause"),
+    }
+}
+
+/// Converts an `i64` to `usize`, performing a boundary check.
+fn convert_usize_with_check(n: i64, arg_name: &str) -> Result<usize> {
+    if n < 0 {
+        plan_err!("{arg_name} must be >= 0, '{n}' was provided.")
+    } else {
+        Ok(n as usize)
+    }
+}
+
+/// Returns the order by expressions from the query.
+fn to_order_by_exprs(order_by: Option<OrderBy>) -> Result<Vec<OrderByExpr>> {
+    let Some(OrderBy { exprs, interpolate }) = order_by else {
+        // if no order by, return an empty array
+        return Ok(vec![]);
+    };
+    if let Some(_interpolate) = interpolate {
+        return not_impl_err!("ORDER BY INTERPOLATE is not supported");
+    }
+    Ok(exprs)
 }
