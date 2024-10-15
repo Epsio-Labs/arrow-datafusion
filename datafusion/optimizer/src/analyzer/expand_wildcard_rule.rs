@@ -26,7 +26,9 @@ use datafusion_expr::expr::PlannedReplaceSelectItem;
 use datafusion_expr::utils::{
     expand_qualified_wildcard, expand_wildcard, find_base_plan,
 };
-use datafusion_expr::{Expr, LogicalPlan, Projection, SubqueryAlias};
+use datafusion_expr::{
+    Distinct, DistinctOn, Expr, LogicalPlan, Projection, SubqueryAlias,
+};
 
 #[derive(Default)]
 pub struct ExpandWildcardRule {}
@@ -59,11 +61,24 @@ fn expand_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                     .map(LogicalPlan::Projection)?,
             ))
         }
-        // Teh schema of the plan should also be updated if the child plan is transformed.
+        // The schema of the plan should also be updated if the child plan is transformed.
         LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
             Ok(Transformed::yes(
                 SubqueryAlias::try_new(input, alias).map(LogicalPlan::SubqueryAlias)?,
             ))
+        }
+        LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
+            let projected_expr =
+                expand_exprlist(&distinct_on.input, distinct_on.select_expr)?;
+            validate_unique_names("Distinct", projected_expr.iter())?;
+            Ok(Transformed::yes(LogicalPlan::Distinct(Distinct::On(
+                DistinctOn::try_new(
+                    distinct_on.on_expr,
+                    projected_expr,
+                    distinct_on.sort_expr,
+                    distinct_on.input,
+                )?,
+            ))))
         }
         _ => Ok(Transformed::no(plan)),
     }
