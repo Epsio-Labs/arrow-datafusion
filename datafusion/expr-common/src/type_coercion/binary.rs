@@ -83,7 +83,7 @@ fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature>
                 )
             })
         }
-        And | Or => if matches!((lhs, rhs), (Boolean | Null, Boolean | Null)) {
+        And | Or => if matches!((lhs, rhs), (Boolean | Null | Int64, Boolean | Null | Int64)) {
             // Logical binary boolean operators can only be evaluated for
             // boolean or null arguments.
             Ok(Signature::uniform(DataType::Boolean))

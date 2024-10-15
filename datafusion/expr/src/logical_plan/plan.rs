@@ -17,11 +17,6 @@
 
 //! Logical plan types
 
-use std::collections::{HashMap, HashSet};
-use std::fmt::{self, Debug, Display, Formatter};
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-
 use super::dml::CopyTo;
 use super::DdlStatement;
 use crate::builder::{change_redundant_column, unnest_with_options};
@@ -38,10 +33,15 @@ use crate::utils::{
     split_conjunction,
 };
 use crate::{
-    build_join_schema, expr_vec_fmt, BinaryExpr, CreateMemoryTable, CreateView, Expr,
-    ExprSchemable, LogicalPlanBuilder, Operator, TableProviderFilterPushDown,
+    build_join_schema, expr_vec_fmt, BinaryExpr, Cast, CreateMemoryTable, CreateView,
+    Expr, ExprSchemable, LogicalPlanBuilder, Operator, TableProviderFilterPushDown,
     TableSource, WindowFunctionDefinition,
 };
+use arrow::compute::can_cast_types;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -2219,7 +2219,7 @@ impl Filter {
     }
 
     fn try_new_internal(
-        predicate: Expr,
+        mut predicate: Expr,
         input: Arc<LogicalPlan>,
         having: bool,
     ) -> Result<Self> {
@@ -2229,9 +2229,16 @@ impl Filter {
         // ignore errors resolving the expression against the schema.
         if let Ok(predicate_type) = predicate.get_type(input.schema()) {
             if !Filter::is_allowed_filter_type(&predicate_type) {
-                return plan_err!(
-                    "Cannot create filter with non-boolean predicate '{predicate}' returning {predicate_type}"
-                );
+                if can_cast_types(&predicate_type, &DataType::Boolean) {
+                    predicate = Expr::Cast(Cast {
+                        expr: Box::new(predicate),
+                        data_type: DataType::Boolean,
+                    });
+                } else {
+                    return plan_err!(
+                        "Cannot create filter with non-boolean predicate '{predicate}' returning {predicate_type}"
+                    );
+                }
             }
         }
 
