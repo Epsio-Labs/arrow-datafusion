@@ -699,12 +699,14 @@ async fn roundtrip_logical_plan_distinct_on() -> Result<()> {
     )
     .await?;
 
-    let query = "SELECT DISTINCT ON (a % 2) a, b * 2 FROM t1 ORDER BY a % 2 DESC, b";
-    let plan = ctx.sql(query).await?.into_optimized_plan()?;
+    for query in ["SELECT DISTINCT ON (a % 2) a, b * 2 FROM t1 ORDER BY a % 2 DESC, b",
+                  "SELECT DISTINCT ON (a % 2) * FROM t1 ORDER BY a % 2 DESC, b"] {
+        let plan = ctx.sql(query).await?.into_optimized_plan()?;
 
-    let bytes = logical_plan_to_bytes(&plan)?;
-    let logical_round_trip = logical_plan_from_bytes(&bytes, &ctx)?;
-    assert_eq!(format!("{plan}"), format!("{logical_round_trip}"));
+        let bytes = logical_plan_to_bytes(&plan)?;
+        let logical_round_trip = logical_plan_from_bytes(&bytes, &ctx)?;
+        assert_eq!(format!("{plan}"), format!("{logical_round_trip}"));
+    }
 
     Ok(())
 }
