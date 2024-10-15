@@ -85,6 +85,13 @@ impl IdentNormalizer {
             ident.value
         }
     }
+
+    /// This is a temporary fix for MySQL
+    /// In MySQL table names should not be normalized but column names should
+    /// TODO add a configuration field for this
+    pub fn normalize_column(&self, ident: Ident) -> String {
+        crate::utils::normalize_ident(ident)
+    }
 }
 
 /// Value Normalizer
@@ -271,7 +278,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 .iter()
                 .any(|x| x.option == ColumnOption::NotNull);
             fields.push(Field::new(
-                self.ident_normalizer.normalize(column.name),
+                self.ident_normalizer.normalize_column(column.name),
                 data_type,
                 !not_nullable,
             ));
@@ -350,7 +357,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             let fields = plan.schema().fields().clone();
             LogicalPlanBuilder::from(plan)
                 .project(fields.iter().zip(idents.into_iter()).map(|(field, ident)| {
-                    col(field.name()).alias(self.ident_normalizer.normalize(ident))
+                    col(field.name()).alias(self.ident_normalizer.normalize_column(ident))
                 }))?
                 .build()
         }

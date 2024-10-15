@@ -353,7 +353,10 @@ impl DFSchema {
                 // field to lookup is qualified.
                 // current field is qualified and not shared between relations, compare both
                 // qualifier and name.
-                (Some(q), Some(field_q)) => q.resolved_eq(field_q) && f.name() == name,
+                (Some(q), Some(field_q)) => {
+                    q.resolved_eq(field_q)
+                        && f.name().to_lowercase() == name.to_lowercase()
+                }
                 // field to lookup is qualified but current field is unqualified.
                 (Some(qq), None) => {
                     // the original field may now be aliased with a name that matches the
@@ -363,12 +366,16 @@ impl DFSchema {
                         Column {
                             relation: Some(r),
                             name: column_name,
-                        } => &r == qq && column_name == name,
+                        } => {
+                            &r == qq && column_name.to_lowercase() == name.to_lowercase()
+                        }
                         _ => false,
                     }
                 }
                 // field to lookup is unqualified, no need to compare qualifier
-                (None, Some(_)) | (None, None) => f.name() == name,
+                (None, Some(_)) | (None, None) => {
+                    f.name().to_lowercase() == name.to_lowercase()
+                }
             })
             .map(|(idx, _)| idx);
         matches.next()
@@ -451,7 +458,7 @@ impl DFSchema {
     pub fn fields_with_unqualified_name(&self, name: &str) -> Vec<&Field> {
         self.fields()
             .iter()
-            .filter(|field| field.name() == name)
+            .filter(|field| field.name().to_lowercase() == name.to_lowercase())
             .map(|f| f.as_ref())
             .collect()
     }
@@ -462,7 +469,7 @@ impl DFSchema {
         name: &str,
     ) -> Vec<(Option<&TableReference>, &Field)> {
         self.iter()
-            .filter(|(_, field)| field.name() == name)
+            .filter(|(_, field)| field.name().to_lowercase() == name.to_lowercase())
             .map(|(qualifier, field)| (qualifier, field.as_ref()))
             .collect()
     }
@@ -470,7 +477,7 @@ impl DFSchema {
     /// Find all fields that match the given name and convert to column
     pub fn columns_with_unqualified_name(&self, name: &str) -> Vec<Column> {
         self.iter()
-            .filter(|(_, field)| field.name() == name)
+            .filter(|(_, field)| field.name().to_lowercase() == name.to_lowercase())
             .map(|(qualifier, field)| Column::new(qualifier.cloned(), field.name()))
             .collect()
     }
@@ -556,7 +563,9 @@ impl DFSchema {
 
     /// Find if the field exists with the given name
     pub fn has_column_with_unqualified_name(&self, name: &str) -> bool {
-        self.fields().iter().any(|field| field.name() == name)
+        self.fields()
+            .iter()
+            .any(|field| field.name().to_lowercase() == name.to_lowercase())
     }
 
     /// Find if the field exists with the given qualified name
@@ -565,8 +574,10 @@ impl DFSchema {
         qualifier: &TableReference,
         name: &str,
     ) -> bool {
-        self.iter()
-            .any(|(q, f)| q.map(|q| q.eq(qualifier)).unwrap_or(false) && f.name() == name)
+        self.iter().any(|(q, f)| {
+            q.map(|q| q.eq(qualifier)).unwrap_or(false)
+                && f.name().to_lowercase() == name.to_lowercase()
+        })
     }
 
     /// Find if the field exists with the given qualified column
@@ -583,7 +594,9 @@ impl DFSchema {
             .fields
             .iter()
             .zip(arrow_schema.fields().iter())
-            .all(|(dffield, arrowfield)| dffield.name() == arrowfield.name())
+            .all(|(dffield, arrowfield)| {
+                dffield.name().to_lowercase() == arrowfield.name().to_lowercase()
+            })
     }
 
     /// Check to see if fields in 2 Arrow schemas are compatible
@@ -622,7 +635,7 @@ impl DFSchema {
         let other_fields = other.iter();
         self_fields.zip(other_fields).all(|((q1, f1), (q2, f2))| {
             q1 == q2
-                && f1.name() == f2.name()
+                && f1.name().to_lowercase() == f2.name().to_lowercase()
                 && Self::datatype_is_logically_equal(f1.data_type(), f2.data_type())
         })
     }
@@ -644,7 +657,7 @@ impl DFSchema {
         let other_fields = other.iter();
         self_fields.zip(other_fields).all(|((q1, f1), (q2, f2))| {
             q1 == q2
-                && f1.name() == f2.name()
+                && f1.name().to_lowercase() == f2.name().to_lowercase()
                 && Self::datatype_is_semantically_equal(f1.data_type(), f2.data_type())
         })
     }
@@ -737,12 +750,12 @@ impl DFSchema {
     }
 
     fn field_is_logically_equal(f1: &Field, f2: &Field) -> bool {
-        f1.name() == f2.name()
+        f1.name().to_lowercase() == f2.name().to_lowercase()
             && Self::datatype_is_logically_equal(f1.data_type(), f2.data_type())
     }
 
     fn field_is_semantically_equal(f1: &Field, f2: &Field) -> bool {
-        f1.name() == f2.name()
+        f1.name().to_lowercase() == f2.name().to_lowercase()
             && Self::datatype_is_semantically_equal(f1.data_type(), f2.data_type())
     }
 
@@ -996,7 +1009,7 @@ impl SchemaExt for Schema {
             .iter()
             .zip(other.fields().iter())
             .all(|(f1, f2)| {
-                f1.name() == f2.name()
+                f1.name().to_lowercase() == f2.name().to_lowercase()
                     && DFSchema::datatype_is_semantically_equal(
                         f1.data_type(),
                         f2.data_type(),
@@ -1013,7 +1026,7 @@ impl SchemaExt for Schema {
             .iter()
             .zip(other.fields().iter())
             .all(|(f1, f2)| {
-                f1.name() == f2.name()
+                f1.name().to_lowercase() == f2.name().to_lowercase()
                     && DFSchema::datatype_is_logically_equal(
                         f1.data_type(),
                         f2.data_type(),
