@@ -149,6 +149,7 @@ impl ExprPlanner for FieldAccessPlanner {
             GetFieldAccess::ListIndex { key: index } => {
                 match expr {
                     // Special case for array_agg(expr)[index] to NTH_VALUE(expr, index)
+                    // TODO epsio test this
                     Expr::AggregateFunction(agg_func) if is_array_agg(&agg_func) => {
                         Ok(PlannerResult::Planned(Expr::AggregateFunction(
                             datafusion_expr::expr::AggregateFunction::new_udf(
