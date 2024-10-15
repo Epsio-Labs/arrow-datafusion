@@ -50,7 +50,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             // interpret names with '.' as if they were
             // compound identifiers, but this is not a compound
             // identifier. (e.g. it is "foo.bar" not foo.bar)
-            let normalize_ident = self.ident_normalizer.normalize(id);
+            // let normalize_ident = self.ident_normalizer.normalize(id);
+            let normalize_ident = id.value;
 
             // Check for qualified field with unqualified name
             if let Ok((qualifier, _)) =
@@ -70,7 +71,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     // Found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
                     return Ok(Expr::OuterReferenceColumn(
                         field.data_type().clone(),
-                        Column::from((qualifier, field)),
+                        Column::new(qualifier.cloned(), normalize_ident),
                     ));
                 }
             }
@@ -85,19 +86,20 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
 
     pub(super) fn sql_compound_identifier_to_expr(
         &self,
-        ids: Vec<Ident>,
+        mut ids: Vec<Ident>,
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
         if ids.len() < 2 {
             return internal_err!("Not a compound identifier: {ids:?}");
         }
-
+        let col_name = ids.pop().unwrap();
         if ids[0].value.starts_with('@') {
-            let var_names: Vec<_> = ids
+            let mut var_names: Vec<_> = ids
                 .into_iter()
                 .map(|id| self.ident_normalizer.normalize(id))
                 .collect();
+            var_names.push(self.ident_normalizer.normalize_column(col_name));
             let ty = self
                 .context_provider
                 .get_variable_type(&var_names)
@@ -108,10 +110,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 })?;
             Ok(Expr::ScalarVariable(ty, var_names))
         } else {
-            let ids = ids
+            let mut ids = ids
                 .into_iter()
                 .map(|id| self.ident_normalizer.normalize(id))
                 .collect::<Vec<_>>();
+            ids.push(col_name.value.clone());
 
             // Currently not supporting more than one nested level
             // Though ideally once that support is in place, this code should work with it
@@ -142,9 +145,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     )
                 }
                 // found matching field with no spare identifier(s)
-                Some((field, qualifier, _nested_names)) => {
-                    Ok(Expr::Column(Column::from((qualifier, field))))
-                }
+                Some((field, qualifier, _nested_names)) => Ok(Expr::Column(Column::new(
+                    qualifier.cloned(),
+                    col_name.value,
+                ))),
                 None => {
                     // return default where use all identifiers to not have a nested field
                     // this len check is because at 5 identifiers will have to have a nested field
@@ -170,7 +174,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                                     // found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
                                     Ok(Expr::OuterReferenceColumn(
                                         field.data_type().clone(),
-                                        Column::from((qualifier, field)),
+                                        Column::new(qualifier.cloned(), col_name.value),
                                     ))
                                 }
                                 // found no matching field, will return a default

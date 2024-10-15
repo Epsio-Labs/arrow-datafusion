@@ -1427,7 +1427,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             let mut value_indices = vec![None; table_schema.fields().len()];
             let fields = columns
                 .into_iter()
-                .map(|c| self.ident_normalizer.normalize(c))
+                .map(|c| self.ident_normalizer.normalize_column(c))
                 .enumerate()
                 .map(|(i, c)| {
                     let column_index = table_schema

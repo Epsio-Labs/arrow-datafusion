@@ -689,8 +689,6 @@ pub fn operator_to_name(op: Operator) -> &'static str {
         Operator::BitwiseXor => "bitwise_xor",
         Operator::BitwiseShiftRight => "bitwise_shift_right",
         Operator::BitwiseShiftLeft => "bitwise_shift_left",
-        Operator::ArrowAccess => "arrow_access",
-        Operator::LongArrow => "long_arrow",
     }
 }
 

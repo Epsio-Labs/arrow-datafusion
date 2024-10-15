@@ -157,9 +157,6 @@ impl Column {
 
     /// Qualify column if not done yet.
     ///
-    /// If this column already has a [relation](Self::relation), it will be returned as is and the given parameters are
-    /// ignored. Otherwise this will search through the given schemas to find the column.
-    ///
     /// Will check for ambiguity at each level of `schemas`.
     ///
     /// A schema matches if there is a single column that -- when unqualified -- matches this column. There is an
@@ -196,10 +193,6 @@ impl Column {
         schemas: &[&[&DFSchema]],
         using_columns: &[HashSet<Column>],
     ) -> Result<Self> {
-        if self.relation.is_some() {
-            return Ok(self);
-        }
-
         for schema_level in schemas {
             let qualified_fields = schema_level
                 .iter()
@@ -241,6 +234,13 @@ impl Column {
                     });
                 }
             }
+        }
+
+        // TODO: This absolutely needs to be refactored. If we don't find a match, we should return an error.
+        // The only reason this is here is because this is how it behaved previously and we
+        // don't want to raise errors
+        if self.relation.is_some() {
+            return Ok(self);
         }
 
         _schema_err!(SchemaError::FieldNotFound {
