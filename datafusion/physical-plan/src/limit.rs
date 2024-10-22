@@ -22,23 +22,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::{
-    DisplayFormatType, Distribution, EquivalenceProperties, ExecutionPlan, Partitioning,
-};
-
-use super::expressions::PhysicalSortExpr;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use super::{DisplayAs, RecordBatchStream, SendableRecordBatchStream, Statistics};
+use super::{
+    DisplayAs, ExecutionMode, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
+    SendableRecordBatchStream, Statistics,
+};
+use crate::{DisplayFormatType, Distribution, ExecutionPlan, Partitioning};
 
-use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
-use datafusion_common::{internal_err, DataFusionError, Result};
+use arrow::record_batch::RecordBatch;
+use datafusion_common::{internal_err, Result};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::OrderingEquivalenceProperties;
 
-use futures::stream::Stream;
-use futures::stream::StreamExt;
+use futures::stream::{Stream, StreamExt};
 use log::trace;
 
 /// Limit execution plan
@@ -53,16 +49,19 @@ pub struct GlobalLimitExec {
     fetch: Option<usize>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    cache: PlanProperties,
 }
 
 impl GlobalLimitExec {
     /// Create a new GlobalLimitExec
     pub fn new(input: Arc<dyn ExecutionPlan>, skip: usize, fetch: Option<usize>) -> Self {
+        let cache = Self::compute_properties(&input);
         GlobalLimitExec {
             input,
             skip,
             fetch,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
     }
 
@@ -79,6 +78,15 @@ impl GlobalLimitExec {
     /// Maximum number of rows to fetch
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        PlanProperties::new(
+            input.equivalence_properties().clone(), // Equivalence Properties
+            Partitioning::UnknownPartitioning(1),   // Output Partitioning
+            ExecutionMode::Bounded,                 // Execution Mode
+        )
     }
 }
 
@@ -102,25 +110,25 @@ impl DisplayAs for GlobalLimitExec {
 }
 
 impl ExecutionPlan for GlobalLimitExec {
+    fn name(&self) -> &'static str {
+        "GlobalLimitExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.input.schema()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
-    }
-    /// Get the output partitioning of this plan
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -131,24 +139,12 @@ impl ExecutionPlan for GlobalLimitExec {
         vec![false]
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input.equivalence_properties()
-    }
-
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        self.input.ordering_equivalence_properties()
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(GlobalLimitExec::new(
-            children[0].clone(),
+            Arc::clone(&children[0]),
             self.skip,
             self.fetch,
         )))
@@ -187,51 +183,22 @@ impl ExecutionPlan for GlobalLimitExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        let input_stats = self.input.statistics();
-        let skip = self.skip;
-        // the maximum row number needs to be fetched
-        let max_row_num = self
-            .fetch
-            .map(|fetch| {
-                if fetch >= usize::MAX - skip {
-                    usize::MAX
-                } else {
-                    fetch + skip
-                }
-            })
-            .unwrap_or(usize::MAX);
-        match input_stats {
-            Statistics {
-                num_rows: Some(nr), ..
-            } => {
-                if nr <= skip {
-                    // if all input data will be skipped, return 0
-                    Statistics {
-                        num_rows: Some(0),
-                        is_exact: input_stats.is_exact,
-                        ..Default::default()
-                    }
-                } else if nr <= max_row_num {
-                    // if the input does not reach the "fetch" globally, return input stats
-                    input_stats
-                } else {
-                    // if the input is greater than the "fetch", the num_row will be the "fetch",
-                    // but we won't be able to predict the other statistics
-                    Statistics {
-                        num_rows: Some(max_row_num),
-                        is_exact: input_stats.is_exact,
-                        ..Default::default()
-                    }
-                }
-            }
-            _ => Statistics {
-                // the result output row number will always be no greater than the limit number
-                num_rows: Some(max_row_num),
-                is_exact: false,
-                ..Default::default()
-            },
-        }
+    fn statistics(&self) -> Result<Statistics> {
+        Statistics::with_fetch(
+            self.input.statistics()?,
+            self.schema(),
+            self.fetch,
+            self.skip,
+            1,
+        )
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
     }
 }
 
@@ -244,15 +211,18 @@ pub struct LocalLimitExec {
     fetch: usize,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
+    cache: PlanProperties,
 }
 
 impl LocalLimitExec {
     /// Create a new LocalLimitExec partition
     pub fn new(input: Arc<dyn ExecutionPlan>, fetch: usize) -> Self {
+        let cache = Self::compute_properties(&input);
         Self {
             input,
             fetch,
             metrics: ExecutionPlanMetricsSet::new(),
+            cache,
         }
     }
 
@@ -264,6 +234,15 @@ impl LocalLimitExec {
     /// Maximum number of rows to fetch
     pub fn fetch(&self) -> usize {
         self.fetch
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(input: &Arc<dyn ExecutionPlan>) -> PlanProperties {
+        PlanProperties::new(
+            input.equivalence_properties().clone(), // Equivalence Properties
+            input.output_partitioning().clone(),    // Output Partitioning
+            ExecutionMode::Bounded,                 // Execution Mode
+        )
     }
 }
 
@@ -282,42 +261,29 @@ impl DisplayAs for LocalLimitExec {
 }
 
 impl ExecutionPlan for LocalLimitExec {
+    fn name(&self) -> &'static str {
+        "LocalLimitExec"
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.input.schema()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
         vec![false]
     }
 
-    // Local limit will not change the input plan's ordering
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
-    }
-
-    fn equivalence_properties(&self) -> EquivalenceProperties {
-        self.input.equivalence_properties()
-    }
-
-    fn ordering_equivalence_properties(&self) -> OrderingEquivalenceProperties {
-        self.input.ordering_equivalence_properties()
     }
 
     fn with_new_children(
@@ -326,7 +292,7 @@ impl ExecutionPlan for LocalLimitExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match children.len() {
             1 => Ok(Arc::new(LocalLimitExec::new(
-                children[0].clone(),
+                Arc::clone(&children[0]),
                 self.fetch,
             ))),
             _ => internal_err!("LocalLimitExec wrong number of children"),
@@ -353,37 +319,27 @@ impl ExecutionPlan for LocalLimitExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> Statistics {
-        let input_stats = self.input.statistics();
-        match input_stats {
-            // if the input does not reach the limit globally, return input stats
-            Statistics {
-                num_rows: Some(nr), ..
-            } if nr <= self.fetch => input_stats,
-            // if the input is greater than the limit, the num_row will be greater
-            // than the limit because the partitions will be limited separatly
-            // the statistic
-            Statistics {
-                num_rows: Some(nr), ..
-            } if nr > self.fetch => Statistics {
-                num_rows: Some(self.fetch),
-                // this is not actually exact, but will be when GlobalLimit is applied
-                // TODO stats: find a more explicit way to vehiculate this information
-                is_exact: input_stats.is_exact,
-                ..Default::default()
-            },
-            _ => Statistics {
-                // the result output row number will always be no greater than the limit number
-                num_rows: Some(self.fetch * self.output_partitioning().partition_count()),
-                is_exact: false,
-                ..Default::default()
-            },
-        }
+    fn statistics(&self) -> Result<Statistics> {
+        Statistics::with_fetch(
+            self.input.statistics()?,
+            self.schema(),
+            Some(self.fetch),
+            0,
+            1,
+        )
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        Some(self.fetch)
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
     }
 }
 
 /// A Limit stream skips `skip` rows, and then fetch up to `fetch` rows.
-struct LimitStream {
+pub struct LimitStream {
     /// The remaining number of rows to skip
     skip: usize,
     /// The remaining number of rows to produce
@@ -398,7 +354,7 @@ struct LimitStream {
 }
 
 impl LimitStream {
-    fn new(
+    pub fn new(
         input: SendableRecordBatchStream,
         skip: usize,
         fetch: Option<usize>,
@@ -434,7 +390,7 @@ impl LimitStream {
 
             match &poll {
                 Poll::Ready(Some(Ok(batch))) => {
-                    if batch.num_rows() > 0 && self.skip == 0 {
+                    if batch.num_rows() > 0 {
                         break poll;
                     } else {
                         // continue to poll input stream
@@ -458,26 +414,15 @@ impl LimitStream {
             //
             self.fetch -= batch.num_rows();
             Some(batch)
-        } else {
+        } else if batch.num_rows() >= self.fetch {
             let batch_rows = self.fetch;
             self.fetch = 0;
             self.input = None; // clear input so it can be dropped early
 
-            let limited_columns: Vec<ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|col| col.slice(0, col.len().min(batch_rows)))
-                .collect();
-            let options =
-                RecordBatchOptions::new().with_row_count(Option::from(batch_rows));
-            Some(
-                RecordBatch::try_new_with_options(
-                    batch.schema(),
-                    limited_columns,
-                    &options,
-                )
-                .unwrap(),
-            )
+            // It is guaranteed that batch_rows is <= batch.num_rows
+            Some(batch.slice(0, batch_rows))
+        } else {
+            unreachable!()
         }
     }
 }
@@ -514,20 +459,23 @@ impl Stream for LimitStream {
 impl RecordBatchStream for LimitStream {
     /// Get the schema
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    use arrow_schema::Schema;
-    use common::collect;
-
     use super::*;
     use crate::coalesce_partitions::CoalescePartitionsExec;
-    use crate::common;
-    use crate::test;
+    use crate::common::collect;
+    use crate::{common, test};
+
+    use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use arrow_array::RecordBatchOptions;
+    use arrow_schema::Schema;
+    use datafusion_common::stats::Precision;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::PhysicalExpr;
 
     #[tokio::test]
     async fn limit() -> Result<()> {
@@ -687,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_3_fetch_10() -> Result<()> {
+    async fn skip_3_fetch_10_stats() -> Result<()> {
         // there are total of 100 rows, we skipped 3 rows (offset = 3)
         let row_count = skip_and_fetch(3, Some(10)).await?;
         assert_eq!(row_count, 10);
@@ -720,10 +668,61 @@ mod tests {
     #[tokio::test]
     async fn test_row_number_statistics_for_global_limit() -> Result<()> {
         let row_count = row_number_statistics_for_global_limit(0, Some(10)).await?;
-        assert_eq!(row_count, Some(10));
+        assert_eq!(row_count, Precision::Exact(10));
 
         let row_count = row_number_statistics_for_global_limit(5, Some(10)).await?;
-        assert_eq!(row_count, Some(15));
+        assert_eq!(row_count, Precision::Exact(10));
+
+        let row_count = row_number_statistics_for_global_limit(400, Some(10)).await?;
+        assert_eq!(row_count, Precision::Exact(0));
+
+        let row_count = row_number_statistics_for_global_limit(398, Some(10)).await?;
+        assert_eq!(row_count, Precision::Exact(2));
+
+        let row_count = row_number_statistics_for_global_limit(398, Some(1)).await?;
+        assert_eq!(row_count, Precision::Exact(1));
+
+        let row_count = row_number_statistics_for_global_limit(398, None).await?;
+        assert_eq!(row_count, Precision::Exact(2));
+
+        let row_count =
+            row_number_statistics_for_global_limit(0, Some(usize::MAX)).await?;
+        assert_eq!(row_count, Precision::Exact(400));
+
+        let row_count =
+            row_number_statistics_for_global_limit(398, Some(usize::MAX)).await?;
+        assert_eq!(row_count, Precision::Exact(2));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(0, Some(10)).await?;
+        assert_eq!(row_count, Precision::Inexact(10));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(5, Some(10)).await?;
+        assert_eq!(row_count, Precision::Inexact(10));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(400, Some(10)).await?;
+        assert_eq!(row_count, Precision::Exact(0));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(398, Some(10)).await?;
+        assert_eq!(row_count, Precision::Inexact(2));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(398, Some(1)).await?;
+        assert_eq!(row_count, Precision::Inexact(1));
+
+        let row_count = row_number_inexact_statistics_for_global_limit(398, None).await?;
+        assert_eq!(row_count, Precision::Inexact(2));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(0, Some(usize::MAX)).await?;
+        assert_eq!(row_count, Precision::Inexact(400));
+
+        let row_count =
+            row_number_inexact_statistics_for_global_limit(398, Some(usize::MAX)).await?;
+        assert_eq!(row_count, Precision::Inexact(2));
 
         Ok(())
     }
@@ -731,7 +730,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_number_statistics_for_local_limit() -> Result<()> {
         let row_count = row_number_statistics_for_local_limit(4, 10).await?;
-        assert_eq!(row_count, Some(10));
+        assert_eq!(row_count, Precision::Exact(10));
 
         Ok(())
     }
@@ -739,7 +738,7 @@ mod tests {
     async fn row_number_statistics_for_global_limit(
         skip: usize,
         fetch: Option<usize>,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Precision<usize>> {
         let num_partitions = 4;
         let csv = test::scan_partitioned(num_partitions);
 
@@ -748,20 +747,60 @@ mod tests {
         let offset =
             GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(csv)), skip, fetch);
 
-        Ok(offset.statistics().num_rows)
+        Ok(offset.statistics()?.num_rows)
+    }
+
+    pub fn build_group_by(
+        input_schema: &SchemaRef,
+        columns: Vec<String>,
+    ) -> PhysicalGroupBy {
+        let mut group_by_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+        for column in columns.iter() {
+            group_by_expr.push((col(column, input_schema).unwrap(), column.to_string()));
+        }
+        PhysicalGroupBy::new_single(group_by_expr.clone())
+    }
+
+    async fn row_number_inexact_statistics_for_global_limit(
+        skip: usize,
+        fetch: Option<usize>,
+    ) -> Result<Precision<usize>> {
+        let num_partitions = 4;
+        let csv = test::scan_partitioned(num_partitions);
+
+        assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
+
+        // Adding a "GROUP BY i" changes the input stats from Exact to Inexact.
+        let agg = AggregateExec::try_new(
+            AggregateMode::Final,
+            build_group_by(&csv.schema(), vec!["i".to_string()]),
+            vec![],
+            vec![],
+            Arc::clone(&csv),
+            Arc::clone(&csv.schema()),
+        )?;
+        let agg_exec: Arc<dyn ExecutionPlan> = Arc::new(agg);
+
+        let offset = GlobalLimitExec::new(
+            Arc::new(CoalescePartitionsExec::new(agg_exec)),
+            skip,
+            fetch,
+        );
+
+        Ok(offset.statistics()?.num_rows)
     }
 
     async fn row_number_statistics_for_local_limit(
         num_partitions: usize,
         fetch: usize,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Precision<usize>> {
         let csv = test::scan_partitioned(num_partitions);
 
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
         let offset = LocalLimitExec::new(csv, fetch);
 
-        Ok(offset.statistics().num_rows)
+        Ok(offset.statistics()?.num_rows)
     }
 
     /// Return a RecordBatch with a single array with row_count sz

@@ -17,132 +17,52 @@
 
 //! Data source traits
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion_common::{not_impl_err, Constraints, DataFusionError, Statistics};
-use datafusion_expr::{CreateExternalTable, LogicalPlan};
+use datafusion_catalog::Session;
+use datafusion_expr::CreateExternalTable;
 pub use datafusion_expr::{TableProviderFilterPushDown, TableType};
 
-use crate::arrow::datatypes::SchemaRef;
+use crate::catalog::{TableProvider, TableProviderFactory};
+use crate::datasource::listing_table_factory::ListingTableFactory;
+use crate::datasource::stream::StreamTableFactory;
 use crate::error::Result;
-use crate::execution::context::SessionState;
-use crate::logical_expr::Expr;
-use crate::physical_plan::ExecutionPlan;
 
-/// Source table
-#[async_trait]
-pub trait TableProvider: Sync + Send {
-    /// Returns the table provider as [`Any`](std::any::Any) so that it can be
-    /// downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any;
+/// The default [`TableProviderFactory`]
+///
+/// If [`CreateExternalTable`] is unbounded calls [`StreamTableFactory::create`],
+/// otherwise calls [`ListingTableFactory::create`]
+#[derive(Debug, Default)]
+pub struct DefaultTableFactory {
+    stream: StreamTableFactory,
+    listing: ListingTableFactory,
+}
 
-    /// Get a reference to the schema for this table
-    fn schema(&self) -> SchemaRef;
-
-    /// Get a reference to the constraints of the table.
-    fn constraints(&self) -> Option<&Constraints> {
-        None
-    }
-
-    /// Get the type of this table for metadata/catalog purposes.
-    fn table_type(&self) -> TableType;
-
-    /// Get the create statement used to create this table, if available.
-    fn get_table_definition(&self) -> Option<&str> {
-        None
-    }
-
-    /// Get the Logical Plan of this table, if available.
-    fn get_logical_plan(&self) -> Option<&LogicalPlan> {
-        None
-    }
-
-    /// Create an ExecutionPlan that will scan the table.
-    /// The table provider will be usually responsible of grouping
-    /// the source data into partitions that can be efficiently
-    /// parallelized or distributed.
-    async fn scan(
-        &self,
-        state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        // limit can be used to reduce the amount scanned
-        // from the datasource as a performance optimization.
-        // If set, it contains the amount of rows needed by the `LogicalPlan`,
-        // The datasource should return *at least* this number of rows if available.
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
-
-    /// Tests whether the table provider can make use of a filter expression
-    /// to optimise data retrieval.
-    #[deprecated(since = "20.0.0", note = "use supports_filters_pushdown instead")]
-    fn supports_filter_pushdown(
-        &self,
-        _filter: &Expr,
-    ) -> Result<TableProviderFilterPushDown> {
-        Ok(TableProviderFilterPushDown::Unsupported)
-    }
-
-    /// Tests whether the table provider can make use of any or all filter expressions
-    /// to optimise data retrieval.
-    #[allow(deprecated)]
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        filters
-            .iter()
-            .map(|f| self.supports_filter_pushdown(f))
-            .collect()
-    }
-
-    /// Get statistics for this table, if available
-    fn statistics(&self) -> Option<Statistics> {
-        None
-    }
-
-    /// Return an [`ExecutionPlan`] to insert data into this table, if
-    /// supported.
-    ///
-    /// The returned plan should return a single row in a UInt64
-    /// column called "count" such as the following
-    ///
-    /// ```text
-    /// +-------+,
-    /// | count |,
-    /// +-------+,
-    /// | 6     |,
-    /// +-------+,
-    /// ```
-    ///
-    /// # See Also
-    ///
-    /// See [`FileSinkExec`] for the common pattern of inserting a
-    /// streams of `RecordBatch`es as files to an ObjectStore.
-    ///
-    /// [`FileSinkExec`]: crate::physical_plan::insert::FileSinkExec
-    async fn insert_into(
-        &self,
-        _state: &SessionState,
-        _input: Arc<dyn ExecutionPlan>,
-        _overwrite: bool,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("Insert into not implemented for this table")
+impl DefaultTableFactory {
+    /// Creates a new [`DefaultTableFactory`]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-/// A factory which creates [`TableProvider`]s at runtime given a URL.
-///
-/// For example, this can be used to create a table "on the fly"
-/// from a directory of files only when that name is referenced.
 #[async_trait]
-pub trait TableProviderFactory: Sync + Send {
-    /// Create a TableProvider with the given url
+impl TableProviderFactory for DefaultTableFactory {
     async fn create(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         cmd: &CreateExternalTable,
-    ) -> Result<Arc<dyn TableProvider>>;
+    ) -> Result<Arc<dyn TableProvider>> {
+        let mut unbounded = cmd.unbounded;
+        for (k, v) in &cmd.options {
+            if k.eq_ignore_ascii_case("unbounded") && v.eq_ignore_ascii_case("true") {
+                unbounded = true
+            }
+        }
+
+        match unbounded {
+            true => self.stream.create(state, cmd).await,
+            false => self.listing.create(state, cmd).await,
+        }
+    }
 }

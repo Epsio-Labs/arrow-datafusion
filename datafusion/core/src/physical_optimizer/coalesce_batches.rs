@@ -18,17 +18,19 @@
 //! CoalesceBatches optimizer that groups batches together rows
 //! in bigger batches to avoid overhead with small batches
 
-use crate::config::ConfigOptions;
+use std::sync::Arc;
+
 use crate::{
+    config::ConfigOptions,
     error::Result,
-    physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         coalesce_batches::CoalesceBatchesExec, filter::FilterExec, joins::HashJoinExec,
         repartition::RepartitionExec, Partitioning,
     },
 };
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use std::sync::Arc;
+
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_physical_optimizer::PhysicalOptimizerRule;
 
 /// Optimizer rule that introduces CoalesceBatchesExec to avoid overhead with small batches that
 /// are produced by highly selective filters
@@ -52,12 +54,12 @@ impl PhysicalOptimizerRule for CoalesceBatches {
         }
 
         let target_batch_size = config.execution.batch_size;
-        plan.transform_up(&|plan| {
+        plan.transform_up(|plan| {
             let plan_any = plan.as_any();
             // The goal here is to detect operators that could produce small batches and only
             // wrap those ones with a CoalesceBatchesExec operator. An alternate approach here
             // would be to build the coalescing logic directly into the operators
-            // See https://github.com/apache/arrow-datafusion/issues/139
+            // See https://github.com/apache/datafusion/issues/139
             let wrap_in_coalesce = plan_any.downcast_ref::<FilterExec>().is_some()
                 || plan_any.downcast_ref::<HashJoinExec>().is_some()
                 // Don't need to add CoalesceBatchesExec after a round robin RepartitionExec
@@ -71,14 +73,15 @@ impl PhysicalOptimizerRule for CoalesceBatches {
                     })
                     .unwrap_or(false);
             if wrap_in_coalesce {
-                Ok(Transformed::Yes(Arc::new(CoalesceBatchesExec::new(
+                Ok(Transformed::yes(Arc::new(CoalesceBatchesExec::new(
                     plan,
                     target_batch_size,
                 ))))
             } else {
-                Ok(Transformed::No(plan))
+                Ok(Transformed::no(plan))
             }
         })
+        .data()
     }
 
     fn name(&self) -> &str {

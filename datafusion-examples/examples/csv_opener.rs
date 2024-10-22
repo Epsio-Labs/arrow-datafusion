@@ -20,6 +20,7 @@ use std::{sync::Arc, vec};
 use datafusion::{
     assert_batches_eq,
     datasource::{
+        file_format::file_compression_type::FileCompressionType,
         listing::PartitionedFile,
         object_store::ObjectStoreUrl,
         physical_plan::{CsvConfig, CsvOpener, FileScanConfig, FileStream},
@@ -28,7 +29,7 @@ use datafusion::{
     physical_plan::metrics::ExecutionPlanMetricsSet,
     test_util::aggr_test_schema,
 };
-use datafusion_common::FileCompressionType;
+
 use futures::StreamExt;
 use object_store::local::LocalFileSystem;
 
@@ -46,7 +47,9 @@ async fn main() -> Result<()> {
         true,
         b',',
         b'"',
+        None,
         object_store,
+        Some(b'#'),
     );
 
     let opener = CsvOpener::new(Arc::new(config), FileCompressionType::UNCOMPRESSED);
@@ -56,17 +59,11 @@ async fn main() -> Result<()> {
 
     let path = std::path::Path::new(&path).canonicalize()?;
 
-    let scan_config = FileScanConfig {
-        object_store_url: ObjectStoreUrl::local_filesystem(),
-        file_schema: schema.clone(),
-        file_groups: vec![vec![PartitionedFile::new(path.display().to_string(), 10)]],
-        statistics: Default::default(),
-        projection: Some(vec![12, 0]),
-        limit: Some(5),
-        table_partition_cols: vec![],
-        output_ordering: vec![],
-        infinite_source: false,
-    };
+    let scan_config =
+        FileScanConfig::new(ObjectStoreUrl::local_filesystem(), schema.clone())
+            .with_projection(Some(vec![12, 0]))
+            .with_limit(Some(5))
+            .with_file(PartitionedFile::new(path.display().to_string(), 10));
 
     let result =
         FileStream::new(&scan_config, 0, opener, &ExecutionPlanMetricsSet::new())

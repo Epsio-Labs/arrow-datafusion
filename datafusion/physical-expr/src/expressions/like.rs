@@ -20,19 +20,11 @@ use std::{any::Any, sync::Arc};
 
 use crate::{physical_expr::down_cast_any_ref, PhysicalExpr};
 
-use arrow::compute::kernels::comparison::{
-    ilike_utf8, like_utf8, nilike_utf8, nlike_utf8,
-};
-use arrow::compute::kernels::comparison::{
-    ilike_utf8_scalar, like_utf8_scalar, nilike_utf8_scalar, nlike_utf8_scalar,
-};
-use arrow::{
-    array::{new_null_array, Array, ArrayRef, LargeStringArray, StringArray},
-    record_batch::RecordBatch,
-};
+use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Schema};
-use datafusion_common::{internal_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{internal_err, Result};
 use datafusion_expr::ColumnarValue;
+use datafusion_physical_expr_common::datum::apply_cmp;
 
 // Like expression
 #[derive(Debug, Hash)]
@@ -109,65 +101,19 @@ impl PhysicalExpr for LikeExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let expr_value = self.expr.evaluate(batch)?;
-        let pattern_value = self.pattern.evaluate(batch)?;
-        let expr_data_type = expr_value.data_type();
-        let pattern_data_type = pattern_value.data_type();
-
-        match (
-            &expr_value,
-            &expr_data_type,
-            &pattern_value,
-            &pattern_data_type,
-        ) {
-            // Types are equal => valid
-            (_, l, _, r) if l == r => {}
-            // Allow comparing a dictionary value with its corresponding scalar value
-            (
-                ColumnarValue::Array(_),
-                DataType::Dictionary(_, dict_t),
-                ColumnarValue::Scalar(_),
-                scalar_t,
-            )
-            | (
-                ColumnarValue::Scalar(_),
-                scalar_t,
-                ColumnarValue::Array(_),
-                DataType::Dictionary(_, dict_t),
-            ) if dict_t.as_ref() == scalar_t => {}
-            _ => {
-                return internal_err!(
-                    "Cannot evaluate {} expression with types {:?} and {:?}",
-                    self.op_name(),
-                    expr_data_type,
-                    pattern_data_type
-                );
-            }
+        use arrow::compute::*;
+        let lhs = self.expr.evaluate(batch)?;
+        let rhs = self.pattern.evaluate(batch)?;
+        match (self.negated, self.case_insensitive) {
+            (false, false) => apply_cmp(&lhs, &rhs, like),
+            (false, true) => apply_cmp(&lhs, &rhs, ilike),
+            (true, false) => apply_cmp(&lhs, &rhs, nlike),
+            (true, true) => apply_cmp(&lhs, &rhs, nilike),
         }
-
-        // Attempt to use special kernels if one input is scalar and the other is an array
-        let scalar_result = match (&expr_value, &pattern_value) {
-            (ColumnarValue::Array(array), ColumnarValue::Scalar(scalar)) => {
-                self.evaluate_array_scalar(array, scalar)?
-            }
-            (_, _) => None, // default to array implementation
-        };
-
-        if let Some(result) = scalar_result {
-            return result.map(|a| ColumnarValue::Array(a));
-        }
-
-        // if both arrays or both literals - extract arrays and continue execution
-        let (expr, pattern) = (
-            expr_value.into_array(batch.num_rows()),
-            pattern_value.into_array(batch.num_rows()),
-        );
-        self.evaluate_array_array(expr, pattern)
-            .map(|a| ColumnarValue::Array(a))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.expr.clone(), self.pattern.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr, &self.pattern]
     }
 
     fn with_new_children(
@@ -177,8 +123,8 @@ impl PhysicalExpr for LikeExpr {
         Ok(Arc::new(LikeExpr::new(
             self.negated,
             self.case_insensitive,
-            children[0].clone(),
-            children[1].clone(),
+            Arc::clone(&children[0]),
+            Arc::clone(&children[1]),
         )))
     }
 
@@ -202,68 +148,11 @@ impl PartialEq<dyn Any> for LikeExpr {
     }
 }
 
-macro_rules! binary_string_array_op_scalar {
-    ($LEFT:expr, $RIGHT:expr, $OP:ident, $OP_TYPE:expr) => {{
-        let result: Result<Arc<dyn Array>> = match $LEFT.data_type() {
-            DataType::Utf8 => compute_utf8_op_scalar!($LEFT, $RIGHT, $OP, StringArray, $OP_TYPE),
-            DataType::LargeUtf8 => compute_utf8_op_scalar!($LEFT, $RIGHT, $OP, LargeStringArray, $OP_TYPE),
-            other => internal_err!(
-                "Data type {:?} not supported for scalar operation '{}' on string array",
-                other, stringify!($OP)
-            ),
-        };
-        Some(result)
-    }};
-}
-
-impl LikeExpr {
-    /// Evaluate the expression if the input is an array and
-    /// pattern is literal - use scalar operations
-    fn evaluate_array_scalar(
-        &self,
-        array: &dyn Array,
-        scalar: &ScalarValue,
-    ) -> Result<Option<Result<ArrayRef>>> {
-        let scalar_result = match (self.negated, self.case_insensitive) {
-            (false, false) => binary_string_array_op_scalar!(
-                array,
-                scalar.clone(),
-                like,
-                &DataType::Boolean
-            ),
-            (true, false) => binary_string_array_op_scalar!(
-                array,
-                scalar.clone(),
-                nlike,
-                &DataType::Boolean
-            ),
-            (false, true) => binary_string_array_op_scalar!(
-                array,
-                scalar.clone(),
-                ilike,
-                &DataType::Boolean
-            ),
-            (true, true) => binary_string_array_op_scalar!(
-                array,
-                scalar.clone(),
-                nilike,
-                &DataType::Boolean
-            ),
-        };
-        Ok(scalar_result)
-    }
-
-    fn evaluate_array_array(
-        &self,
-        left: Arc<dyn Array>,
-        right: Arc<dyn Array>,
-    ) -> Result<ArrayRef> {
-        match (self.negated, self.case_insensitive) {
-            (false, false) => binary_string_array_op!(left, right, like),
-            (true, false) => binary_string_array_op!(left, right, nlike),
-            (false, true) => binary_string_array_op!(left, right, ilike),
-            (true, true) => binary_string_array_op!(left, right, nilike),
-        }
+/// used for optimize Dictionary like
+fn can_like_type(from_type: &DataType) -> bool {
+    match from_type {
+        DataType::Dictionary(_, inner_type_from) => **inner_type_from == DataType::Utf8,
+        _ => false,
     }
 }
 
@@ -277,7 +166,7 @@ pub fn like(
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = &expr.data_type(input_schema)?;
     let pattern_type = &pattern.data_type(input_schema)?;
-    if !expr_type.eq(pattern_type) {
+    if !expr_type.eq(pattern_type) && !can_like_type(expr_type) {
         return internal_err!(
             "The type of {expr_type} AND {pattern_type} of like physical should be same"
         );
@@ -294,7 +183,7 @@ pub fn like(
 mod test {
     use super::*;
     use crate::expressions::col;
-    use arrow::array::BooleanArray;
+    use arrow::array::*;
     use arrow_schema::Field;
     use datafusion_common::cast::as_boolean_array;
 
@@ -320,7 +209,10 @@ mod test {
             )?;
 
             // compute
-            let result = expression.evaluate(&batch)?.into_array(batch.num_rows());
+            let result = expression
+                .evaluate(&batch)?
+                .into_array(batch.num_rows())
+                .expect("Failed to convert to array");
             let result =
                 as_boolean_array(&result).expect("failed to downcast to BooleanArray");
             let expected = &BooleanArray::from($VEC);

@@ -18,44 +18,30 @@
 //! Factory for creating ListingTables with default options
 
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, SchemaRef};
-use async_trait::async_trait;
-use datafusion_common::file_options::{FileTypeWriterOptions, StatementOptions};
-use datafusion_common::DataFusionError;
-use datafusion_expr::CreateExternalTable;
-
-use crate::datasource::file_format::arrow::ArrowFormat;
-use crate::datasource::file_format::avro::AvroFormat;
-use crate::datasource::file_format::csv::CsvFormat;
-use crate::datasource::file_format::json::JsonFormat;
-use crate::datasource::file_format::parquet::ParquetFormat;
-use crate::datasource::file_format::FileFormat;
+use crate::catalog::{TableProvider, TableProviderFactory};
 use crate::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use crate::datasource::provider::TableProviderFactory;
-use crate::datasource::TableProvider;
 use crate::execution::context::SessionState;
-use datafusion_common::{FileCompressionType, FileType};
 
-use super::listing::ListingTableInsertMode;
+use arrow::datatypes::{DataType, SchemaRef};
+use datafusion_common::{arrow_datafusion_err, DataFusionError};
+use datafusion_common::{config_datafusion_err, Result};
+use datafusion_expr::CreateExternalTable;
+
+use async_trait::async_trait;
+use datafusion_catalog::Session;
 
 /// A `TableProviderFactory` capable of creating new `ListingTable`s
+#[derive(Debug, Default)]
 pub struct ListingTableFactory {}
 
 impl ListingTableFactory {
     /// Creates a new `ListingTableFactory`
     pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for ListingTableFactory {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -63,30 +49,20 @@ impl Default for ListingTableFactory {
 impl TableProviderFactory for ListingTableFactory {
     async fn create(
         &self,
-        state: &SessionState,
+        state: &dyn Session,
         cmd: &CreateExternalTable,
-    ) -> datafusion_common::Result<Arc<dyn TableProvider>> {
-        let file_compression_type = FileCompressionType::from(cmd.file_compression_type);
-        let file_type = FileType::from_str(cmd.file_type.as_str()).map_err(|_| {
-            DataFusionError::Execution(format!("Unknown FileType {}", cmd.file_type))
-        })?;
+    ) -> Result<Arc<dyn TableProvider>> {
+        // TODO (https://github.com/apache/datafusion/issues/11600) remove downcast_ref from here. Should file format factory be an extension to session state?
+        let session_state = state.as_any().downcast_ref::<SessionState>().unwrap();
+        let file_format = session_state
+            .get_file_format_factory(cmd.file_type.as_str())
+            .ok_or(config_datafusion_err!(
+                "Unable to create table with format {}! Could not find FileFormat.",
+                cmd.file_type
+            ))?
+            .create(session_state, &cmd.options)?;
 
         let file_extension = get_extension(cmd.location.as_str());
-
-        let file_format: Arc<dyn FileFormat> = match file_type {
-            FileType::CSV => Arc::new(
-                CsvFormat::default()
-                    .with_has_header(cmd.has_header)
-                    .with_delimiter(cmd.delimiter as u8)
-                    .with_file_compression_type(file_compression_type),
-            ),
-            FileType::PARQUET => Arc::new(ParquetFormat::default()),
-            FileType::AVRO => Arc::new(AvroFormat),
-            FileType::JSON => Arc::new(
-                JsonFormat::default().with_file_compression_type(file_compression_type),
-            ),
-            FileType::ARROW => Arc::new(ArrowFormat),
-        };
 
         let (provided_schema, table_partition_cols) = if cmd.schema.fields().is_empty() {
             (
@@ -112,7 +88,7 @@ impl TableProviderFactory for ListingTableFactory {
                 .map(|col| {
                     schema
                         .field_with_name(col)
-                        .map_err(DataFusionError::ArrowError)
+                        .map_err(|e| arrow_datafusion_err!(e))
                 })
                 .collect::<datafusion_common::Result<Vec<_>>>()?
                 .into_iter()
@@ -131,99 +107,21 @@ impl TableProviderFactory for ListingTableFactory {
             (Some(schema), table_partition_cols)
         };
 
-        // look for 'infinite' as an option
-        let infinite_source = cmd.unbounded;
-
-        let mut statement_options = StatementOptions::from(&cmd.options);
-
-        // Extract ListingTable specific options if present or set default
-        let unbounded = if infinite_source {
-            statement_options.take_str_option("unbounded");
-            infinite_source
-        } else {
-            statement_options
-                .take_bool_option("unbounded")?
-                .unwrap_or(false)
-        };
-
-        let create_local_path = statement_options
-            .take_bool_option("create_local_path")?
-            .unwrap_or(false);
-        let single_file = statement_options
-            .take_bool_option("single_file")?
-            .unwrap_or(false);
-
-        let explicit_insert_mode = statement_options.take_str_option("insert_mode");
-        let insert_mode = match explicit_insert_mode {
-            Some(mode) => ListingTableInsertMode::from_str(mode.as_str()),
-            None => match file_type {
-                FileType::CSV => Ok(ListingTableInsertMode::AppendToFile),
-                FileType::PARQUET => Ok(ListingTableInsertMode::AppendNewFiles),
-                FileType::AVRO => Ok(ListingTableInsertMode::AppendNewFiles),
-                FileType::JSON => Ok(ListingTableInsertMode::AppendToFile),
-                FileType::ARROW => Ok(ListingTableInsertMode::AppendNewFiles),
-            },
-        }?;
-
-        let file_type = file_format.file_type();
-
-        // Use remaining options and session state to build FileTypeWriterOptions
-        let file_type_writer_options = FileTypeWriterOptions::build(
-            &file_type,
-            state.config_options(),
-            &statement_options,
-        )?;
-
-        // Some options have special syntax which takes precedence
-        // e.g. "WITH HEADER ROW" overrides (header false, ...)
-        let file_type_writer_options = match file_type {
-            FileType::CSV => {
-                let mut csv_writer_options =
-                    file_type_writer_options.try_into_csv()?.clone();
-                csv_writer_options.has_header = cmd.has_header;
-                csv_writer_options.writer_options = csv_writer_options
-                    .writer_options
-                    .has_headers(cmd.has_header)
-                    .with_delimiter(cmd.delimiter.try_into().map_err(|_| {
-                        DataFusionError::Internal(
-                            "Unable to convert CSV delimiter into u8".into(),
-                        )
-                    })?);
-                csv_writer_options.compression = cmd.file_compression_type;
-                FileTypeWriterOptions::CSV(csv_writer_options)
-            }
-            FileType::JSON => {
-                let mut json_writer_options =
-                    file_type_writer_options.try_into_json()?.clone();
-                json_writer_options.compression = cmd.file_compression_type;
-                FileTypeWriterOptions::JSON(json_writer_options)
-            }
-            FileType::PARQUET => file_type_writer_options,
-            FileType::ARROW => file_type_writer_options,
-            FileType::AVRO => file_type_writer_options,
-        };
-
-        let table_path = match create_local_path {
-            true => ListingTableUrl::parse_create_local_if_not_exists(
-                &cmd.location,
-                !single_file,
-            ),
-            false => ListingTableUrl::parse(&cmd.location),
-        }?;
+        let table_path = ListingTableUrl::parse(&cmd.location)?;
 
         let options = ListingOptions::new(file_format)
             .with_collect_stat(state.config().collect_statistics())
             .with_file_extension(file_extension)
             .with_target_partitions(state.config().target_partitions())
             .with_table_partition_cols(table_partition_cols)
-            .with_file_sort_order(cmd.order_exprs.clone())
-            .with_insert_mode(insert_mode)
-            .with_single_file(single_file)
-            .with_write_options(file_type_writer_options)
-            .with_infinite_source(unbounded);
+            .with_file_sort_order(cmd.order_exprs.clone());
+
+        options
+            .validate_partitions(session_state, &table_path)
+            .await?;
 
         let resolved_schema = match provided_schema {
-            None => options.infer_schema(state, &table_path).await?,
+            None => options.infer_schema(session_state, &table_path).await?,
             Some(s) => s,
         };
         let config = ListingTableConfig::new(table_path)
@@ -231,7 +129,10 @@ impl TableProviderFactory for ListingTableFactory {
             .with_schema(resolved_schema);
         let provider = ListingTable::try_new(config)?
             .with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
-        let table = provider.with_definition(cmd.definition.clone());
+        let table = provider
+            .with_definition(cmd.definition.clone())
+            .with_constraints(cmd.constraints.clone())
+            .with_column_defaults(cmd.column_defaults.clone());
         Ok(Arc::new(table))
     }
 }
@@ -247,13 +148,14 @@ fn get_extension(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::collections::HashMap;
 
-    use crate::execution::context::SessionContext;
-    use datafusion_common::parsers::CompressionTypeVariant;
-    use datafusion_common::{DFSchema, OwnedTableReference};
+    use super::*;
+    use crate::{
+        datasource::file_format::csv::CsvFormat, execution::context::SessionContext,
+    };
+
+    use datafusion_common::{Constraints, DFSchema, TableReference};
 
     #[tokio::test]
     async fn test_create_using_non_std_file_ext() {
@@ -266,27 +168,70 @@ mod tests {
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
         let state = context.state();
-        let name = OwnedTableReference::bare("foo".to_string());
+        let name = TableReference::bare("foo");
         let cmd = CreateExternalTable {
             name,
             location: csv_file.path().to_str().unwrap().to_string(),
             file_type: "csv".to_string(),
-            has_header: true,
-            delimiter: ',',
             schema: Arc::new(DFSchema::empty()),
             table_partition_cols: vec![],
             if_not_exists: false,
-            file_compression_type: CompressionTypeVariant::UNCOMPRESSED,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
-            options: HashMap::new(),
+            options: HashMap::from([("format.has_header".into(), "true".into())]),
+            constraints: Constraints::empty(),
+            column_defaults: HashMap::new(),
         };
         let table_provider = factory.create(&state, &cmd).await.unwrap();
         let listing_table = table_provider
             .as_any()
             .downcast_ref::<ListingTable>()
             .unwrap();
+        let listing_options = listing_table.options();
+        assert_eq!(".tbl", listing_options.file_extension);
+    }
+
+    #[tokio::test]
+    async fn test_create_using_non_std_file_ext_csv_options() {
+        let csv_file = tempfile::Builder::new()
+            .prefix("foo")
+            .suffix(".tbl")
+            .tempfile()
+            .unwrap();
+
+        let factory = ListingTableFactory::new();
+        let context = SessionContext::new();
+        let state = context.state();
+        let name = TableReference::bare("foo");
+
+        let mut options = HashMap::new();
+        options.insert("format.schema_infer_max_rec".to_owned(), "1000".to_owned());
+        options.insert("format.has_header".into(), "true".into());
+        let cmd = CreateExternalTable {
+            name,
+            location: csv_file.path().to_str().unwrap().to_string(),
+            file_type: "csv".to_string(),
+            schema: Arc::new(DFSchema::empty()),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::empty(),
+            column_defaults: HashMap::new(),
+        };
+        let table_provider = factory.create(&state, &cmd).await.unwrap();
+        let listing_table = table_provider
+            .as_any()
+            .downcast_ref::<ListingTable>()
+            .unwrap();
+
+        let format = listing_table.options().format.clone();
+        let csv_format = format.as_any().downcast_ref::<CsvFormat>().unwrap();
+        let csv_options = csv_format.options().clone();
+        assert_eq!(csv_options.schema_infer_max_rec, 1000);
         let listing_options = listing_table.options();
         assert_eq!(".tbl", listing_options.file_extension);
     }

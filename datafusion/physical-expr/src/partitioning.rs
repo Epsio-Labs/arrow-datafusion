@@ -15,14 +15,100 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`Partitioning`] and [`Distribution`] for physical expressions
+//! [`Partitioning`] and [`Distribution`] for `ExecutionPlans`
 
 use std::fmt;
 use std::sync::Arc;
 
-use crate::{expr_list_eq_strict_order, EquivalenceProperties, PhysicalExpr};
+use crate::{
+    equivalence::ProjectionMapping, expressions::UnKnownColumn, physical_exprs_equal,
+    EquivalenceProperties, PhysicalExpr,
+};
 
-/// Partitioning schemes supported by operators.
+/// Output partitioning supported by [`ExecutionPlan`]s.
+///
+/// Calling [`ExecutionPlan::execute`] produce one or more independent streams of
+/// [`RecordBatch`]es in parallel, referred to as partitions. The streams are Rust
+/// `async` [`Stream`]s (a special kind of future). The number of output
+/// partitions varies based on the input and the operation performed.
+///
+/// For example, an `ExecutionPlan` that has output partitioning of 3 will
+/// produce 3 distinct output streams as the result of calling
+/// `ExecutionPlan::execute(0)`, `ExecutionPlan::execute(1)`, and
+/// `ExecutionPlan::execute(2)`, as shown below:
+///
+/// ```text
+///                                                   ...         ...        ...
+///               ...                                  ▲           ▲           ▲
+///                                                    │           │           │
+///                ▲                                   │           │           │
+///                │                                   │           │           │
+///                │                               ┌───┴────┐  ┌───┴────┐  ┌───┴────┐
+///     ┌────────────────────┐                     │ Stream │  │ Stream │  │ Stream │
+///     │   ExecutionPlan    │                     │  (0)   │  │  (1)   │  │  (2)   │
+///     └────────────────────┘                     └────────┘  └────────┘  └────────┘
+///                ▲                                   ▲           ▲           ▲
+///                │                                   │           │           │
+///     ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                          │           │           │
+///             Input        │                         │           │           │
+///     └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─                          │           │           │
+///                ▲                               ┌ ─ ─ ─ ─   ┌ ─ ─ ─ ─   ┌ ─ ─ ─ ─
+///                │                                 Input  │    Input  │    Input  │
+///                │                               │ Stream    │ Stream    │ Stream
+///                                                   (0)   │     (1)   │     (2)   │
+///               ...                              └ ─ ▲ ─ ─   └ ─ ▲ ─ ─   └ ─ ▲ ─ ─
+///                                                    │           │           │
+///                                                    │           │           │
+///                                                    │           │           │
+///
+/// ExecutionPlan with 1 input                      3 (async) streams, one for each
+/// that has 3 partitions, which itself             output partition
+/// has 3 output partitions
+/// ```
+///
+/// It is common (but not required) that an `ExecutionPlan` has the same number
+/// of input partitions as output partitions. However, some plans have different
+/// numbers such as the `RepartitionExec` that redistributes batches from some
+/// number of inputs to some number of outputs
+///
+/// ```text
+///               ...                                     ...         ...        ...
+///
+///                                                        ▲           ▲           ▲
+///                ▲                                       │           │           │
+///                │                                       │           │           │
+///       ┌────────┴───────────┐                           │           │           │
+///       │  RepartitionExec   │                      ┌────┴───┐  ┌────┴───┐  ┌────┴───┐
+///       └────────────────────┘                      │ Stream │  │ Stream │  │ Stream │
+///                ▲                                  │  (0)   │  │  (1)   │  │  (2)   │
+///                │                                  └────────┘  └────────┘  └────────┘
+///                │                                       ▲           ▲           ▲
+///                ...                                     │           │           │
+///                                                        └──────────┐│┌──────────┘
+///                                                                   │││
+///                                                                   │││
+/// RepartitionExec with 1 input
+/// partition and 3 output partitions                 3 (async) streams, that internally
+///                                                    pull from the same input stream
+///                                                                  ...
+/// ```
+///
+/// # Additional Examples
+///
+/// A simple `FileScanExec` might produce one output stream (partition) for each
+/// file (note the actual DataFusion file scaners can read individual files in
+/// parallel, potentially producing multiple partitions per file)
+///
+/// Plans such as `SortPreservingMerge` produce a single output stream
+/// (1 output partition) by combining some number of input streams (input partitions)
+///
+/// Plans such as `FilterExec` produce the same number of output streams
+/// (partitions) as input streams (partitions).
+///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+/// [`ExecutionPlan::execute`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html#tymethod.execute
+/// [`ExecutionPlan`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html
+/// [`Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 #[derive(Debug, Clone)]
 pub enum Partitioning {
     /// Allocate batches using a round-robin algorithm and the specified number of partitions
@@ -61,16 +147,18 @@ impl Partitioning {
         }
     }
 
-    /// Returns true when the guarantees made by this [[Partitioning]] are sufficient to
-    /// satisfy the partitioning scheme mandated by the `required` [[Distribution]]
-    pub fn satisfy<F: FnOnce() -> EquivalenceProperties>(
+    /// Returns true when the guarantees made by this [`Partitioning`] are sufficient to
+    /// satisfy the partitioning scheme mandated by the `required` [`Distribution`].
+    pub fn satisfy(
         &self,
-        required: Distribution,
-        equal_properties: F,
+        required: &Distribution,
+        eq_properties: &EquivalenceProperties,
     ) -> bool {
         match required {
             Distribution::UnspecifiedDistribution => true,
             Distribution::SinglePartition if self.partition_count() == 1 => true,
+            // When partition count is 1, hash requirement is satisfied.
+            Distribution::HashPartitioned(_) if self.partition_count() == 1 => true,
             Distribution::HashPartitioned(required_exprs) => {
                 match self {
                     // Here we do not check the partition count for hash partitioning and assumes the partition count
@@ -78,36 +166,55 @@ impl Partitioning {
                     // then we need to have the partition count and hash functions validation.
                     Partitioning::Hash(partition_exprs, _) => {
                         let fast_match =
-                            expr_list_eq_strict_order(&required_exprs, partition_exprs);
+                            physical_exprs_equal(required_exprs, partition_exprs);
                         // If the required exprs do not match, need to leverage the eq_properties provided by the child
-                        // and normalize both exprs based on the eq_properties
+                        // and normalize both exprs based on the equivalent groups.
                         if !fast_match {
-                            let eq_properties = equal_properties();
-                            let eq_classes = eq_properties.classes();
-                            if !eq_classes.is_empty() {
+                            let eq_groups = eq_properties.eq_group();
+                            if !eq_groups.is_empty() {
                                 let normalized_required_exprs = required_exprs
                                     .iter()
-                                    .map(|e| eq_properties.normalize_expr(e.clone()))
+                                    .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
                                     .collect::<Vec<_>>();
                                 let normalized_partition_exprs = partition_exprs
                                     .iter()
-                                    .map(|e| eq_properties.normalize_expr(e.clone()))
+                                    .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
                                     .collect::<Vec<_>>();
-                                expr_list_eq_strict_order(
+                                return physical_exprs_equal(
                                     &normalized_required_exprs,
                                     &normalized_partition_exprs,
-                                )
-                            } else {
-                                fast_match
+                                );
                             }
-                        } else {
-                            fast_match
                         }
+                        fast_match
                     }
                     _ => false,
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Calculate the output partitioning after applying the given projection.
+    pub fn project(
+        &self,
+        projection_mapping: &ProjectionMapping,
+        input_eq_properties: &EquivalenceProperties,
+    ) -> Self {
+        if let Partitioning::Hash(exprs, part) = self {
+            let normalized_exprs = exprs
+                .iter()
+                .map(|expr| {
+                    input_eq_properties
+                        .project_expr(expr, projection_mapping)
+                        .unwrap_or_else(|| {
+                            Arc::new(UnKnownColumn::new(&expr.to_string()))
+                        })
+                })
+                .collect();
+            Partitioning::Hash(normalized_exprs, *part)
+        } else {
+            self.clone()
         }
     }
 }
@@ -120,7 +227,7 @@ impl PartialEq for Partitioning {
                 Partitioning::RoundRobinBatch(count2),
             ) if count1 == count2 => true,
             (Partitioning::Hash(exprs1, count1), Partitioning::Hash(exprs2, count2))
-                if expr_list_eq_strict_order(exprs1, exprs2) && (count1 == count2) =>
+                if physical_exprs_equal(exprs1, exprs2) && (count1 == count2) =>
             {
                 true
             }
@@ -129,7 +236,8 @@ impl PartialEq for Partitioning {
     }
 }
 
-/// Distribution schemes
+/// How data is distributed amongst partitions. See [`Partitioning`] for more
+/// details.
 #[derive(Debug, Clone)]
 pub enum Distribution {
     /// Unspecified distribution
@@ -142,15 +250,15 @@ pub enum Distribution {
 }
 
 impl Distribution {
-    /// Creates a Partitioning for this Distribution to satisfy itself
-    pub fn create_partitioning(&self, partition_count: usize) -> Partitioning {
+    /// Creates a `Partitioning` that satisfies this `Distribution`
+    pub fn create_partitioning(self, partition_count: usize) -> Partitioning {
         match self {
             Distribution::UnspecifiedDistribution => {
                 Partitioning::UnknownPartitioning(partition_count)
             }
             Distribution::SinglePartition => Partitioning::UnknownPartitioning(1),
             Distribution::HashPartitioned(expr) => {
-                Partitioning::Hash(expr.clone(), partition_count)
+                Partitioning::Hash(expr, partition_count)
             }
         }
     }
@@ -158,15 +266,12 @@ impl Distribution {
 
 #[cfg(test)]
 mod tests {
-    use crate::expressions::Column;
 
     use super::*;
-    use arrow::datatypes::DataType;
-    use arrow::datatypes::Field;
-    use arrow::datatypes::Schema;
-    use datafusion_common::Result;
+    use crate::expressions::Column;
 
-    use std::sync::Arc;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::Result;
 
     #[test]
     fn partitioning_satisfy_distribution() -> Result<()> {
@@ -196,24 +301,15 @@ mod tests {
         let round_robin_partition = Partitioning::RoundRobinBatch(10);
         let hash_partition1 = Partitioning::Hash(partition_exprs1, 10);
         let hash_partition2 = Partitioning::Hash(partition_exprs2, 10);
+        let eq_properties = EquivalenceProperties::new(schema);
 
         for distribution in distribution_types {
             let result = (
-                single_partition.satisfy(distribution.clone(), || {
-                    EquivalenceProperties::new(schema.clone())
-                }),
-                unspecified_partition.satisfy(distribution.clone(), || {
-                    EquivalenceProperties::new(schema.clone())
-                }),
-                round_robin_partition.satisfy(distribution.clone(), || {
-                    EquivalenceProperties::new(schema.clone())
-                }),
-                hash_partition1.satisfy(distribution.clone(), || {
-                    EquivalenceProperties::new(schema.clone())
-                }),
-                hash_partition2.satisfy(distribution.clone(), || {
-                    EquivalenceProperties::new(schema.clone())
-                }),
+                single_partition.satisfy(&distribution, &eq_properties),
+                unspecified_partition.satisfy(&distribution, &eq_properties),
+                round_robin_partition.satisfy(&distribution, &eq_properties),
+                hash_partition1.satisfy(&distribution, &eq_properties),
+                hash_partition2.satisfy(&distribution, &eq_properties),
             );
 
             match distribution {
@@ -224,7 +320,7 @@ mod tests {
                     assert_eq!(result, (true, false, false, false, false))
                 }
                 Distribution::HashPartitioned(_) => {
-                    assert_eq!(result, (false, false, false, true, false))
+                    assert_eq!(result, (true, false, false, true, false))
                 }
             }
         }

@@ -16,6 +16,7 @@
 // under the License.
 
 //! Fuzz Test for various corner cases merging streams of RecordBatches
+
 use std::sync::Arc;
 
 use arrow::{
@@ -89,7 +90,7 @@ async fn test_merge_3_gaps() {
 /// Merge a set of input streams using SortPreservingMergeExec and
 /// `Vec::sort` and ensure the results are the same.
 ///
-/// For each case, the `input` streams are turned into a set of of
+/// For each case, the `input` streams are turned into a set of
 /// streams which are then merged together by [SortPreservingMerge]
 ///
 /// Each `Vec<RecordBatch>` in `input` must be sorted and have a
@@ -118,7 +119,7 @@ async fn run_merge_test(input: Vec<Vec<RecordBatch>>) {
         let merge = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
 
         let session_config = SessionConfig::new().with_batch_size(batch_size);
-        let ctx = SessionContext::with_config(session_config);
+        let ctx = SessionContext::new_with_config(session_config);
         let task_ctx = ctx.task_ctx();
         let collected = collect(merge, task_ctx).await.unwrap();
 

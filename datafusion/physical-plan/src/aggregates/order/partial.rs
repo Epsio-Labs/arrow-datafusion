@@ -20,8 +20,9 @@ use arrow_array::ArrayRef;
 use arrow_schema::Schema;
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
-use datafusion_physical_expr::EmitTo;
+use datafusion_expr::EmitTo;
 use datafusion_physical_expr::PhysicalSortExpr;
+use std::sync::Arc;
 
 /// Tracks grouping state when the data is ordered by some subset of
 /// the group keys.
@@ -31,7 +32,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 /// key and earlier.
 ///
 /// For example, given `SUM(amt) GROUP BY id, state` if the input is
-/// sorted by `state, when a new value of `state` is seen, all groups
+/// sorted by `state`, when a new value of `state` is seen, all groups
 /// with prior values of `state` can be emitted.
 ///
 /// The state is tracked like this:
@@ -59,7 +60,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 ///      order)                                    recent group index
 ///```
 #[derive(Debug)]
-pub(crate) struct GroupOrderingPartial {
+pub struct GroupOrderingPartial {
     /// State machine
     state: State,
 
@@ -138,7 +139,7 @@ impl GroupOrderingPartial {
         let sort_values: Vec<_> = self
             .order_indices
             .iter()
-            .map(|&idx| group_values[idx].clone())
+            .map(|&idx| Arc::clone(&group_values[idx]))
             .collect();
 
         Ok(self.row_converter.convert_columns(&sort_values)?)

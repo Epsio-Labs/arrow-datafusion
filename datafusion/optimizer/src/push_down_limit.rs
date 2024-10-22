@@ -15,18 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Optimizer rule to push down LIMIT in the query plan
-//! It will push down through projection, limits (taking the smaller limit)
-use crate::optimizer::ApplyOrder;
-use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::Result;
-use datafusion_expr::{
-    logical_plan::{Join, JoinType, Limit, LogicalPlan, Sort, TableScan, Union},
-    CrossJoin,
-};
+//! [`PushDownLimit`] pushes `LIMIT` earlier in the query plan
+
+use std::cmp::min;
 use std::sync::Arc;
 
-/// Optimization rule that tries to push down LIMIT.
+use crate::optimizer::ApplyOrder;
+use crate::{OptimizerConfig, OptimizerRule};
+
+use datafusion_common::tree_node::Transformed;
+use datafusion_common::utils::combine_limit;
+use datafusion_common::Result;
+use datafusion_expr::logical_plan::{Join, JoinType, Limit, LogicalPlan};
+
+/// Optimization rule that tries to push down `LIMIT`.
+///
+//. It will push down through projection, limits (taking the smaller limit)
 #[derive(Default)]
 pub struct PushDownLimit {}
 
@@ -39,172 +43,118 @@ impl PushDownLimit {
 
 /// Push down Limit.
 impl OptimizerRule for PushDownLimit {
-    fn try_optimize(
-        &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        use std::cmp::min;
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
 
-        let limit = match plan {
-            LogicalPlan::Limit(limit) => limit,
-            _ => return Ok(None),
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let LogicalPlan::Limit(mut limit) = plan else {
+            return Ok(Transformed::no(plan));
         };
 
-        if let LogicalPlan::Limit(child) = &*limit.input {
-            // Merge the Parent Limit and the Child Limit.
+        let Limit { skip, fetch, input } = limit;
 
-            //  Case 0: Parent and Child are disjoint. (child_fetch <= skip)
-            //   Before merging:
-            //                     |........skip........|---fetch-->|              Parent Limit
-            //    |...child_skip...|---child_fetch-->|                             Child Limit
-            //   After merging:
-            //    |.........(child_skip + skip).........|
-            //   Before merging:
-            //                     |...skip...|------------fetch------------>|     Parent Limit
-            //    |...child_skip...|-------------child_fetch------------>|         Child Limit
-            //   After merging:
-            //    |....(child_skip + skip)....|---(child_fetch - skip)-->|
-
-            //  Case 1: Parent is beyond the range of Child. (skip < child_fetch <= skip + fetch)
-            //   Before merging:
-            //                     |...skip...|------------fetch------------>|     Parent Limit
-            //    |...child_skip...|-------------child_fetch------------>|         Child Limit
-            //   After merging:
-            //    |....(child_skip + skip)....|---(child_fetch - skip)-->|
-
-            //  Case 2: Parent is in the range of Child. (skip + fetch < child_fetch)
-            //   Before merging:
-            //                     |...skip...|---fetch-->|                        Parent Limit
-            //    |...child_skip...|-------------child_fetch------------>|         Child Limit
-            //   After merging:
-            //    |....(child_skip + skip)....|---fetch-->|
-            let parent_skip = limit.skip;
-            let new_fetch = match (limit.fetch, child.fetch) {
-                (Some(fetch), Some(child_fetch)) => {
-                    Some(min(fetch, child_fetch.saturating_sub(parent_skip)))
-                }
-                (Some(fetch), None) => Some(fetch),
-                (None, Some(child_fetch)) => {
-                    Some(child_fetch.saturating_sub(parent_skip))
-                }
-                (None, None) => None,
-            };
+        // Merge the Parent Limit and the Child Limit.
+        if let LogicalPlan::Limit(child) = input.as_ref() {
+            let (skip, fetch) =
+                combine_limit(limit.skip, limit.fetch, child.skip, child.fetch);
 
             let plan = LogicalPlan::Limit(Limit {
-                skip: child.skip + parent_skip,
-                fetch: new_fetch,
-                input: Arc::new((*child.input).clone()),
+                skip,
+                fetch,
+                input: Arc::clone(&child.input),
             });
-            return {
-                match self.try_optimize(&plan, _config)? {
-                    Some(new_plan) => Ok(Some(new_plan)),
-                    None => Ok(Some(plan)),
-                }
-            };
+
+            // recursively reapply the rule on the new plan
+            return self.rewrite(plan, _config);
         }
 
-        let fetch = match limit.fetch {
-            Some(fetch) => fetch,
-            None => return Ok(None),
+        // no fetch to push, so return the original plan
+        let Some(fetch) = fetch else {
+            return Ok(Transformed::no(LogicalPlan::Limit(Limit {
+                skip,
+                fetch,
+                input,
+            })));
         };
-        let skip = limit.skip;
-        let child_plan = &*limit.input;
 
-        let plan = match child_plan {
-            LogicalPlan::TableScan(scan) => {
-                let limit = if fetch != 0 { fetch + skip } else { 0 };
-                let new_fetch = scan.fetch.map(|x| min(x, limit)).or(Some(limit));
+        match Arc::unwrap_or_clone(input) {
+            LogicalPlan::TableScan(mut scan) => {
+                let rows_needed = if fetch != 0 { fetch + skip } else { 0 };
+                let new_fetch = scan
+                    .fetch
+                    .map(|x| min(x, rows_needed))
+                    .or(Some(rows_needed));
                 if new_fetch == scan.fetch {
-                    None
+                    original_limit(skip, fetch, LogicalPlan::TableScan(scan))
                 } else {
-                    let new_input = LogicalPlan::TableScan(TableScan {
-                        table_name: scan.table_name.clone(),
-                        source: scan.source.clone(),
-                        projection: scan.projection.clone(),
-                        filters: scan.filters.clone(),
-                        fetch: scan.fetch.map(|x| min(x, limit)).or(Some(limit)),
-                        projected_schema: scan.projected_schema.clone(),
-                    });
-                    Some(plan.with_new_inputs(&[new_input])?)
+                    // push limit into the table scan itself
+                    scan.fetch = scan
+                        .fetch
+                        .map(|x| min(x, rows_needed))
+                        .or(Some(rows_needed));
+                    transformed_limit(skip, fetch, LogicalPlan::TableScan(scan))
                 }
             }
-            LogicalPlan::Union(union) => {
-                let new_inputs = union
+            LogicalPlan::Union(mut union) => {
+                // push limits to each input of the union
+                union.inputs = union
                     .inputs
-                    .iter()
-                    .map(|x| {
-                        Ok(Arc::new(LogicalPlan::Limit(Limit {
-                            skip: 0,
-                            fetch: Some(fetch + skip),
-                            input: Arc::new((**x).clone()),
-                        })))
-                    })
-                    .collect::<Result<_>>()?;
-                let union = LogicalPlan::Union(Union {
-                    inputs: new_inputs,
-                    schema: union.schema.clone(),
-                });
-                Some(plan.with_new_inputs(&[union])?)
+                    .into_iter()
+                    .map(|input| make_arc_limit(0, fetch + skip, input))
+                    .collect();
+                transformed_limit(skip, fetch, LogicalPlan::Union(union))
             }
 
-            LogicalPlan::CrossJoin(cross_join) => {
-                let left = &*cross_join.left;
-                let right = &*cross_join.right;
-                let new_left = LogicalPlan::Limit(Limit {
-                    skip: 0,
-                    fetch: Some(fetch + skip),
-                    input: Arc::new(left.clone()),
-                });
-                let new_right = LogicalPlan::Limit(Limit {
-                    skip: 0,
-                    fetch: Some(fetch + skip),
-                    input: Arc::new(right.clone()),
-                });
-                let new_cross_join = LogicalPlan::CrossJoin(CrossJoin {
-                    left: Arc::new(new_left),
-                    right: Arc::new(new_right),
-                    schema: plan.schema().clone(),
-                });
-                Some(plan.with_new_inputs(&[new_cross_join])?)
+            LogicalPlan::CrossJoin(mut cross_join) => {
+                // push limit to both inputs
+                cross_join.left = make_arc_limit(0, fetch + skip, cross_join.left);
+                cross_join.right = make_arc_limit(0, fetch + skip, cross_join.right);
+                transformed_limit(skip, fetch, LogicalPlan::CrossJoin(cross_join))
             }
 
-            LogicalPlan::Join(join) => {
-                let new_join = push_down_join(join, fetch + skip);
-                match new_join {
-                    Some(new_join) => {
-                        Some(plan.with_new_inputs(&[LogicalPlan::Join(new_join)])?)
-                    }
-                    None => None,
-                }
-            }
+            LogicalPlan::Join(join) => Ok(push_down_join(join, fetch + skip)
+                .update_data(|join| {
+                    make_limit(skip, fetch, Arc::new(LogicalPlan::Join(join)))
+                })),
 
-            LogicalPlan::Sort(sort) => {
+            LogicalPlan::Sort(mut sort) => {
                 let new_fetch = {
                     let sort_fetch = skip + fetch;
                     Some(sort.fetch.map(|f| f.min(sort_fetch)).unwrap_or(sort_fetch))
                 };
                 if new_fetch == sort.fetch {
-                    None
+                    if skip > 0 {
+                        original_limit(skip, fetch, LogicalPlan::Sort(sort))
+                    } else {
+                        Ok(Transformed::yes(LogicalPlan::Sort(sort)))
+                    }
                 } else {
-                    let new_sort = LogicalPlan::Sort(Sort {
-                        expr: sort.expr.clone(),
-                        input: Arc::new((*sort.input).clone()),
-                        fetch: new_fetch,
-                    });
-                    Some(plan.with_new_inputs(&[new_sort])?)
+                    sort.fetch = new_fetch;
+                    limit.input = Arc::new(LogicalPlan::Sort(sort));
+                    Ok(Transformed::yes(LogicalPlan::Limit(limit)))
                 }
             }
-            LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => {
+            LogicalPlan::Projection(mut proj) => {
                 // commute
-                let new_limit =
-                    plan.with_new_inputs(&[child_plan.inputs()[0].clone()])?;
-                Some(child_plan.with_new_inputs(&[new_limit])?)
+                limit.input = Arc::clone(&proj.input);
+                let new_limit = LogicalPlan::Limit(limit);
+                proj.input = Arc::new(new_limit);
+                Ok(Transformed::yes(LogicalPlan::Projection(proj)))
             }
-            _ => None,
-        };
-
-        Ok(plan)
+            LogicalPlan::SubqueryAlias(mut subquery_alias) => {
+                // commute
+                limit.input = Arc::clone(&subquery_alias.input);
+                let new_limit = LogicalPlan::Limit(limit);
+                subquery_alias.input = Arc::new(new_limit);
+                Ok(Transformed::yes(LogicalPlan::SubqueryAlias(subquery_alias)))
+            }
+            input => original_limit(skip, fetch, input),
+        }
     }
 
     fn name(&self) -> &str {
@@ -216,14 +166,70 @@ impl OptimizerRule for PushDownLimit {
     }
 }
 
-fn push_down_join(join: &Join, limit: usize) -> Option<Join> {
+/// Wrap the input plan with a limit node
+///
+/// Original:
+/// ```text
+/// input
+/// ```
+///
+/// Return
+/// ```text
+/// Limit: skip=skip, fetch=fetch
+///  input
+/// ```
+fn make_limit(skip: usize, fetch: usize, input: Arc<LogicalPlan>) -> LogicalPlan {
+    LogicalPlan::Limit(Limit {
+        skip,
+        fetch: Some(fetch),
+        input,
+    })
+}
+
+/// Wrap the input plan with a limit node
+fn make_arc_limit(
+    skip: usize,
+    fetch: usize,
+    input: Arc<LogicalPlan>,
+) -> Arc<LogicalPlan> {
+    Arc::new(make_limit(skip, fetch, input))
+}
+
+/// Returns the original limit (non transformed)
+fn original_limit(
+    skip: usize,
+    fetch: usize,
+    input: LogicalPlan,
+) -> Result<Transformed<LogicalPlan>> {
+    Ok(Transformed::no(LogicalPlan::Limit(Limit {
+        skip,
+        fetch: Some(fetch),
+        input: Arc::new(input),
+    })))
+}
+
+/// Returns the a transformed limit
+fn transformed_limit(
+    skip: usize,
+    fetch: usize,
+    input: LogicalPlan,
+) -> Result<Transformed<LogicalPlan>> {
+    Ok(Transformed::yes(LogicalPlan::Limit(Limit {
+        skip,
+        fetch: Some(fetch),
+        input: Arc::new(input),
+    })))
+}
+
+/// Adds a limit to the inputs of a join, if possible
+fn push_down_join(mut join: Join, limit: usize) -> Transformed<Join> {
     use JoinType::*;
 
     fn is_no_join_condition(join: &Join) -> bool {
         join.on.is_empty() && join.filter.is_none()
     }
 
-    let (left_limit, right_limit) = if is_no_join_condition(join) {
+    let (left_limit, right_limit) = if is_no_join_condition(&join) {
         match join.join_type {
             Left | Right | Full => (Some(limit), Some(limit)),
             LeftAnti | LeftSemi => (Some(limit), None),
@@ -238,37 +244,16 @@ fn push_down_join(join: &Join, limit: usize) -> Option<Join> {
         }
     };
 
-    match (left_limit, right_limit) {
-        (None, None) => None,
-        _ => {
-            let left = match left_limit {
-                Some(limit) => LogicalPlan::Limit(Limit {
-                    skip: 0,
-                    fetch: Some(limit),
-                    input: Arc::new((*join.left).clone()),
-                }),
-                None => (*join.left).clone(),
-            };
-            let right = match right_limit {
-                Some(limit) => LogicalPlan::Limit(Limit {
-                    skip: 0,
-                    fetch: Some(limit),
-                    input: Arc::new((*join.right).clone()),
-                }),
-                None => (*join.right).clone(),
-            };
-            Some(Join {
-                left: Arc::new(left),
-                right: Arc::new(right),
-                on: join.on.clone(),
-                filter: join.filter.clone(),
-                join_type: join.join_type,
-                join_constraint: join.join_constraint,
-                schema: join.schema.clone(),
-                null_equals_null: join.null_equals_null,
-            })
-        }
+    if left_limit.is_none() && right_limit.is_none() {
+        return Transformed::no(join);
     }
+    if let Some(limit) = left_limit {
+        join.left = make_arc_limit(0, limit, join.left);
+    }
+    if let Some(limit) = right_limit {
+        join.right = make_arc_limit(0, limit, join.right);
+    }
+    Transformed::yes(join)
 }
 
 #[cfg(test)]
@@ -277,13 +262,10 @@ mod test {
 
     use super::*;
     use crate::test::*;
-    use datafusion_expr::{
-        col, exists,
-        logical_plan::{builder::LogicalPlanBuilder, JoinType, LogicalPlan},
-        max,
-    };
+    use datafusion_expr::{col, exists, logical_plan::builder::LogicalPlanBuilder};
+    use datafusion_functions_aggregate::expr_fn::max;
 
-    fn assert_optimized_plan_equal(plan: &LogicalPlan, expected: &str) -> Result<()> {
+    fn assert_optimized_plan_equal(plan: LogicalPlan, expected: &str) -> Result<()> {
         assert_optimized_plan_eq(Arc::new(PushDownLimit::new()), plan, expected)
     }
 
@@ -302,7 +284,7 @@ mod test {
         \n  Limit: skip=0, fetch=1000\
         \n    TableScan: test, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -320,7 +302,7 @@ mod test {
         let expected = "Limit: skip=0, fetch=10\
         \n  TableScan: test, fetch=10";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -334,10 +316,10 @@ mod test {
 
         // Limit should *not* push down aggregate node
         let expected = "Limit: skip=0, fetch=1000\
-        \n  Aggregate: groupBy=[[test.a]], aggr=[[MAX(test.b)]]\
+        \n  Aggregate: groupBy=[[test.a]], aggr=[[max(test.b)]]\
         \n    TableScan: test";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -357,7 +339,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -365,16 +347,16 @@ mod test {
         let table_scan = test_table_scan()?;
 
         let plan = LogicalPlanBuilder::from(table_scan)
-            .sort(vec![col("a")])?
+            .sort_by(vec![col("a")])?
             .limit(0, Some(10))?
             .build()?;
 
         // Should push down limit to sort
         let expected = "Limit: skip=0, fetch=10\
-        \n  Sort: test.a, fetch=10\
+        \n  Sort: test.a ASC NULLS LAST, fetch=10\
         \n    TableScan: test";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -382,16 +364,16 @@ mod test {
         let table_scan = test_table_scan()?;
 
         let plan = LogicalPlanBuilder::from(table_scan)
-            .sort(vec![col("a")])?
+            .sort_by(vec![col("a")])?
             .limit(5, Some(10))?
             .build()?;
 
         // Should push down limit to sort
         let expected = "Limit: skip=5, fetch=10\
-        \n  Sort: test.a, fetch=15\
+        \n  Sort: test.a ASC NULLS LAST, fetch=15\
         \n    TableScan: test";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -406,11 +388,11 @@ mod test {
 
         // Limit should use deeper LIMIT 1000, but Limit 10 shouldn't push down aggregation
         let expected = "Limit: skip=0, fetch=10\
-        \n  Aggregate: groupBy=[[test.a]], aggr=[[MAX(test.b)]]\
+        \n  Aggregate: groupBy=[[test.a]], aggr=[[max(test.b)]]\
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -425,7 +407,7 @@ mod test {
         let expected = "Limit: skip=10, fetch=None\
         \n  TableScan: test";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -443,7 +425,7 @@ mod test {
         \n  Limit: skip=10, fetch=1000\
         \n    TableScan: test, fetch=1010";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -460,7 +442,7 @@ mod test {
         \n  Limit: skip=10, fetch=990\
         \n    TableScan: test, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -477,7 +459,7 @@ mod test {
         \n  Limit: skip=10, fetch=1000\
         \n    TableScan: test, fetch=1010";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -493,7 +475,7 @@ mod test {
         let expected = "Limit: skip=10, fetch=10\
         \n  TableScan: test, fetch=20";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -507,10 +489,10 @@ mod test {
 
         // Limit should *not* push down aggregate node
         let expected = "Limit: skip=10, fetch=1000\
-        \n  Aggregate: groupBy=[[test.a]], aggr=[[MAX(test.b)]]\
+        \n  Aggregate: groupBy=[[test.a]], aggr=[[max(test.b)]]\
         \n    TableScan: test";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -530,7 +512,7 @@ mod test {
         \n    Limit: skip=0, fetch=1010\
         \n      TableScan: test, fetch=1010";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -554,7 +536,7 @@ mod test {
         \n    TableScan: test\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -578,7 +560,7 @@ mod test {
         \n    TableScan: test\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -607,7 +589,7 @@ mod test {
         \n    Projection: test2.a\
         \n      TableScan: test2";
 
-        assert_optimized_plan_equal(&outer_query, expected)
+        assert_optimized_plan_equal(outer_query, expected)
     }
 
     #[test]
@@ -636,7 +618,7 @@ mod test {
         \n    Projection: test2.a\
         \n      TableScan: test2";
 
-        assert_optimized_plan_equal(&outer_query, expected)
+        assert_optimized_plan_equal(outer_query, expected)
     }
 
     #[test]
@@ -662,7 +644,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1.clone())
             .join(
@@ -681,7 +663,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1.clone())
             .join(
@@ -700,7 +682,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1.clone())
             .join(
@@ -718,7 +700,7 @@ mod test {
         \n      TableScan: test, fetch=1000\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1.clone())
             .join(
@@ -736,7 +718,7 @@ mod test {
         \n      TableScan: test, fetch=1000\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1.clone())
             .join(
@@ -754,7 +736,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)?;
+        assert_optimized_plan_equal(plan, expected)?;
 
         let plan = LogicalPlanBuilder::from(table_scan_1)
             .join(
@@ -772,7 +754,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -797,7 +779,7 @@ mod test {
         \n      TableScan: test, fetch=1000\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -822,7 +804,7 @@ mod test {
         \n      TableScan: test, fetch=1010\
         \n    TableScan: test2";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -847,7 +829,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -872,7 +854,7 @@ mod test {
         \n    Limit: skip=0, fetch=1010\
         \n      TableScan: test2, fetch=1010";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -892,7 +874,7 @@ mod test {
         \n    Limit: skip=0, fetch=1000\
         \n      TableScan: test2, fetch=1000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -912,7 +894,7 @@ mod test {
         \n    Limit: skip=0, fetch=2000\
         \n      TableScan: test2, fetch=2000";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -927,7 +909,7 @@ mod test {
         let expected = "Limit: skip=1000, fetch=0\
         \n  TableScan: test, fetch=0";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -942,7 +924,7 @@ mod test {
         let expected = "Limit: skip=1000, fetch=0\
         \n  TableScan: test, fetch=0";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 
     #[test]
@@ -959,6 +941,6 @@ mod test {
         \n  Limit: skip=1000, fetch=0\
         \n    TableScan: test, fetch=0";
 
-        assert_optimized_plan_equal(&plan, expected)
+        assert_optimized_plan_equal(plan, expected)
     }
 }

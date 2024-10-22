@@ -26,9 +26,7 @@ use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{
-    cast::as_boolean_array, internal_err, DataFusionError, Result, ScalarValue,
-};
+use datafusion_common::{cast::as_boolean_array, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 
 /// Not expression
@@ -83,13 +81,6 @@ impl PhysicalExpr for NotExpr {
                 if scalar.is_null() {
                     return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)));
                 }
-                let value_type = scalar.data_type();
-                if value_type != DataType::Boolean {
-                    return internal_err!(
-                        "NOT '{:?}' can't be evaluated because the expression's type is {:?}, not boolean or NULL",
-                        self.arg, value_type
-                    );
-                }
                 let bool_value: bool = scalar.try_into()?;
                 Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(
                     !bool_value,
@@ -98,15 +89,15 @@ impl PhysicalExpr for NotExpr {
         }
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
-        vec![self.arg.clone()]
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.arg]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        Ok(Arc::new(NotExpr::new(children[0].clone())))
+        Ok(Arc::new(NotExpr::new(Arc::clone(&children[0]))))
     }
 
     fn dyn_hash(&self, state: &mut dyn Hasher) {
@@ -134,7 +125,6 @@ mod tests {
     use super::*;
     use crate::expressions::col;
     use arrow::{array::BooleanArray, datatypes::*};
-    use datafusion_common::Result;
 
     #[test]
     fn neg_op() -> Result<()> {
@@ -150,7 +140,10 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(input)])?;
 
-        let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
+        let result = expr
+            .evaluate(&batch)?
+            .into_array(batch.num_rows())
+            .expect("Failed to convert to array");
         let result =
             as_boolean_array(&result).expect("failed to downcast to BooleanArray");
         assert_eq!(result, expected);

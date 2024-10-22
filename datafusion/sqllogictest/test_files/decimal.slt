@@ -44,8 +44,8 @@ c4 BOOLEAN NOT NULL,
 c5 DECIMAL(12,7) NOT NULL
 )
 STORED AS CSV
-WITH HEADER ROW
-LOCATION '../core/tests/data/decimal_data.csv';
+LOCATION '../core/tests/data/decimal_data.csv'
+OPTIONS ('format.has_header' 'true');
 
 
 query TT
@@ -469,7 +469,7 @@ select c1%c5 from decimal_simple;
 query T
 select arrow_typeof(abs(c1)) from decimal_simple limit 1;
 ----
-Float64
+Decimal128(10, 6)
 
 
 query R rowsort
@@ -507,27 +507,26 @@ select * from decimal_simple where c1 >= 0.00004 order by c1;
 
 
 query RRIBR
-select * from decimal_simple where c1 >= 0.00004 order by c1 limit 10;
+select * from decimal_simple where c1 >= 0.00004 order by c1, c3 limit 10;
 ----
 0.00004 0.000000000004 5 true 0.000044
+0.00004 0.000000000004 8 false 0.000044
 0.00004 0.000000000004 12 false 0.00004
 0.00004 0.000000000004 14 true 0.00004
-0.00004 0.000000000004 8 false 0.000044
-0.00005 0.000000000005 9 true 0.000052
+0.00005 0.000000000005 1 false 0.0001
 0.00005 0.000000000005 4 true 0.000078
 0.00005 0.000000000005 8 false 0.000033
+0.00005 0.000000000005 9 true 0.000052
 0.00005 0.000000000005 100 true 0.000068
-0.00005 0.000000000005 1 false 0.0001
-
 
 query RRIBR
-select * from decimal_simple where c1 >= 0.00004 order by c1 limit 5;
+select * from decimal_simple where c1 >= 0.00004 order by c1, c3 limit 5;
 ----
 0.00004 0.000000000004 5 true 0.000044
+0.00004 0.000000000004 8 false 0.000044
 0.00004 0.000000000004 12 false 0.00004
 0.00004 0.000000000004 14 true 0.00004
-0.00004 0.000000000004 8 false 0.000044
-0.00005 0.000000000005 9 true 0.000052
+0.00005 0.000000000005 1 false 0.0001
 
 
 query RRIBR
@@ -623,8 +622,114 @@ create table t as values (arrow_cast(123, 'Decimal256(5,2)'));
 statement ok
 set datafusion.execution.target_partitions = 1;
 
-query error DataFusion error: This feature is not implemented: AvgAccumulator for \(Decimal256\(5, 2\) --> Decimal256\(9, 6\)\)
+query R
 select AVG(column1) from t;
+----
+123
 
 statement ok
 drop table t;
+
+statement ok
+CREATE EXTERNAL TABLE decimal256_simple (
+c1 DECIMAL(50,6) NOT NULL,
+c2 DOUBLE NOT NULL,
+c3 BIGINT NOT NULL,
+c4 BOOLEAN NOT NULL,
+c5 DECIMAL(52,7) NOT NULL
+)
+STORED AS CSV
+LOCATION '../core/tests/data/decimal_data.csv'
+OPTIONS ('format.has_header' 'true');
+
+query TT
+select arrow_typeof(c1), arrow_typeof(c5) from decimal256_simple limit 1;
+----
+Decimal256(50, 6) Decimal256(52, 7)
+
+query R rowsort
+SELECT c1 from decimal256_simple;
+----
+0.00001
+0.00002
+0.00002
+0.00003
+0.00003
+0.00003
+0.00004
+0.00004
+0.00004
+0.00004
+0.00005
+0.00005
+0.00005
+0.00005
+0.00005
+
+query R rowsort
+select c1 from decimal256_simple where c1 > 0.000030;
+----
+0.00004
+0.00004
+0.00004
+0.00004
+0.00005
+0.00005
+0.00005
+0.00005
+0.00005
+
+query RRIBR rowsort
+select * from decimal256_simple where c1 > c5;
+----
+0.00002 0.000000000002 3 false 0.000019
+0.00003 0.000000000003 5 true 0.000011
+0.00005 0.000000000005 8 false 0.000033
+
+query TR
+select arrow_typeof(avg(c1)), avg(c1) from decimal256_simple;
+----
+Decimal256(54, 10) 0.0000366666
+
+query TR
+select arrow_typeof(min(c1)), min(c1) from decimal256_simple where c4=false;
+----
+Decimal256(50, 6) 0.00002
+
+query TR
+select arrow_typeof(max(c1)), max(c1) from decimal256_simple where c4=false;
+----
+Decimal256(50, 6) 0.00005
+
+query TR
+select arrow_typeof(sum(c1)), sum(c1) from decimal256_simple;
+----
+Decimal256(60, 6) 0.00055
+
+query TR
+select arrow_typeof(median(c1)), median(c1) from decimal256_simple;
+----
+Decimal256(50, 6) 0.00004
+
+query IR
+select count(*),c1 from decimal256_simple group by c1 order by c1;
+----
+1 0.00001
+2 0.00002
+3 0.00003
+4 0.00004
+5 0.00005
+
+query I
+select count(DISTINCT cast(c1 AS DECIMAL(42, 4))) from decimal256_simple;
+----
+2
+
+query BI
+select c4, count(DISTINCT cast(c1 AS DECIMAL(42, 4))) from decimal256_simple GROUP BY c4 ORDER BY c4;
+----
+false 2
+true 2
+
+statement ok
+drop table decimal256_simple;
