@@ -317,7 +317,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     .sql_to_expr(default_sql_expr.clone(), &empty_schema, planner_context)
                     .map_err(error_desc)?;
                 column_defaults.push((
-                    self.ident_normalizer.normalize(column.name.clone()),
+                    self.ident_normalizer.normalize_column(column.name.clone()),
                     default_expr,
                 ));
             }
@@ -483,7 +483,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                             None => Ident::new(format!("c{idx}"))
                         };
                         Ok(Arc::new(Field::new(
-                            self.ident_normalizer.normalize(field_name),
+                            self.ident_normalizer.normalize_column(field_name),
                             data_type,
                             true,
                         )))
@@ -638,7 +638,7 @@ pub fn object_name_to_qualifier(
             format!(
                 r#"{} = '{}'"#,
                 column_name,
-                normalizer.normalize(ident.clone())
+                normalizer.normalize_column(ident.clone())
             )
         })
         .collect::<Vec<_>>()

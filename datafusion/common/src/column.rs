@@ -196,11 +196,46 @@ impl Column {
         for schema_level in schemas {
             let qualified_fields = schema_level
                 .iter()
-                .flat_map(|s| s.qualified_fields_with_unqualified_name(&self.name))
+                .flat_map(|s| {
+                    s.field_qualifiers()
+                        .iter()
+                        .zip(s.fields().iter())
+                        .filter_map(|(qualifier, field)| {
+                            let tables_match = match &self.relation {
+                                Some(tb) => match qualifier {
+                                    None => true,
+                                    Some(s) => tb.resolved_eq(s),
+                                },
+                                None => true,
+                            };
+                            if tables_match && *field.name().to_lowercase() == self.name.to_lowercase() {
+                                let qualifier = match &self.relation {
+                                    Some(tb) => Some(tb),
+                                    None => qualifier.as_ref(),
+                                };
+                                return Some((
+                                    qualifier,
+                                    Field::new(
+                                        self.name.as_str(), // We want to use the original name
+                                        // in case there's some casing difference
+                                        field.data_type().clone(),
+                                        field.is_nullable(),
+                                    ),
+                                ));
+                            }
+                            None
+                        })
+                        .collect::<Vec<_>>()
+                })
                 .collect::<Vec<_>>();
             match qualified_fields.len() {
                 0 => continue,
-                1 => return Ok(Column::from(qualified_fields[0])),
+                1 => {
+                    return Ok(Column::from((
+                        qualified_fields[0].0,
+                        &qualified_fields[0].1,
+                    )))
+                }
                 _ => {
                     // More than 1 fields in this schema have their names set to self.name.
                     //

@@ -329,6 +329,10 @@ impl DFSchema {
         &self.inner.fields
     }
 
+    pub fn field_qualifiers(&self) -> &Vec<Option<TableReference>> {
+        &self.field_qualifiers
+    }
+
     /// Returns an immutable reference of a specific `Field` instance selected using an
     /// offset within the internal `fields` vector
     pub fn field(&self, i: usize) -> &Field {
