@@ -19,16 +19,18 @@ use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
-use datafusion_common::{not_impl_err, plan_err, Constraints, Result, ScalarValue};
+use datafusion_common::{not_impl_err, plan_err, Constraints, Result, ScalarValue, Column};
 use datafusion_expr::expr::Sort;
 use datafusion_expr::{
     CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
     Operator,
 };
+use datafusion_expr::expr_rewriter::{normalize_col, normalize_sorts};
 use sqlparser::ast::{
     Expr as SQLExpr, Offset as SQLOffset, OrderBy, OrderByExpr, Query, SelectInto,
     SetExpr, Value,
 };
+use crate::utils::{extract_aliases, resolve_aliases_to_exprs};
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Generate a logical plan from an SQL query/subquery
@@ -127,9 +129,56 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
 
         if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
+
+            let parent_plan = distinct_on.input.clone();
+
             // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
             // optimization we're effectively doing a `first_value` aggregation according to them.
-            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
+            let alias_map = extract_aliases(&distinct_on.select_expr);
+            let on_expr = distinct_on.on_expr.clone()
+                .into_iter()
+                .map(|e| {
+                    normalize_col(
+                        resolve_aliases_to_exprs(e, &alias_map)?,
+                        &parent_plan,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let order_by_expressions = normalize_sorts(order_by.clone(), &parent_plan)?;
+
+            for (i, expr) in on_expr.into_iter().enumerate() {
+                let order_exp = order_by_expressions.get(i);
+                match order_exp {
+                    None => {}
+                    Some(sort_expr) =>
+                    if sort_expr.expr != expr {
+                        return plan_err!(
+                            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+                        );
+                    }
+                }
+            }
+
+            let schema = plan.schema();
+
+            // Collect sort columns that are missing in the input plan's schema
+            let mut missing_cols: Vec<Column> = vec![];
+            order_by.iter().try_for_each::<_, Result<()>>(|sort| {
+                let columns = sort.expr.column_refs();
+
+                columns.into_iter().for_each(|c| {
+                    if !schema.has_column(c) {
+                        missing_cols.push(c.clone());
+                    }
+                });
+
+                Ok(())
+            })?;
+
+            let parent_plan = LogicalPlanBuilder::add_missing_columns(Arc::unwrap_or_clone(parent_plan), &missing_cols, false)?;
+            let mut distinct_on = distinct_on.clone();
+            distinct_on.input = Arc::new(parent_plan);
             Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
         } else {
             LogicalPlanBuilder::from(plan).sort(order_by)?.build()

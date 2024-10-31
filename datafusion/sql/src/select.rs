@@ -105,6 +105,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             true,
             Some(base_plan.schema().as_ref()),
         )?;
+
         let order_by_rex = normalize_sorts(order_by_rex, &projected_plan)?;
 
         // this alias map is resolved and looked up in both having exprs and group by exprs
@@ -236,7 +237,17 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         };
 
         // try process unnest expression or do the final projection
-        let plan = self.try_process_unnest(plan, select_exprs_post_aggr)?;
+        let plan = self.try_process_unnest(plan, select_exprs_post_aggr.clone())?;
+
+        let projection = match &plan {
+            LogicalPlan::Projection(projection) => projection,
+            _ => unreachable!(),
+        };
+
+        select_exprs_post_aggr = select_exprs_post_aggr
+            .iter()
+            .map(|expr| rebase_expr(expr, &projection.expr, &plan))
+            .collect::<Result<Vec<Expr>>>()?;
 
         // process distinct clause
         let plan = match select.distinct {
@@ -259,9 +270,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
+
                 // Build the final plan
-                LogicalPlanBuilder::from(base_plan)
-                    .distinct_on(on_expr, select_exprs, None)?
+                LogicalPlanBuilder::from(plan)
+                    .distinct_on(on_expr, select_exprs_post_aggr, None)?
                     .build()
             }
         }?;

@@ -472,7 +472,7 @@ impl LogicalPlanBuilder {
     ///  (which will appear as a (1, 2), (1, 2) if a and b are projected
     ///
     /// See <https://github.com/apache/datafusion/issues/5065> for more details
-    fn add_missing_columns(
+    pub fn add_missing_columns(
         curr_plan: LogicalPlan,
         missing_cols: &[Column],
         is_distinct: bool,
@@ -645,8 +645,28 @@ impl LogicalPlanBuilder {
         select_expr: Vec<Expr>,
         sort_expr: Option<Vec<SortExpr>>,
     ) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
-            DistinctOn::try_new(on_expr, select_expr, sort_expr, self.plan)?,
+        let schema = self.plan.schema();
+
+        // Collect sort columns that are missing in the input plan's schema
+        let mut missing_cols: Vec<Column> = vec![];
+        on_expr
+            .iter()
+            .chain(sort_expr.iter().flat_map(|sort| sort.iter().map(|s| &s.expr)))
+            .try_for_each::<_, Result<()>>(|expr| {
+                let columns = expr.to_columns()?;
+
+                columns.into_iter().for_each(|c| {
+                    if schema.field_from_column(&c).is_err() {
+                        missing_cols.push(c);
+                    }
+                });
+
+                Ok(())
+            })?;
+
+        let plan = Self::add_missing_columns(Arc::unwrap_or_clone(self.plan), &missing_cols, false)?;
+        Ok(Self::from(LogicalPlan::Distinct(Distinct::On(
+            DistinctOn::try_new(on_expr, select_expr, sort_expr, Arc::new(plan))?,
         ))))
     }
 

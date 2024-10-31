@@ -22,7 +22,7 @@ use super::DdlStatement;
 use crate::builder::{change_redundant_column, unnest_with_options};
 use crate::expr::{Placeholder, Sort as SortExpr, WindowFunction};
 use crate::expr_rewriter::{
-    create_col_from_scalar_expr, normalize_cols, normalize_sorts, NamePreserver,
+    create_col_from_scalar_expr, normalize_cols, NamePreserver,
 };
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
 use crate::logical_plan::extension::UserDefinedLogicalNode;
@@ -2717,36 +2717,9 @@ impl DistinctOn {
             schema: Arc::new(dfschema),
         };
 
-        if let Some(sort_expr) = sort_expr {
-            distinct_on = distinct_on.with_sort_expr(sort_expr)?;
-        }
+        distinct_on.sort_expr = sort_expr;
 
         Ok(distinct_on)
-    }
-
-    /// Try to update `self` with a new sort expressions.
-    ///
-    /// Validates that the sort expressions are a super-set of the `ON` expressions.
-    pub fn with_sort_expr(mut self, sort_expr: Vec<SortExpr>) -> Result<Self> {
-        let sort_expr = normalize_sorts(sort_expr, self.input.as_ref())?;
-
-        // Check that the left-most sort expressions are the same as the `ON` expressions.
-        let mut matched = true;
-        for (on, sort) in self.on_expr.iter().zip(sort_expr.iter()) {
-            if on != &sort.expr {
-                matched = false;
-                break;
-            }
-        }
-
-        if self.on_expr.len() > sort_expr.len() || !matched {
-            return plan_err!(
-                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
-            );
-        }
-
-        self.sort_expr = Some(sort_expr);
-        Ok(self)
     }
 }
 
