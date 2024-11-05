@@ -26,8 +26,8 @@ use sqlparser::ast::{
 };
 
 use datafusion_common::{
-    internal_datafusion_err, internal_err, not_impl_err, plan_err, DFSchema, Result,
-    ScalarValue,
+    internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, DFSchema,
+    Result, ScalarValue,
 };
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::expr::{InList, WildcardOptions};
@@ -148,20 +148,19 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     fn rewrite_partial_qualifier(&self, expr: Expr, schema: &DFSchema) -> Expr {
         match expr {
             Expr::Column(col) => match &col.relation {
-                Some(q) => {
-                    match schema.iter().find(|(qualifier, field)| match qualifier {
-                        Some(field_q) => {
-                            field.name() == &col.name
-                                && field_q.to_string().ends_with(&format!(".{q}"))
-                        }
-                        _ => false,
-                    }) {
-                        Some((qualifier, df_field)) => Expr::from((qualifier, df_field)),
-                        None => Expr::Column(col),
+                Some(q) => match schema.field_with_qualified_name(q, &col.name) {
+                    Ok(found) => {
+                        Column::new(Some(q.clone()), &found.name().clone()).into()
                     }
-                }
+                    Err(_) => Expr::Column(col),
+                },
                 None => Expr::Column(col),
             },
+            Expr::BinaryExpr(binary_expr) => Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.rewrite_partial_qualifier(*binary_expr.left, schema)),
+                binary_expr.op,
+                Box::new(self.rewrite_partial_qualifier(*binary_expr.right, schema)),
+            )),
             _ => expr,
         }
     }
