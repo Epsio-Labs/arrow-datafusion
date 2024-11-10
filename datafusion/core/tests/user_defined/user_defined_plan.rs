@@ -58,7 +58,9 @@
 //! N elements, reducing the total amount of required buffer memory.
 //!
 
-use futures::{Stream, StreamExt};
+use std::fmt::Debug;
+use std::task::{Context, Poll};
+use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
 use arrow::{
     array::{Int64Array, StringArray},
@@ -66,10 +68,13 @@ use arrow::{
     record_batch::RecordBatch,
     util::pretty::pretty_format_batches,
 };
+use async_trait::async_trait;
+use futures::{Stream, StreamExt};
+
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::{
     common::cast::{as_int64_array, as_string_array},
-    common::internal_err,
-    common::DFSchemaRef,
+    common::{arrow_datafusion_err, internal_err, DFSchemaRef},
     error::{DataFusionError, Result},
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
@@ -79,66 +84,77 @@ use datafusion::{
         Expr, Extension, Limit, LogicalPlan, Sort, UserDefinedLogicalNode,
         UserDefinedLogicalNodeCore,
     },
-    optimizer::{optimize_children, OptimizerConfig, OptimizerRule},
+    optimizer::{OptimizerConfig, OptimizerRule},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        expressions::PhysicalSortExpr, DisplayAs, DisplayFormatType, Distribution,
-        ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionMode, ExecutionPlan,
+        Partitioning, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
         Statistics,
     },
     physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner},
     prelude::{SessionConfig, SessionContext},
 };
-
-use fmt::Debug;
-use std::task::{Context, Poll};
-use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
-
-use async_trait::async_trait;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::ScalarValue;
+use datafusion_expr::tree_node::replace_sort_expression;
+use datafusion_expr::{Projection, SortExpr};
+use datafusion_optimizer::optimizer::ApplyOrder;
+use datafusion_optimizer::AnalyzerRule;
 
 /// Execute the specified sql and return the resulting record batches
 /// pretty printed as a String.
-async fn exec_sql(ctx: &mut SessionContext, sql: &str) -> Result<String> {
+async fn exec_sql(ctx: &SessionContext, sql: &str) -> Result<String> {
     let df = ctx.sql(sql).await?;
     let batches = df.collect().await?;
     pretty_format_batches(&batches)
-        .map_err(DataFusionError::ArrowError)
+        .map_err(|e| arrow_datafusion_err!(e))
         .map(|d| d.to_string())
 }
 
 /// Create a test table.
-async fn setup_table(mut ctx: SessionContext) -> Result<SessionContext> {
-    let sql = "CREATE EXTERNAL TABLE sales(customer_id VARCHAR, revenue BIGINT) STORED AS CSV location 'tests/data/customer.csv'";
+async fn setup_table(ctx: SessionContext) -> Result<SessionContext> {
+    let sql = "
+        CREATE EXTERNAL TABLE sales(customer_id VARCHAR, revenue BIGINT)
+        STORED AS CSV location 'tests/data/customer.csv'
+        OPTIONS('format.has_header' 'false')
+    ";
 
     let expected = vec!["++", "++"];
 
-    let s = exec_sql(&mut ctx, sql).await?;
+    let s = exec_sql(&ctx, sql).await?;
     let actual = s.lines().collect::<Vec<_>>();
 
     assert_eq!(expected, actual, "Creating table");
     Ok(ctx)
 }
 
-async fn setup_table_without_schemas(mut ctx: SessionContext) -> Result<SessionContext> {
-    let sql =
-        "CREATE EXTERNAL TABLE sales STORED AS CSV location 'tests/data/customer.csv'";
+async fn setup_table_without_schemas(ctx: SessionContext) -> Result<SessionContext> {
+    let sql = "
+        CREATE EXTERNAL TABLE sales
+        STORED AS CSV location 'tests/data/customer.csv'
+        OPTIONS('format.has_header' 'false')
+    ";
 
     let expected = vec!["++", "++"];
 
-    let s = exec_sql(&mut ctx, sql).await?;
+    let s = exec_sql(&ctx, sql).await?;
     let actual = s.lines().collect::<Vec<_>>();
 
     assert_eq!(expected, actual, "Creating table");
     Ok(ctx)
 }
-
-const QUERY1: &str = "SELECT * FROM sales limit 3";
 
 const QUERY: &str =
     "SELECT customer_id, revenue FROM sales ORDER BY revenue DESC limit 3";
 
+const QUERY1: &str = "SELECT * FROM sales limit 3";
+
+const QUERY2: &str = "SELECT 42, arrow_typeof(42)";
+
 // Run the query using the specified execution context and compare it
 // to the known result
-async fn run_and_compare_query(mut ctx: SessionContext, description: &str) -> Result<()> {
+async fn run_and_compare_query(ctx: SessionContext, description: &str) -> Result<()> {
     let expected = vec![
         "+-------------+---------+",
         "| customer_id | revenue |",
@@ -149,7 +165,35 @@ async fn run_and_compare_query(mut ctx: SessionContext, description: &str) -> Re
         "+-------------+---------+",
     ];
 
-    let s = exec_sql(&mut ctx, QUERY).await?;
+    let s = exec_sql(&ctx, QUERY).await?;
+    let actual = s.lines().collect::<Vec<_>>();
+
+    assert_eq!(
+        expected,
+        actual,
+        "output mismatch for {}. Expectedn\n{}Actual:\n{}",
+        description,
+        expected.join("\n"),
+        s
+    );
+    Ok(())
+}
+
+// Run the query using the specified execution context and compare it
+// to the known result
+async fn run_and_compare_query_with_analyzer_rule(
+    ctx: SessionContext,
+    description: &str,
+) -> Result<()> {
+    let expected = vec![
+        "+------------+--------------------------+",
+        "| UInt64(42) | arrow_typeof(UInt64(42)) |",
+        "+------------+--------------------------+",
+        "| 42         | UInt64                   |",
+        "+------------+--------------------------+",
+    ];
+
+    let s = exec_sql(&ctx, QUERY2).await?;
     let actual = s.lines().collect::<Vec<_>>();
 
     assert_eq!(
@@ -166,7 +210,7 @@ async fn run_and_compare_query(mut ctx: SessionContext, description: &str) -> Re
 // Run the query using the specified execution context and compare it
 // to the known result
 async fn run_and_compare_query_with_auto_schemas(
-    mut ctx: SessionContext,
+    ctx: SessionContext,
     description: &str,
 ) -> Result<()> {
     let expected = vec![
@@ -179,7 +223,7 @@ async fn run_and_compare_query_with_auto_schemas(
         "+----------+----------+",
     ];
 
-    let s = exec_sql(&mut ctx, QUERY1).await?;
+    let s = exec_sql(&ctx, QUERY1).await?;
     let actual = s.lines().collect::<Vec<_>>();
 
     assert_eq!(
@@ -208,6 +252,14 @@ async fn normal_query() -> Result<()> {
 }
 
 #[tokio::test]
+// Run the query using default planners, optimizer and custom analyzer rule
+async fn normal_query_with_analyzer() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.add_analyzer_rule(Arc::new(MyAnalyzerRule {}));
+    run_and_compare_query_with_analyzer_rule(ctx, "MyAnalyzerRule").await
+}
+
+#[tokio::test]
 // Run the query using topk optimization
 async fn topk_query() -> Result<()> {
     // Note the only difference is that the top
@@ -218,13 +270,13 @@ async fn topk_query() -> Result<()> {
 #[tokio::test]
 // Run EXPLAIN PLAN and show the plan was in fact rewritten
 async fn topk_plan() -> Result<()> {
-    let mut ctx = setup_table(make_topk_context()).await?;
+    let ctx = setup_table(make_topk_context()).await?;
 
     let mut expected = ["| logical_plan after topk                               | TopK: k=3                                                                     |",
         "|                                                       |   TableScan: sales projection=[customer_id,revenue]                                  |"].join("\n");
 
     let explain_query = format!("EXPLAIN VERBOSE {QUERY}");
-    let actual_output = exec_sql(&mut ctx, &explain_query).await?;
+    let actual_output = exec_sql(&ctx, &explain_query).await?;
 
     // normalize newlines (output on windows uses \r\n)
     let mut actual_output = actual_output.replace("\r\n", "\n");
@@ -247,10 +299,15 @@ async fn topk_plan() -> Result<()> {
 fn make_topk_context() -> SessionContext {
     let config = SessionConfig::new().with_target_partitions(48);
     let runtime = Arc::new(RuntimeEnv::default());
-    let state = SessionState::with_config_rt(config, runtime)
+    let state = SessionStateBuilder::new()
+        .with_config(config)
+        .with_runtime_env(runtime)
+        .with_default_features()
         .with_query_planner(Arc::new(TopKQueryPlanner {}))
-        .add_optimizer_rule(Arc::new(TopKOptimizerRule {}));
-    SessionContext::with_state(state)
+        .with_optimizer_rule(Arc::new(TopKOptimizerRule {}))
+        .with_analyzer_rule(Arc::new(MyAnalyzerRule {}))
+        .build();
+    SessionContext::new_with_state(state)
 }
 
 // ------ The implementation of the TopK code follows -----
@@ -280,12 +337,24 @@ impl QueryPlanner for TopKQueryPlanner {
 
 struct TopKOptimizerRule {}
 impl OptimizerRule for TopKOptimizerRule {
+    fn name(&self) -> &str {
+        "topk"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::TopDown)
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
     // Example rewrite pass to insert a user defined LogicalPlanNode
-    fn try_optimize(
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
-        config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>, DataFusionError> {
         // Note: this code simply looks for the pattern of a Limit followed by a
         // Sort and replaces it by a TopK node. It does not handle many
         // edge cases (e.g multiple sort columns, sort ASC / DESC), etc.
@@ -293,7 +362,7 @@ impl OptimizerRule for TopKOptimizerRule {
             fetch: Some(fetch),
             input,
             ..
-        }) = plan
+        }) = &plan
         {
             if let LogicalPlan::Sort(Sort {
                 ref expr,
@@ -303,12 +372,10 @@ impl OptimizerRule for TopKOptimizerRule {
             {
                 if expr.len() == 1 {
                     // we found a sort with a single sort expr, replace with a a TopK
-                    return Ok(Some(LogicalPlan::Extension(Extension {
+                    return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
                         node: Arc::new(TopKPlanNode {
                             k: *fetch,
-                            input: self
-                                .try_optimize(input.as_ref(), config)?
-                                .unwrap_or_else(|| input.as_ref().clone()),
+                            input: input.as_ref().clone(),
                             expr: expr[0].clone(),
                         }),
                     })));
@@ -316,13 +383,7 @@ impl OptimizerRule for TopKOptimizerRule {
             }
         }
 
-        // If we didn't find the Limit/Sort combination, recurse as
-        // normal and build the result.
-        optimize_children(self, plan, config)
-    }
-
-    fn name(&self) -> &str {
-        "topk"
+        Ok(Transformed::no(plan))
     }
 }
 
@@ -332,7 +393,7 @@ struct TopKPlanNode {
     input: LogicalPlan,
     /// The sort expression (this example only supports a single sort
     /// expr)
-    expr: Expr,
+    expr: SortExpr,
 }
 
 impl Debug for TopKPlanNode {
@@ -358,7 +419,7 @@ impl UserDefinedLogicalNodeCore for TopKPlanNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        vec![self.expr.clone()]
+        vec![self.expr.expr.clone()]
     }
 
     /// For example: `TopK: k=10`
@@ -366,14 +427,18 @@ impl UserDefinedLogicalNodeCore for TopKPlanNode {
         write!(f, "TopK: k={}", self.k)
     }
 
-    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+    fn with_exprs_and_inputs(
+        &self,
+        mut exprs: Vec<Expr>,
+        mut inputs: Vec<LogicalPlan>,
+    ) -> Result<Self> {
         assert_eq!(inputs.len(), 1, "input size inconsistent");
         assert_eq!(exprs.len(), 1, "expression size inconsistent");
-        Self {
+        Ok(Self {
             k: self.k,
-            input: inputs[0].clone(),
-            expr: exprs[0].clone(),
-        }
+            input: inputs.swap_remove(0),
+            expr: replace_sort_expression(self.expr.clone(), exprs.swap_remove(0)),
+        })
     }
 }
 
@@ -396,10 +461,10 @@ impl ExtensionPlanner for TopKPlanner {
                 assert_eq!(logical_inputs.len(), 1, "Inconsistent number of inputs");
                 assert_eq!(physical_inputs.len(), 1, "Inconsistent number of inputs");
                 // figure out input name
-                Some(Arc::new(TopKExec {
-                    input: physical_inputs[0].clone(),
-                    k: topk_node.k,
-                }))
+                Some(Arc::new(TopKExec::new(
+                    physical_inputs[0].clone(),
+                    topk_node.k,
+                )))
             } else {
                 None
             },
@@ -413,6 +478,25 @@ struct TopKExec {
     input: Arc<dyn ExecutionPlan>,
     /// The maxium number of values
     k: usize,
+    cache: PlanProperties,
+}
+
+impl TopKExec {
+    fn new(input: Arc<dyn ExecutionPlan>, k: usize) -> Self {
+        let cache = Self::compute_properties(input.schema());
+        Self { input, k, cache }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        )
+    }
 }
 
 impl Debug for TopKExec {
@@ -437,39 +521,32 @@ impl DisplayAs for TopKExec {
 
 #[async_trait]
 impl ExecutionPlan for TopKExec {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     /// Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.input.schema()
-    }
-
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(TopKExec {
-            input: children[0].clone(),
-            k: self.k,
-        }))
+        Ok(Arc::new(TopKExec::new(children[0].clone(), self.k)))
     }
 
     /// Execute one partition and return an iterator over RecordBatch
@@ -490,10 +567,10 @@ impl ExecutionPlan for TopKExec {
         }))
     }
 
-    fn statistics(&self) -> Statistics {
+    fn statistics(&self) -> Result<Statistics> {
         // to improve the optimizability of this plan
         // better statistics inference could be provided
-        Statistics::default()
+        Ok(Statistics::new_unknown(&self.schema()))
     }
 }
 
@@ -606,5 +683,54 @@ impl Stream for TopKReader {
 impl RecordBatchStream for TopKReader {
     fn schema(&self) -> SchemaRef {
         self.input.schema()
+    }
+}
+
+struct MyAnalyzerRule {}
+
+impl AnalyzerRule for MyAnalyzerRule {
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        Self::analyze_plan(plan)
+    }
+
+    fn name(&self) -> &str {
+        "my_analyzer_rule"
+    }
+}
+
+impl MyAnalyzerRule {
+    fn analyze_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
+        plan.transform(|plan| {
+            Ok(match plan {
+                LogicalPlan::Projection(projection) => {
+                    let expr = Self::analyze_expr(projection.expr.clone())?;
+                    Transformed::yes(LogicalPlan::Projection(Projection::try_new(
+                        expr,
+                        projection.input,
+                    )?))
+                }
+                _ => Transformed::no(plan),
+            })
+        })
+        .data()
+    }
+
+    fn analyze_expr(expr: Vec<Expr>) -> Result<Vec<Expr>> {
+        expr.into_iter()
+            .map(|e| {
+                e.transform(|e| {
+                    Ok(match e {
+                        Expr::Literal(ScalarValue::Int64(i)) => {
+                            // transform to UInt64
+                            Transformed::yes(Expr::Literal(ScalarValue::UInt64(
+                                i.map(|i| i as u64),
+                            )))
+                        }
+                        _ => Transformed::no(e),
+                    })
+                })
+                .data()
+            })
+            .collect()
     }
 }

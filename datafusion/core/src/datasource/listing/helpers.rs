@@ -17,31 +17,32 @@
 
 //! Helper functions for the table implementation
 
+use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
-use arrow::compute::{and, cast, prep_null_mask_filter};
+use super::ListingTableUrl;
+use super::PartitionedFile;
+use crate::execution::context::SessionState;
+use datafusion_common::{Result, ScalarValue};
+use datafusion_expr::{BinaryExpr, Operator};
+
 use arrow::{
-    array::{ArrayRef, StringBuilder},
+    array::{Array, ArrayRef, AsArray, StringBuilder},
+    compute::{and, cast, prep_null_mask_filter},
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use arrow_array::cast::AsArray;
-use arrow_array::Array;
 use arrow_schema::Fields;
+use datafusion_expr::execution_props::ExecutionProps;
 use futures::stream::FuturesUnordered;
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use log::{debug, trace};
 
-use crate::{error::Result, scalar::ScalarValue};
-
-use super::PartitionedFile;
-use crate::datasource::listing::ListingTableUrl;
-use datafusion_common::tree_node::{TreeNode, VisitRecursion};
-use datafusion_common::{Column, DFField, DFSchema, DataFusionError};
-use datafusion_expr::expr::ScalarUDF;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::{Column, DFSchema, DataFusionError};
 use datafusion_expr::{Expr, Volatility};
 use datafusion_physical_expr::create_physical_expr;
-use datafusion_physical_expr::execution_props::ExecutionProps;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
 
@@ -49,17 +50,17 @@ use object_store::{ObjectMeta, ObjectStore};
 /// This means that if this function returns true:
 /// - the table provider can filter the table partition values with this expression
 /// - the expression can be marked as `TableProviderFilterPushDown::Exact` once this filtering
-/// was performed
-pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
+///   was performed
+pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
     let mut is_applicable = true;
-    expr.apply(&mut |expr| {
-        Ok(match expr {
+    expr.apply(|expr| {
+        match expr {
             Expr::Column(Column { ref name, .. }) => {
-                is_applicable &= col_names.contains(name);
+                is_applicable &= col_names.contains(&name.as_str());
                 if is_applicable {
-                    VisitRecursion::Skip
+                    Ok(TreeNodeRecursion::Jump)
                 } else {
-                    VisitRecursion::Stop
+                    Ok(TreeNodeRecursion::Stop)
                 }
             }
             Expr::Literal(_)
@@ -86,46 +87,33 @@ pub fn expr_applicable_for_cols(col_names: &[String], expr: &Expr) -> bool {
             | Expr::Exists { .. }
             | Expr::InSubquery(_)
             | Expr::ScalarSubquery(_)
-            | Expr::GetIndexedField { .. }
             | Expr::GroupingSet(_)
-            | Expr::Case { .. } => VisitRecursion::Continue,
+            | Expr::Case { .. } => Ok(TreeNodeRecursion::Continue),
 
             Expr::ScalarFunction(scalar_function) => {
-                match scalar_function.fun.volatility() {
-                    Volatility::Immutable => VisitRecursion::Continue,
+                match scalar_function.func.signature().volatility {
+                    Volatility::Immutable => Ok(TreeNodeRecursion::Continue),
                     // TODO: Stable functions could be `applicable`, but that would require access to the context
                     Volatility::Stable | Volatility::Volatile => {
                         is_applicable = false;
-                        VisitRecursion::Stop
-                    }
-                }
-            }
-            Expr::ScalarUDF(ScalarUDF { fun, .. }) => {
-                match fun.signature.volatility {
-                    Volatility::Immutable => VisitRecursion::Continue,
-                    // TODO: Stable functions could be `applicable`, but that would require access to the context
-                    Volatility::Stable | Volatility::Volatile => {
-                        is_applicable = false;
-                        VisitRecursion::Stop
+                        Ok(TreeNodeRecursion::Stop)
                     }
                 }
             }
 
             // TODO other expressions are not handled yet:
-            // - AGGREGATE, WINDOW and SORT should not end up in filter conditions, except maybe in some edge cases
+            // - AGGREGATE and WINDOW should not end up in filter conditions, except maybe in some edge cases
             // - Can `Wildcard` be considered as a `Literal`?
             // - ScalarVariable could be `applicable`, but that would require access to the context
-            Expr::AggregateUDF { .. }
-            | Expr::AggregateFunction { .. }
-            | Expr::Sort { .. }
+            Expr::AggregateFunction { .. }
             | Expr::WindowFunction { .. }
-            | Expr::Wildcard
-            | Expr::QualifiedWildcard { .. }
+            | Expr::Wildcard { .. }
+            | Expr::Unnest { .. }
             | Expr::Placeholder(_) => {
                 is_applicable = false;
-                VisitRecursion::Stop
+                Ok(TreeNodeRecursion::Stop)
             }
-        })
+        }
     })
     .unwrap();
     is_applicable
@@ -136,18 +124,36 @@ const CONCURRENCY_LIMIT: usize = 100;
 
 /// Partition the list of files into `n` groups
 pub fn split_files(
-    partitioned_files: Vec<PartitionedFile>,
+    mut partitioned_files: Vec<PartitionedFile>,
     n: usize,
 ) -> Vec<Vec<PartitionedFile>> {
     if partitioned_files.is_empty() {
         return vec![];
     }
+
+    // ObjectStore::list does not guarantee any consistent order and for some
+    // implementations such as LocalFileSystem, it may be inconsistent. Thus
+    // Sort files by path to ensure consistent plans when run more than once.
+    partitioned_files.sort_by(|a, b| a.path().cmp(b.path()));
+
     // effectively this is div with rounding up instead of truncating
     let chunk_size = (partitioned_files.len() + n - 1) / n;
-    partitioned_files
-        .chunks(chunk_size)
-        .map(|c| c.to_vec())
-        .collect()
+    let mut chunks = Vec::with_capacity(n);
+    let mut current_chunk = Vec::with_capacity(chunk_size);
+    for file in partitioned_files.drain(..) {
+        current_chunk.push(file);
+        if current_chunk.len() == chunk_size {
+            let full_chunk =
+                mem::replace(&mut current_chunk, Vec::with_capacity(chunk_size));
+            chunks.push(full_chunk);
+        }
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk)
+    }
+
+    chunks
 }
 
 struct Partition {
@@ -177,9 +183,17 @@ async fn list_partitions(
     store: &dyn ObjectStore,
     table_path: &ListingTableUrl,
     max_depth: usize,
+    partition_prefix: Option<Path>,
 ) -> Result<Vec<Partition>> {
     let partition = Partition {
-        path: table_path.prefix().clone(),
+        path: match partition_prefix {
+            Some(prefix) => Path::from_iter(
+                Path::from(table_path.prefix().as_ref())
+                    .parts()
+                    .chain(Path::from(prefix.as_ref()).parts()),
+            ),
+            None => table_path.prefix().clone(),
+        },
         depth: 0,
         files: None,
     };
@@ -259,23 +273,26 @@ async fn prune_partitions(
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
-    let df_schema = DFSchema::new_with_metadata(
+    let df_schema = DFSchema::from_unqualified_fields(
         partition_cols
             .iter()
-            .map(|(n, d)| DFField::new_unqualified(n, d.clone(), true))
+            .map(|(n, d)| Field::new(n, d.clone(), true))
             .collect(),
         Default::default(),
     )?;
 
-    let batch = RecordBatch::try_new(schema.clone(), arrays)?;
+    let batch = RecordBatch::try_new(schema, arrays)?;
 
     // TODO: Plumb this down
     let props = ExecutionProps::new();
 
     // Applies `filter` to `batch` returning `None` on error
     let do_filter = |filter| -> Option<ArrayRef> {
-        let expr = create_physical_expr(filter, &df_schema, &schema, &props).ok()?;
-        Some(expr.evaluate(&batch).ok()?.into_array(partitions.len()))
+        let expr = create_physical_expr(filter, &df_schema, &props).ok()?;
+        expr.evaluate(&batch)
+            .ok()?
+            .into_array(partitions.len())
+            .ok()
     };
 
     //.Compute the conjunction of the filters, ignoring errors
@@ -310,11 +327,86 @@ async fn prune_partitions(
     Ok(filtered)
 }
 
+#[derive(Debug)]
+enum PartitionValue {
+    Single(String),
+    Multi,
+}
+
+fn populate_partition_values<'a>(
+    partition_values: &mut HashMap<&'a str, PartitionValue>,
+    filter: &'a Expr,
+) {
+    if let Expr::BinaryExpr(BinaryExpr {
+        ref left,
+        op,
+        ref right,
+    }) = filter
+    {
+        match op {
+            Operator::Eq => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(Column { ref name, .. }), Expr::Literal(val))
+                | (Expr::Literal(val), Expr::Column(Column { ref name, .. })) => {
+                    if partition_values
+                        .insert(name, PartitionValue::Single(val.to_string()))
+                        .is_some()
+                    {
+                        partition_values.insert(name, PartitionValue::Multi);
+                    }
+                }
+                _ => {}
+            },
+            Operator::And => {
+                populate_partition_values(partition_values, left);
+                populate_partition_values(partition_values, right);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn evaluate_partition_prefix<'a>(
+    partition_cols: &'a [(String, DataType)],
+    filters: &'a [Expr],
+) -> Option<Path> {
+    let mut partition_values = HashMap::new();
+    for filter in filters {
+        populate_partition_values(&mut partition_values, filter);
+    }
+
+    if partition_values.is_empty() {
+        return None;
+    }
+
+    let mut parts = vec![];
+    for (p, _) in partition_cols {
+        match partition_values.get(p.as_str()) {
+            Some(PartitionValue::Single(val)) => {
+                // if a partition only has a single literal value, then it can be added to the
+                // prefix
+                parts.push(format!("{p}={val}"));
+            }
+            _ => {
+                // break on the first unconstrainted partition to create a common prefix
+                // for all covered partitions.
+                break;
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(Path::from_iter(parts))
+    }
+}
+
 /// Discover the partitions on the given path and prune out files
 /// that belong to irrelevant partitions using `filters` expressions.
 /// `filters` might contain expressions that can be resolved only at the
 /// file level (e.g. Parquet row group pruning).
 pub async fn pruned_partition_list<'a>(
+    ctx: &'a SessionState,
     store: &'a dyn ObjectStore,
     table_path: &'a ListingTableUrl,
     filters: &'a [Expr],
@@ -325,12 +417,16 @@ pub async fn pruned_partition_list<'a>(
     if partition_cols.is_empty() {
         return Ok(Box::pin(
             table_path
-                .list_all_files(store, file_extension)
+                .list_all_files(ctx, store, file_extension)
+                .await?
                 .map_ok(|object_meta| object_meta.into()),
         ));
     }
 
-    let partitions = list_partitions(store, table_path, partition_cols.len()).await?;
+    let partition_prefix = evaluate_partition_prefix(partition_cols, filters);
+    let partitions =
+        list_partitions(store, table_path, partition_cols.len(), partition_prefix)
+            .await?;
     debug!("Listed {} partitions", partitions.len());
 
     let pruned =
@@ -356,14 +452,13 @@ pub async fn pruned_partition_list<'a>(
                 Some(files) => files,
                 None => {
                     trace!("Recursively listing partition {}", partition.path);
-                    let s = store.list(Some(&partition.path)).await?;
-                    s.try_collect().await?
+                    store.list(Some(&partition.path)).try_collect().await?
                 }
             };
-
             let files = files.into_iter().filter(move |o| {
                 let extension_match = o.location.as_ref().ends_with(file_extension);
-                let glob_match = table_path.contains(&o.location);
+                // here need to scan subdirectories(`listing_table_ignore_subdirectory` = false)
+                let glob_match = table_path.contains(&o.location, false);
                 extension_match && glob_match
             });
 
@@ -372,6 +467,7 @@ pub async fn pruned_partition_list<'a>(
                     object_meta,
                     partition_values: partition_values.clone(),
                     range: None,
+                    statistics: None,
                     extensions: None,
                 })
             }));
@@ -421,8 +517,8 @@ mod tests {
 
     use futures::StreamExt;
 
-    use crate::logical_expr::{case, col, lit};
-    use crate::test::object_store::make_test_store;
+    use crate::test::object_store::make_test_store_and_state;
+    use datafusion_expr::{case, col, lit, Expr};
 
     use super::*;
 
@@ -468,12 +564,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_pruned_partition_list_empty() {
-        let store = make_test_store(&[
+        let (store, state) = make_test_store_and_state(&[
             ("tablepath/mypartition=val1/notparquetfile", 100),
             ("tablepath/file.parquet", 100),
         ]);
         let filter = Expr::eq(col("mypartition"), lit("val1"));
         let pruned = pruned_partition_list(
+            &state,
             store.as_ref(),
             &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter],
@@ -490,13 +587,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_pruned_partition_list() {
-        let store = make_test_store(&[
+        let (store, state) = make_test_store_and_state(&[
             ("tablepath/mypartition=val1/file.parquet", 100),
             ("tablepath/mypartition=val2/file.parquet", 100),
             ("tablepath/mypartition=val1/other=val3/file.parquet", 100),
         ]);
         let filter = Expr::eq(col("mypartition"), lit("val1"));
         let pruned = pruned_partition_list(
+            &state,
             store.as_ref(),
             &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter],
@@ -515,24 +613,18 @@ mod tests {
             f1.object_meta.location.as_ref(),
             "tablepath/mypartition=val1/file.parquet"
         );
-        assert_eq!(
-            &f1.partition_values,
-            &[ScalarValue::Utf8(Some(String::from("val1"))),]
-        );
+        assert_eq!(&f1.partition_values, &[ScalarValue::from("val1")]);
         let f2 = &pruned[1];
         assert_eq!(
             f2.object_meta.location.as_ref(),
             "tablepath/mypartition=val1/other=val3/file.parquet"
         );
-        assert_eq!(
-            f2.partition_values,
-            &[ScalarValue::Utf8(Some(String::from("val1"))),]
-        );
+        assert_eq!(f2.partition_values, &[ScalarValue::from("val1"),]);
     }
 
     #[tokio::test]
     async fn test_pruned_partition_list_multi() {
-        let store = make_test_store(&[
+        let (store, state) = make_test_store_and_state(&[
             ("tablepath/part1=p1v1/file.parquet", 100),
             ("tablepath/part1=p1v2/part2=p2v1/file1.parquet", 100),
             ("tablepath/part1=p1v2/part2=p2v1/file2.parquet", 100),
@@ -544,6 +636,7 @@ mod tests {
         // filter3 cannot be resolved at partition pruning
         let filter3 = Expr::eq(col("part2"), col("other"));
         let pruned = pruned_partition_list(
+            &state,
             store.as_ref(),
             &ListingTableUrl::parse("file:///tablepath/").unwrap(),
             &[filter1, filter2, filter3],
@@ -567,10 +660,7 @@ mod tests {
         );
         assert_eq!(
             &f1.partition_values,
-            &[
-                ScalarValue::Utf8(Some(String::from("p1v2"))),
-                ScalarValue::Utf8(Some(String::from("p2v1")))
-            ]
+            &[ScalarValue::from("p1v2"), ScalarValue::from("p2v1"),]
         );
         let f2 = &pruned[1];
         assert_eq!(
@@ -579,10 +669,7 @@ mod tests {
         );
         assert_eq!(
             &f2.partition_values,
-            &[
-                ScalarValue::Utf8(Some(String::from("p1v2"))),
-                ScalarValue::Utf8(Some(String::from("p2v1")))
-            ]
+            &[ScalarValue::from("p1v2"), ScalarValue::from("p2v1")]
         );
     }
 
@@ -658,35 +745,145 @@ mod tests {
     #[test]
     fn test_expr_applicable_for_cols() {
         assert!(expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c1"), lit("value"))
         ));
         assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c2"), lit("value"))
         ));
         assert!(!expr_applicable_for_cols(
-            &[String::from("c1")],
+            &["c1"],
             &Expr::eq(col("c1"), col("c2"))
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &Expr::eq(col("c1"), col("c2"))
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &(Expr::eq(col("c1"), col("c2").alias("c2_alias"))).not()
         ));
         assert!(expr_applicable_for_cols(
-            &[String::from("c1"), String::from("c2")],
+            &["c1", "c2"],
             &(case(col("c1"))
                 .when(lit("v1"), lit(true))
                 .otherwise(lit(false))
                 .expect("valid case expr"))
         ));
-        // static expression not relvant in this context but we
+        // static expression not relevant in this context but we
         // test it as an edge case anyway in case we want to generalize
         // this helper function
         assert!(expr_applicable_for_cols(&[], &lit(true)));
+    }
+
+    #[test]
+    fn test_evaluate_partition_prefix() {
+        let partitions = &[
+            ("a".to_string(), DataType::Utf8),
+            ("b".to_string(), DataType::Int16),
+            ("c".to_string(), DataType::Boolean),
+        ];
+
+        assert_eq!(
+            evaluate_partition_prefix(partitions, &[col("a").eq(lit("foo"))]),
+            Some(Path::from("a=foo")),
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(partitions, &[lit("foo").eq(col("a"))]),
+            Some(Path::from("a=foo")),
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(lit("foo")).and(col("b").eq(lit("bar")))],
+            ),
+            Some(Path::from("a=foo/b=bar")),
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                // list of filters should be evaluated as AND
+                &[col("a").eq(lit("foo")), col("b").eq(lit("bar")),],
+            ),
+            Some(Path::from("a=foo/b=bar")),
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a")
+                    .eq(lit("foo"))
+                    .and(col("b").eq(lit("1")))
+                    .and(col("c").eq(lit("true")))],
+            ),
+            Some(Path::from("a=foo/b=1/c=true")),
+        );
+
+        // no prefix when filter is empty
+        assert_eq!(evaluate_partition_prefix(partitions, &[]), None);
+
+        // b=foo results in no prefix because a is not restricted
+        assert_eq!(
+            evaluate_partition_prefix(partitions, &[Expr::eq(col("b"), lit("foo"))]),
+            None,
+        );
+
+        // a=foo and c=baz only results in preifx a=foo because b is not restricted
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(lit("foo")).and(col("c").eq(lit("baz")))],
+            ),
+            Some(Path::from("a=foo")),
+        );
+
+        // partition with multiple values results in no prefix
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[Expr::and(col("a").eq(lit("foo")), col("a").eq(lit("bar")))],
+            ),
+            None,
+        );
+
+        // no prefix because partition a is not restricted to a single literal
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[Expr::or(col("a").eq(lit("foo")), col("a").eq(lit("bar")))],
+            ),
+            None,
+        );
+        assert_eq!(
+            evaluate_partition_prefix(partitions, &[col("b").lt(lit(5))],),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_evaluate_date_partition_prefix() {
+        let partitions = &[("a".to_string(), DataType::Date32)];
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(Expr::Literal(ScalarValue::Date32(Some(3))))],
+            ),
+            Some(Path::from("a=1970-01-04")),
+        );
+
+        let partitions = &[("a".to_string(), DataType::Date64)];
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(Expr::Literal(ScalarValue::Date64(Some(
+                    4 * 24 * 60 * 60 * 1000
+                )))),],
+            ),
+            Some(Path::from("a=1970-01-05")),
+        );
     }
 }

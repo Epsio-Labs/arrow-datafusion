@@ -19,26 +19,28 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Schema, SchemaRef};
-use async_trait::async_trait;
-use datafusion_common::{plan_err, DataFusionError};
-
 use crate::datasource::file_format::arrow::ArrowFormat;
+use crate::datasource::file_format::file_compression_type::FileCompressionType;
+#[cfg(feature = "parquet")]
+use crate::datasource::file_format::parquet::ParquetFormat;
 use crate::datasource::file_format::DEFAULT_SCHEMA_INFER_MAX_RECORD;
-use crate::datasource::listing::{ListingTableInsertMode, ListingTableUrl};
+use crate::datasource::listing::ListingTableUrl;
 use crate::datasource::{
-    file_format::{
-        avro::AvroFormat, csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat,
-    },
+    file_format::{avro::AvroFormat, csv::CsvFormat, json::JsonFormat},
     listing::ListingOptions,
 };
 use crate::error::Result;
 use crate::execution::context::{SessionConfig, SessionState};
-use crate::logical_expr::Expr;
+
+use arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion_common::config::TableOptions;
 use datafusion_common::{
-    FileCompressionType, DEFAULT_ARROW_EXTENSION, DEFAULT_AVRO_EXTENSION,
-    DEFAULT_CSV_EXTENSION, DEFAULT_JSON_EXTENSION, DEFAULT_PARQUET_EXTENSION,
+    DEFAULT_ARROW_EXTENSION, DEFAULT_AVRO_EXTENSION, DEFAULT_CSV_EXTENSION,
+    DEFAULT_JSON_EXTENSION, DEFAULT_PARQUET_EXTENSION,
 };
+
+use async_trait::async_trait;
+use datafusion_expr::SortExpr;
 
 /// Options that control the reading of CSV files.
 ///
@@ -57,8 +59,20 @@ pub struct CsvReadOptions<'a> {
     pub delimiter: u8,
     /// An optional quote character. Defaults to `b'"'`.
     pub quote: u8,
+    /// An optional terminator character. Defaults to None (CRLF).
+    pub terminator: Option<u8>,
     /// An optional escape character. Defaults to None.
     pub escape: Option<u8>,
+    /// If enabled, lines beginning with this byte are ignored.
+    pub comment: Option<u8>,
+    /// Specifies whether newlines in (quoted) values are supported.
+    ///
+    /// Parsing newlines in quoted values may be affected by execution behaviour such as
+    /// parallel file scanning. Setting this to `true` ensures that newlines in values are
+    /// parsed successfully, which may reduce performance.
+    ///
+    /// The default behaviour depends on the `datafusion.catalog.newlines_in_values` setting.
+    pub newlines_in_values: bool,
     /// An optional schema representing the CSV files. If None, CSV reader will try to infer it
     /// based on data in file.
     pub schema: Option<&'a Schema>,
@@ -71,12 +85,8 @@ pub struct CsvReadOptions<'a> {
     pub table_partition_cols: Vec<(String, DataType)>,
     /// File compression type
     pub file_compression_type: FileCompressionType,
-    /// Flag indicating whether this file may be unbounded (as in a FIFO file).
-    pub infinite: bool,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
-    /// Setting controls how inserts to this file should be handled
-    pub insert_mode: ListingTableInsertMode,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for CsvReadOptions<'a> {
@@ -94,13 +104,14 @@ impl<'a> CsvReadOptions<'a> {
             schema_infer_max_records: DEFAULT_SCHEMA_INFER_MAX_RECORD,
             delimiter: b',',
             quote: b'"',
+            terminator: None,
             escape: None,
+            newlines_in_values: false,
             file_extension: DEFAULT_CSV_EXTENSION,
             table_partition_cols: vec![],
             file_compression_type: FileCompressionType::UNCOMPRESSED,
-            infinite: false,
             file_sort_order: vec![],
-            insert_mode: ListingTableInsertMode::AppendToFile,
+            comment: None,
         }
     }
 
@@ -110,9 +121,9 @@ impl<'a> CsvReadOptions<'a> {
         self
     }
 
-    /// Configure mark_infinite setting
-    pub fn mark_infinite(mut self, infinite: bool) -> Self {
-        self.infinite = infinite;
+    /// Specify comment char to use for CSV read
+    pub fn comment(mut self, comment: u8) -> Self {
+        self.comment = Some(comment);
         self
     }
 
@@ -128,9 +139,27 @@ impl<'a> CsvReadOptions<'a> {
         self
     }
 
+    /// Specify terminator to use for CSV read
+    pub fn terminator(mut self, terminator: Option<u8>) -> Self {
+        self.terminator = terminator;
+        self
+    }
+
     /// Specify delimiter to use for CSV read
     pub fn escape(mut self, escape: u8) -> Self {
         self.escape = Some(escape);
+        self
+    }
+
+    /// Specifies whether newlines in (quoted) values are supported.
+    ///
+    /// Parsing newlines in quoted values may be affected by execution behaviour such as
+    /// parallel file scanning. Setting this to `true` ensures that newlines in values are
+    /// parsed successfully, which may reduce performance.
+    ///
+    /// The default behaviour depends on the `datafusion.catalog.newlines_in_values` setting.
+    pub fn newlines_in_values(mut self, newlines_in_values: bool) -> Self {
+        self.newlines_in_values = newlines_in_values;
         self
     }
 
@@ -179,14 +208,8 @@ impl<'a> CsvReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
-        self
-    }
-
-    /// Configure how insertions to this table should be handled
-    pub fn insert_mode(mut self, insert_mode: ListingTableInsertMode) -> Self {
-        self.insert_mode = insert_mode;
         self
     }
 }
@@ -217,9 +240,7 @@ pub struct ParquetReadOptions<'a> {
     /// based on data in file.
     pub schema: Option<&'a Schema>,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
-    /// Setting controls how inserts to this file should be handled
-    pub insert_mode: ListingTableInsertMode,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for ParquetReadOptions<'a> {
@@ -231,7 +252,6 @@ impl<'a> Default for ParquetReadOptions<'a> {
             skip_metadata: None,
             schema: None,
             file_sort_order: vec![],
-            insert_mode: ListingTableInsertMode::AppendNewFiles,
         }
     }
 }
@@ -267,14 +287,8 @@ impl<'a> ParquetReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
-        self
-    }
-
-    /// Configure how insertions to this table should be handled
-    pub fn insert_mode(mut self, insert_mode: ListingTableInsertMode) -> Self {
-        self.insert_mode = insert_mode;
         self
     }
 }
@@ -341,8 +355,6 @@ pub struct AvroReadOptions<'a> {
     pub file_extension: &'a str,
     /// Partition Columns
     pub table_partition_cols: Vec<(String, DataType)>,
-    /// Flag indicating whether this file may be unbounded (as in a FIFO file).
-    pub infinite: bool,
 }
 
 impl<'a> Default for AvroReadOptions<'a> {
@@ -351,7 +363,6 @@ impl<'a> Default for AvroReadOptions<'a> {
             schema: None,
             file_extension: DEFAULT_AVRO_EXTENSION,
             table_partition_cols: vec![],
-            infinite: false,
         }
     }
 }
@@ -363,12 +374,6 @@ impl<'a> AvroReadOptions<'a> {
         table_partition_cols: Vec<(String, DataType)>,
     ) -> Self {
         self.table_partition_cols = table_partition_cols;
-        self
-    }
-
-    /// Configure mark_infinite setting
-    pub fn mark_infinite(mut self, infinite: bool) -> Self {
-        self.infinite = infinite;
         self
     }
 
@@ -401,9 +406,7 @@ pub struct NdJsonReadOptions<'a> {
     /// Flag indicating whether this file may be unbounded (as in a FIFO file).
     pub infinite: bool,
     /// Indicates how the file is sorted
-    pub file_sort_order: Vec<Vec<Expr>>,
-    /// Setting controls how inserts to this file should be handled
-    pub insert_mode: ListingTableInsertMode,
+    pub file_sort_order: Vec<Vec<SortExpr>>,
 }
 
 impl<'a> Default for NdJsonReadOptions<'a> {
@@ -416,7 +419,6 @@ impl<'a> Default for NdJsonReadOptions<'a> {
             file_compression_type: FileCompressionType::UNCOMPRESSED,
             infinite: false,
             file_sort_order: vec![],
-            insert_mode: ListingTableInsertMode::AppendToFile,
         }
     }
 }
@@ -459,14 +461,8 @@ impl<'a> NdJsonReadOptions<'a> {
     }
 
     /// Configure if file has known sort order
-    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<Expr>>) -> Self {
+    pub fn file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
-        self
-    }
-
-    /// Configure how insertions to this table should be handled
-    pub fn insert_mode(mut self, insert_mode: ListingTableInsertMode) -> Self {
-        self.insert_mode = insert_mode;
         self
     }
 }
@@ -475,7 +471,11 @@ impl<'a> NdJsonReadOptions<'a> {
 /// ['ReadOptions'] is implemented by Options like ['CsvReadOptions'] that control the reading of respective files/sources.
 pub trait ReadOptions<'a> {
     /// Helper to convert these user facing options to `ListingTable` options
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions;
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        table_options: TableOptions,
+    ) -> ListingOptions;
 
     /// Infer and resolve the schema from the files/sources provided.
     async fn get_resolved_schema(
@@ -492,33 +492,37 @@ pub trait ReadOptions<'a> {
         state: SessionState,
         table_path: ListingTableUrl,
         schema: Option<&'a Schema>,
-        infinite: bool,
     ) -> Result<SchemaRef>
     where
         'a: 'async_trait,
     {
-        match (schema, infinite) {
-            (Some(s), _) => Ok(Arc::new(s.to_owned())),
-            (None, false) => Ok(self
-                .to_listing_options(config)
-                .infer_schema(&state, &table_path)
-                .await?),
-            (None, true) => {
-                plan_err!("Schema inference for infinite data sources is not supported.")
-            }
+        if let Some(s) = schema {
+            return Ok(Arc::new(s.to_owned()));
         }
+
+        self.to_listing_options(config, state.default_table_options())
+            .infer_schema(&state, &table_path)
+            .await
     }
 }
 
 #[async_trait]
 impl ReadOptions<'_> for CsvReadOptions<'_> {
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions {
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        table_options: TableOptions,
+    ) -> ListingOptions {
         let file_format = CsvFormat::default()
+            .with_options(table_options.csv)
             .with_has_header(self.has_header)
+            .with_comment(self.comment)
             .with_delimiter(self.delimiter)
             .with_quote(self.quote)
             .with_escape(self.escape)
-            .with_schema_infer_max_rec(Some(self.schema_infer_max_records))
+            .with_terminator(self.terminator)
+            .with_newlines_in_values(self.newlines_in_values)
+            .with_schema_infer_max_rec(self.schema_infer_max_records)
             .with_file_compression_type(self.file_compression_type.to_owned());
 
         ListingOptions::new(Arc::new(file_format))
@@ -526,8 +530,6 @@ impl ReadOptions<'_> for CsvReadOptions<'_> {
             .with_target_partitions(config.target_partitions())
             .with_table_partition_cols(self.table_partition_cols.clone())
             .with_file_sort_order(self.file_sort_order.clone())
-            .with_infinite_source(self.infinite)
-            .with_insert_mode(self.insert_mode.clone())
     }
 
     async fn get_resolved_schema(
@@ -536,24 +538,33 @@ impl ReadOptions<'_> for CsvReadOptions<'_> {
         state: SessionState,
         table_path: ListingTableUrl,
     ) -> Result<SchemaRef> {
-        self._get_resolved_schema(config, state, table_path, self.schema, self.infinite)
+        self._get_resolved_schema(config, state, table_path, self.schema)
             .await
     }
 }
 
+#[cfg(feature = "parquet")]
 #[async_trait]
 impl ReadOptions<'_> for ParquetReadOptions<'_> {
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions {
-        let file_format = ParquetFormat::new()
-            .with_enable_pruning(self.parquet_pruning)
-            .with_skip_metadata(self.skip_metadata);
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        table_options: TableOptions,
+    ) -> ListingOptions {
+        let mut file_format = ParquetFormat::new().with_options(table_options.parquet);
+
+        if let Some(parquet_pruning) = self.parquet_pruning {
+            file_format = file_format.with_enable_pruning(parquet_pruning)
+        }
+        if let Some(skip_metadata) = self.skip_metadata {
+            file_format = file_format.with_skip_metadata(skip_metadata)
+        }
 
         ListingOptions::new(Arc::new(file_format))
             .with_file_extension(self.file_extension)
             .with_target_partitions(config.target_partitions())
             .with_table_partition_cols(self.table_partition_cols.clone())
             .with_file_sort_order(self.file_sort_order.clone())
-            .with_insert_mode(self.insert_mode.clone())
     }
 
     async fn get_resolved_schema(
@@ -562,25 +573,28 @@ impl ReadOptions<'_> for ParquetReadOptions<'_> {
         state: SessionState,
         table_path: ListingTableUrl,
     ) -> Result<SchemaRef> {
-        self._get_resolved_schema(config, state, table_path, self.schema, false)
+        self._get_resolved_schema(config, state, table_path, self.schema)
             .await
     }
 }
 
 #[async_trait]
 impl ReadOptions<'_> for NdJsonReadOptions<'_> {
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions {
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        table_options: TableOptions,
+    ) -> ListingOptions {
         let file_format = JsonFormat::default()
-            .with_schema_infer_max_rec(Some(self.schema_infer_max_records))
+            .with_options(table_options.json)
+            .with_schema_infer_max_rec(self.schema_infer_max_records)
             .with_file_compression_type(self.file_compression_type.to_owned());
 
         ListingOptions::new(Arc::new(file_format))
             .with_file_extension(self.file_extension)
             .with_target_partitions(config.target_partitions())
             .with_table_partition_cols(self.table_partition_cols.clone())
-            .with_infinite_source(self.infinite)
             .with_file_sort_order(self.file_sort_order.clone())
-            .with_insert_mode(self.insert_mode.clone())
     }
 
     async fn get_resolved_schema(
@@ -589,21 +603,24 @@ impl ReadOptions<'_> for NdJsonReadOptions<'_> {
         state: SessionState,
         table_path: ListingTableUrl,
     ) -> Result<SchemaRef> {
-        self._get_resolved_schema(config, state, table_path, self.schema, self.infinite)
+        self._get_resolved_schema(config, state, table_path, self.schema)
             .await
     }
 }
 
 #[async_trait]
 impl ReadOptions<'_> for AvroReadOptions<'_> {
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions {
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        _table_options: TableOptions,
+    ) -> ListingOptions {
         let file_format = AvroFormat;
 
         ListingOptions::new(Arc::new(file_format))
             .with_file_extension(self.file_extension)
             .with_target_partitions(config.target_partitions())
             .with_table_partition_cols(self.table_partition_cols.clone())
-            .with_infinite_source(self.infinite)
     }
 
     async fn get_resolved_schema(
@@ -612,14 +629,18 @@ impl ReadOptions<'_> for AvroReadOptions<'_> {
         state: SessionState,
         table_path: ListingTableUrl,
     ) -> Result<SchemaRef> {
-        self._get_resolved_schema(config, state, table_path, self.schema, self.infinite)
+        self._get_resolved_schema(config, state, table_path, self.schema)
             .await
     }
 }
 
 #[async_trait]
 impl ReadOptions<'_> for ArrowReadOptions<'_> {
-    fn to_listing_options(&self, config: &SessionConfig) -> ListingOptions {
+    fn to_listing_options(
+        &self,
+        config: &SessionConfig,
+        _table_options: TableOptions,
+    ) -> ListingOptions {
         let file_format = ArrowFormat;
 
         ListingOptions::new(Arc::new(file_format))
@@ -634,7 +655,7 @@ impl ReadOptions<'_> for ArrowReadOptions<'_> {
         state: SessionState,
         table_path: ListingTableUrl,
     ) -> Result<SchemaRef> {
-        self._get_resolved_schema(config, state, table_path, self.schema, false)
+        self._get_resolved_schema(config, state, table_path, self.schema)
             .await
     }
 }

@@ -43,19 +43,19 @@ pub trait TimestampLiteral {
 
 impl Literal for &str {
     fn lit(&self) -> Expr {
-        Expr::Literal(ScalarValue::Utf8(Some((*self).to_owned())))
+        Expr::Literal(ScalarValue::from(*self))
     }
 }
 
 impl Literal for String {
     fn lit(&self) -> Expr {
-        Expr::Literal(ScalarValue::Utf8(Some((*self).to_owned())))
+        Expr::Literal(ScalarValue::from(self.as_ref()))
     }
 }
 
 impl Literal for &String {
     fn lit(&self) -> Expr {
-        Expr::Literal(ScalarValue::Utf8(Some((*self).to_owned())))
+        Expr::Literal(ScalarValue::from(self.as_ref()))
     }
 }
 
@@ -180,7 +180,6 @@ mod test {
 
     use super::*;
     use crate::expr_fn::col;
-    use datafusion_common::ScalarValue;
 
     #[test]
     fn test_lit_nonzero() {

@@ -25,7 +25,7 @@ This section will also touch on how to have DataFusion use the new `TableProvide
 
 ## Table Provider and Scan
 
-The `scan` method on the `TableProvider` is likely its most important. It returns an `ExecutionPlan` that DataFusion will use to read the actual data during execution o the query.
+The `scan` method on the `TableProvider` is likely its most important. It returns an `ExecutionPlan` that DataFusion will use to read the actual data during execution of the query.
 
 ### Scan
 
@@ -46,6 +46,10 @@ struct CustomExec {
 }
 
 impl ExecutionPlan for CustomExec {
+    fn name(&self) {
+        "CustomExec"
+    }
+
     fn execute(
         &self,
         _partition: usize,
@@ -108,7 +112,7 @@ impl CustomDataSource {
 impl TableProvider for CustomDataSource {
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         // filters and limit can be used here to inject some push-down operations if needed
         _filters: &[Expr],
@@ -121,12 +125,28 @@ impl TableProvider for CustomDataSource {
 
 With this, and the implementation of the omitted methods, we can now use the `CustomDataSource` as a `TableProvider` in DataFusion.
 
+##### Additional `TableProvider` Methods
+
+`scan` has no default implementation, so it needed to be written. There are other methods on the `TableProvider` that have default implementations, but can be overridden if needed to provide additional functionality.
+
+###### `supports_filters_pushdown`
+
+The `supports_filters_pushdown` method can be overridden to indicate which filter expressions support being pushed down to the data source and within that the specificity of the pushdown.
+
+This returns a `Vec` of `TableProviderFilterPushDown` enums where each enum represents a filter that can be pushed down. The `TableProviderFilterPushDown` enum has three variants:
+
+- `TableProviderFilterPushDown::Unsupported` - the filter cannot be pushed down
+- `TableProviderFilterPushDown::Exact` - the filter can be pushed down and the data source can guarantee that the filter will be applied completely to all rows. This is the highest performance option.
+- `TableProviderFilterPushDown::Inexact` - the filter can be pushed down, but the data source cannot guarantee that the filter will be applied to all rows. DataFusion will apply `Inexact` filters again after the scan to ensure correctness.
+
+For filters that can be pushed down, they'll be passed to the `scan` method as the `filters` parameter and they can be made use of there.
+
 ## Using the Custom Table Provider
 
-In order to use the custom table provider, we need to register it with DataFusion. This is done by creating a `TableProvider` and registering it with the `ExecutionContext`.
+In order to use the custom table provider, we need to register it with DataFusion. This is done by creating a `TableProvider` and registering it with the `SessionContext`.
 
 ```rust
-let mut ctx = ExecutionContext::new();
+let ctx = SessionContext::new();
 
 let custom_table_provider = CustomDataSource::new();
 ctx.register_table("custom_table", Arc::new(custom_table_provider));
@@ -144,7 +164,7 @@ To recap, in order to implement a custom table provider, you need to:
 
 1. Implement the `TableProvider` trait
 2. Implement the `ExecutionPlan` trait
-3. Register the `TableProvider` with the `ExecutionContext`
+3. Register the `TableProvider` with the `SessionContext`
 
 ## Next Steps
 
@@ -156,6 +176,6 @@ More abstractly, see the following traits for more information on how to impleme
 - `FileFormat` - a trait for reading a file format
 - `ListingTableProvider` - a useful trait for implementing a `TableProvider` that lists files in a directory
 
-[ex]: https://github.com/apache/arrow-datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion-examples/examples/custom_datasource.rs#L214C1-L276
-[csv]: https://github.com/apache/arrow-datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion/core/src/datasource/physical_plan/csv.rs#L57-L70
-[parquet]: https://github.com/apache/arrow-datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion/core/src/datasource/physical_plan/parquet.rs#L77-L104
+[ex]: https://github.com/apache/datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion-examples/examples/custom_datasource.rs#L214C1-L276
+[csv]: https://github.com/apache/datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion/core/src/datasource/physical_plan/csv.rs#L57-L70
+[parquet]: https://github.com/apache/datafusion/blob/a5e86fae3baadbd99f8fd0df83f45fde22f7b0c6/datafusion/core/src/datasource/physical_plan/parquet.rs#L77-L104

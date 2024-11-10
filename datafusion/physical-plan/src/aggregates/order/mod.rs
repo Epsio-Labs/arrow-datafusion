@@ -18,19 +18,19 @@
 use arrow_array::ArrayRef;
 use arrow_schema::Schema;
 use datafusion_common::Result;
-use datafusion_physical_expr::EmitTo;
-
-use super::{AggregationOrdering, GroupByOrderMode};
+use datafusion_expr::EmitTo;
+use datafusion_physical_expr::PhysicalSortExpr;
 
 mod full;
 mod partial;
 
-pub(crate) use full::GroupOrderingFull;
-pub(crate) use partial::GroupOrderingPartial;
+use crate::InputOrderMode;
+pub use full::GroupOrderingFull;
+pub use partial::GroupOrderingPartial;
 
 /// Ordering information for each group in the hash table
 #[derive(Debug)]
-pub(crate) enum GroupOrdering {
+pub enum GroupOrdering {
     /// Groups are not ordered
     None,
     /// Groups are ordered by some pre-set of the group keys
@@ -40,27 +40,20 @@ pub(crate) enum GroupOrdering {
 }
 
 impl GroupOrdering {
-    /// Create a `GroupOrdering` for the the specified ordering
+    /// Create a `GroupOrdering` for the specified ordering
     pub fn try_new(
         input_schema: &Schema,
-        ordering: &AggregationOrdering,
+        mode: &InputOrderMode,
+        ordering: &[PhysicalSortExpr],
     ) -> Result<Self> {
-        let AggregationOrdering {
-            mode,
-            order_indices,
-            ordering,
-        } = ordering;
-
-        Ok(match mode {
-            GroupByOrderMode::PartiallyOrdered => {
-                let partial =
-                    GroupOrderingPartial::try_new(input_schema, order_indices, ordering)?;
-                GroupOrdering::Partial(partial)
+        match mode {
+            InputOrderMode::Linear => Ok(GroupOrdering::None),
+            InputOrderMode::PartiallySorted(order_indices) => {
+                GroupOrderingPartial::try_new(input_schema, order_indices, ordering)
+                    .map(GroupOrdering::Partial)
             }
-            GroupByOrderMode::FullyOrdered => {
-                GroupOrdering::Full(GroupOrderingFull::new())
-            }
-        })
+            InputOrderMode::Sorted => Ok(GroupOrdering::Full(GroupOrderingFull::new())),
+        }
     }
 
     // How many groups be emitted, or None if no data can be emitted
@@ -94,7 +87,7 @@ impl GroupOrdering {
     /// Called when new groups are added in a batch
     ///
     /// * `total_num_groups`: total number of groups (so max
-    /// group_index is total_num_groups - 1).
+    ///   group_index is total_num_groups - 1).
     ///
     /// * `group_values`: group key values for *each row* in the batch
     ///
@@ -124,7 +117,7 @@ impl GroupOrdering {
     }
 
     /// Return the size of memory used by the ordering state, in bytes
-    pub(crate) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         std::mem::size_of::<Self>()
             + match self {
                 GroupOrdering::None => 0,

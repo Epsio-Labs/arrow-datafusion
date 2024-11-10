@@ -23,26 +23,74 @@
 //! - An ending frame boundary,
 //! - An EXCLUDE clause.
 
+use std::fmt::{self, Formatter};
+use std::hash::Hash;
+
+use crate::{expr::Sort, lit};
+
 use datafusion_common::{plan_err, sql_err, DataFusionError, Result, ScalarValue};
 use sqlparser::ast;
 use sqlparser::parser::ParserError::ParserError;
-use std::convert::{From, TryFrom};
-use std::fmt;
-use std::hash::Hash;
 
-/// The frame-spec determines which output rows are read by an aggregate window function.
-///
-/// The ending frame boundary can be omitted (if the BETWEEN and AND keywords that surround the
-/// starting frame boundary are also omitted), in which case the ending frame boundary defaults to
-/// CURRENT ROW.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The frame specification determines which output rows are read by an aggregate
+/// window function. The ending frame boundary can be omitted if the `BETWEEN`
+/// and `AND` keywords that surround the starting frame boundary are also omitted,
+/// in which case the ending frame boundary defaults to `CURRENT ROW`.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct WindowFrame {
-    /// A frame type - either ROWS, RANGE or GROUPS
+    /// Frame type - either `ROWS`, `RANGE` or `GROUPS`
     pub units: WindowFrameUnits,
-    /// A starting frame boundary
+    /// Starting frame boundary
     pub start_bound: WindowFrameBound,
-    /// An ending frame boundary
+    /// Ending frame boundary
     pub end_bound: WindowFrameBound,
+    /// Flag indicating whether the frame is causal (i.e. computing the result
+    /// for the current row doesn't depend on any subsequent rows).
+    ///
+    /// Example causal window frames:
+    /// ```text
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              |
+    ///    Current Row |+------------+|  ---
+    ///         |      |              |   |
+    ///         |      |              |   |
+    ///         |      |              |   |  Window Frame 1
+    ///       Past     |              |   |
+    ///                |              |   |
+    ///                |              |  ---
+    ///                +--------------+
+    ///
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              |
+    ///    Current Row |+------------+|
+    ///         |      |              |
+    ///         |      |              | ---
+    ///         |      |              |  |
+    ///       Past     |              |  |  Window Frame 2
+    ///                |              |  |
+    ///                |              | ---
+    ///                +--------------+
+    /// ```
+    /// Example non-causal window frame:
+    /// ```text
+    ///                +--------------+
+    ///      Future    |              |
+    ///         |      |              |
+    ///         |      |              | ---
+    ///    Current Row |+------------+|  |
+    ///         |      |              |  |  Window Frame 3
+    ///         |      |              |  |
+    ///         |      |              | ---
+    ///       Past     |              |
+    ///                |              |
+    ///                |              |
+    ///                +--------------+
+    /// ```
+    causal: bool,
 }
 
 impl fmt::Display for WindowFrame {
@@ -51,6 +99,17 @@ impl fmt::Display for WindowFrame {
             f,
             "{} BETWEEN {} AND {}",
             self.units, self.start_bound, self.end_bound
+        )?;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for WindowFrame {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WindowFrame {{ units: {:?}, start_bound: {:?}, end_bound: {:?}, is_causal: {:?} }}",
+            self.units, self.start_bound, self.end_bound, self.causal
         )?;
         Ok(())
     }
@@ -79,35 +138,40 @@ impl TryFrom<ast::WindowFrame> for WindowFrame {
                 )?
             }
         };
-        Ok(Self {
-            units: value.units.into(),
-            start_bound,
-            end_bound,
-        })
+        let units = value.units.into();
+        Ok(Self::new_bounds(units, start_bound, end_bound))
     }
 }
 
 impl WindowFrame {
-    /// Creates a new, default window frame (with the meaning of default depending on whether the
-    /// frame contains an `ORDER BY` clause.
-    pub fn new(has_order_by: bool) -> Self {
-        if has_order_by {
-            // This window frame covers the table (or partition if `PARTITION BY` is used)
-            // from beginning to the `CURRENT ROW` (with same rank). It is used when the `OVER`
-            // clause contains an `ORDER BY` clause but no frame.
-            WindowFrame {
-                units: WindowFrameUnits::Range,
+    /// Creates a new, default window frame (with the meaning of default
+    /// depending on whether the frame contains an `ORDER BY` clause and this
+    /// ordering is strict (i.e. no ties).
+    pub fn new(order_by: Option<bool>) -> Self {
+        if let Some(strict) = order_by {
+            // This window frame covers the table (or partition if `PARTITION BY`
+            // is used) from beginning to the `CURRENT ROW` (with same rank). It
+            // is used when the `OVER` clause contains an `ORDER BY` clause but
+            // no frame.
+            Self {
+                units: if strict {
+                    WindowFrameUnits::Rows
+                } else {
+                    WindowFrameUnits::Range
+                },
                 start_bound: WindowFrameBound::Preceding(ScalarValue::Null),
                 end_bound: WindowFrameBound::CurrentRow,
+                causal: strict,
             }
         } else {
-            // This window frame covers the whole table (or partition if `PARTITION BY` is used).
-            // It is used when the `OVER` clause does not contain an `ORDER BY` clause and there is
-            // no frame.
-            WindowFrame {
+            // This window frame covers the whole table (or partition if `PARTITION BY`
+            // is used). It is used when the `OVER` clause does not contain an
+            // `ORDER BY` clause and there is no frame.
+            Self {
                 units: WindowFrameUnits::Rows,
                 start_bound: WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
                 end_bound: WindowFrameBound::Following(ScalarValue::UInt64(None)),
+                causal: false,
             }
         }
     }
@@ -117,56 +181,115 @@ impl WindowFrame {
     /// `2 ROWS PRECEDING AND 3 ROWS FOLLOWING`
     pub fn reverse(&self) -> Self {
         let start_bound = match &self.end_bound {
-            WindowFrameBound::Preceding(elem) => {
-                WindowFrameBound::Following(elem.clone())
+            WindowFrameBound::Preceding(value) => {
+                WindowFrameBound::Following(value.clone())
             }
-            WindowFrameBound::Following(elem) => {
-                WindowFrameBound::Preceding(elem.clone())
+            WindowFrameBound::Following(value) => {
+                WindowFrameBound::Preceding(value.clone())
             }
             WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
         };
         let end_bound = match &self.start_bound {
-            WindowFrameBound::Preceding(elem) => {
-                WindowFrameBound::Following(elem.clone())
+            WindowFrameBound::Preceding(value) => {
+                WindowFrameBound::Following(value.clone())
             }
-            WindowFrameBound::Following(elem) => {
-                WindowFrameBound::Preceding(elem.clone())
+            WindowFrameBound::Following(value) => {
+                WindowFrameBound::Preceding(value.clone())
             }
             WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
         };
-        WindowFrame {
-            units: self.units,
+        Self::new_bounds(self.units, start_bound, end_bound)
+    }
+
+    /// Get whether window frame is causal
+    pub fn is_causal(&self) -> bool {
+        self.causal
+    }
+
+    /// Initializes window frame from units (type), start bound and end bound.
+    pub fn new_bounds(
+        units: WindowFrameUnits,
+        start_bound: WindowFrameBound,
+        end_bound: WindowFrameBound,
+    ) -> Self {
+        let causal = match units {
+            WindowFrameUnits::Rows => match &end_bound {
+                WindowFrameBound::Following(value) => {
+                    if value.is_null() {
+                        // Unbounded following
+                        false
+                    } else {
+                        let zero = ScalarValue::new_zero(&value.data_type());
+                        zero.map(|zero| value.eq(&zero)).unwrap_or(false)
+                    }
+                }
+                _ => true,
+            },
+            WindowFrameUnits::Range | WindowFrameUnits::Groups => match &end_bound {
+                WindowFrameBound::Preceding(value) => {
+                    if value.is_null() {
+                        // Unbounded preceding
+                        true
+                    } else {
+                        let zero = ScalarValue::new_zero(&value.data_type());
+                        zero.map(|zero| value.gt(&zero)).unwrap_or(false)
+                    }
+                }
+                _ => false,
+            },
+        };
+        Self {
+            units,
             start_bound,
             end_bound,
+            causal,
         }
     }
-}
 
-/// Construct equivalent explicit window frames for implicit corner cases.
-/// With this processing, we may assume in downstream code that RANGE/GROUPS
-/// frames contain an appropriate ORDER BY clause.
-pub fn regularize(mut frame: WindowFrame, order_bys: usize) -> Result<WindowFrame> {
-    if frame.units == WindowFrameUnits::Range && order_bys != 1 {
-        // Normally, RANGE frames require an ORDER BY clause with exactly one
-        // column. However, an ORDER BY clause may be absent in two edge cases.
-        if (frame.start_bound.is_unbounded()
-            || frame.start_bound == WindowFrameBound::CurrentRow)
-            && (frame.end_bound == WindowFrameBound::CurrentRow
-                || frame.end_bound.is_unbounded())
-        {
-            if order_bys == 0 {
-                frame.units = WindowFrameUnits::Rows;
-                frame.start_bound =
-                    WindowFrameBound::Preceding(ScalarValue::UInt64(None));
-                frame.end_bound = WindowFrameBound::Following(ScalarValue::UInt64(None));
+    /// Regularizes the ORDER BY clause of the window frame.
+    pub fn regularize_order_bys(&self, order_by: &mut Vec<Sort>) -> Result<()> {
+        match self.units {
+            // Normally, RANGE frames require an ORDER BY clause with exactly
+            // one column. However, an ORDER BY clause may be absent or have
+            // more than one column when the start/end bounds are UNBOUNDED or
+            // CURRENT ROW.
+            WindowFrameUnits::Range if self.free_range() => {
+                // If an ORDER BY clause is absent, it is equivalent to an
+                // ORDER BY clause with constant value as sort key. If an
+                // ORDER BY clause is present but has more than one column,
+                // it is unchanged. Note that this follows PostgreSQL behavior.
+                if order_by.is_empty() {
+                    order_by.push(lit(1u64).sort(true, false));
+                }
             }
-        } else {
-            plan_err!("RANGE requires exactly one ORDER BY column")?
+            WindowFrameUnits::Range if order_by.len() != 1 => {
+                return plan_err!("RANGE requires exactly one ORDER BY column");
+            }
+            WindowFrameUnits::Groups if order_by.is_empty() => {
+                return plan_err!("GROUPS requires an ORDER BY clause");
+            }
+            _ => {}
         }
-    } else if frame.units == WindowFrameUnits::Groups && order_bys == 0 {
-        plan_err!("GROUPS requires an ORDER BY clause")?
-    };
-    Ok(frame)
+        Ok(())
+    }
+
+    /// Returns whether the window frame can accept multiple ORDER BY expressons.
+    pub fn can_accept_multi_orderby(&self) -> bool {
+        match self.units {
+            WindowFrameUnits::Rows => true,
+            WindowFrameUnits::Range => self.free_range(),
+            WindowFrameUnits::Groups => true,
+        }
+    }
+
+    /// Returns whether the window frame is "free range"; i.e. its start/end
+    /// bounds are UNBOUNDED or CURRENT ROW.
+    fn free_range(&self) -> bool {
+        (self.start_bound.is_unbounded()
+            || self.start_bound == WindowFrameBound::CurrentRow)
+            && (self.end_bound.is_unbounded()
+                || self.end_bound == WindowFrameBound::CurrentRow)
+    }
 }
 
 /// There are five ways to describe starting and ending frame boundaries:
@@ -180,11 +303,11 @@ pub fn regularize(mut frame: WindowFrame, order_bys: usize) -> Result<WindowFram
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WindowFrameBound {
     /// 1. UNBOUNDED PRECEDING
-    /// The frame boundary is the first row in the partition.
+    ///    The frame boundary is the first row in the partition.
     ///
     /// 2. `<expr>` PRECEDING
-    /// `<expr>` must be a non-negative constant numeric expression. The boundary is a row that
-    /// is `<expr>` "units" prior to the current row.
+    ///    `<expr>` must be a non-negative constant numeric expression. The boundary is a row that
+    ///    is `<expr>` "units" prior to the current row.
     Preceding(ScalarValue),
     /// 3. The current row.
     ///
@@ -194,10 +317,10 @@ pub enum WindowFrameBound {
     /// boundary.
     CurrentRow,
     /// 4. This is the same as "`<expr>` PRECEDING" except that the boundary is `<expr>` units after the
-    /// current rather than before the current row.
+    ///    current rather than before the current row.
     ///
     /// 5. UNBOUNDED FOLLOWING
-    /// The frame boundary is the last row in the partition.
+    ///    The frame boundary is the last row in the partition.
     Following(ScalarValue),
 }
 

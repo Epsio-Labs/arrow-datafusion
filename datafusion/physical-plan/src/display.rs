@@ -19,13 +19,15 @@
 //! [`crate::displayable`] for examples of how to format
 
 use std::fmt;
+use std::fmt::Formatter;
 
 use arrow_schema::SchemaRef;
-use datafusion_common::display::StringifiedPlan;
-use datafusion_physical_expr::PhysicalSortExpr;
+
+use datafusion_common::display::{GraphvizBuilder, PlanType, StringifiedPlan};
+use datafusion_expr::display_schema;
+use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 
 use super::{accept, ExecutionPlan, ExecutionPlanVisitor};
-use datafusion_common::display::{GraphvizBuilder, PlanType};
 
 /// Options for controlling how each [`ExecutionPlan`] should format itself
 #[derive(Debug, Clone, Copy)]
@@ -37,12 +39,15 @@ pub enum DisplayFormatType {
 }
 
 /// Wraps an `ExecutionPlan` with various ways to display this plan
+#[derive(Debug, Clone)]
 pub struct DisplayableExecutionPlan<'a> {
     inner: &'a dyn ExecutionPlan,
     /// How to show metrics
     show_metrics: ShowMetrics,
     /// If statistics should be displayed
     show_statistics: bool,
+    /// If schema should be displayed. See [`Self::set_show_schema`]
+    show_schema: bool,
 }
 
 impl<'a> DisplayableExecutionPlan<'a> {
@@ -53,6 +58,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             inner,
             show_metrics: ShowMetrics::None,
             show_statistics: false,
+            show_schema: false,
         }
     }
 
@@ -64,6 +70,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             inner,
             show_metrics: ShowMetrics::Aggregated,
             show_statistics: false,
+            show_schema: false,
         }
     }
 
@@ -75,7 +82,17 @@ impl<'a> DisplayableExecutionPlan<'a> {
             inner,
             show_metrics: ShowMetrics::Full,
             show_statistics: false,
+            show_schema: false,
         }
+    }
+
+    /// Enable display of schema
+    ///
+    /// If true, plans will be displayed with schema information at the end
+    /// of each line. The format is `schema=[[a:Int32;N, b:Int32;N, c:Int32;N]]`
+    pub fn set_show_schema(mut self, show_schema: bool) -> Self {
+        self.show_schema = show_schema;
+        self
     }
 
     /// Enable display of statistics
@@ -105,6 +122,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             plan: &'a dyn ExecutionPlan,
             show_metrics: ShowMetrics,
             show_statistics: bool,
+            show_schema: bool,
         }
         impl<'a> fmt::Display for Wrapper<'a> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -114,6 +132,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     indent: 0,
                     show_metrics: self.show_metrics,
                     show_statistics: self.show_statistics,
+                    show_schema: self.show_schema,
                 };
                 accept(self.plan, &mut visitor)
             }
@@ -123,6 +142,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             plan: self.inner,
             show_metrics: self.show_metrics,
             show_statistics: self.show_statistics,
+            show_schema: self.show_schema,
         }
     }
 
@@ -133,7 +153,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
     /// ```dot
     /// strict digraph dot_plan {
     //     0[label="ProjectionExec: expr=[id@0 + 2 as employee.id + Int32(2)]",tooltip=""]
-    //     1[label="EmptyExec: produce_one_row=false",tooltip=""]
+    //     1[label="EmptyExec",tooltip=""]
     //     0 -> 1
     // }
     /// ```
@@ -179,6 +199,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             plan: &'a dyn ExecutionPlan,
             show_metrics: ShowMetrics,
             show_statistics: bool,
+            show_schema: bool,
         }
 
         impl<'a> fmt::Display for Wrapper<'a> {
@@ -189,6 +210,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
                     indent: 0,
                     show_metrics: self.show_metrics,
                     show_statistics: self.show_statistics,
+                    show_schema: self.show_schema,
                 };
                 visitor.pre_visit(self.plan)?;
                 Ok(())
@@ -199,6 +221,7 @@ impl<'a> DisplayableExecutionPlan<'a> {
             plan: self.inner,
             show_metrics: self.show_metrics,
             show_statistics: self.show_statistics,
+            show_schema: self.show_schema,
         }
     }
 
@@ -213,7 +236,7 @@ enum ShowMetrics {
     /// Do not show any metrics
     None,
 
-    /// Show aggregrated metrics across partition
+    /// Show aggregated metrics across partition
     Aggregated,
 
     /// Show full per-partition metrics
@@ -221,6 +244,14 @@ enum ShowMetrics {
 }
 
 /// Formats plans with a single line per node.
+///
+/// # Example
+///
+/// ```text
+/// ProjectionExec: expr=[column1@0 + 2 as column1 + Int64(2)]
+///   FilterExec: column1@0 = 5
+///     ValuesExec
+/// ```
 struct IndentVisitor<'a, 'b> {
     /// How to format each node
     t: DisplayFormatType,
@@ -232,6 +263,8 @@ struct IndentVisitor<'a, 'b> {
     show_metrics: ShowMetrics,
     /// If statistics should be displayed
     show_statistics: bool,
+    /// If schema should be displayed
+    show_schema: bool,
 }
 
 impl<'a, 'b> ExecutionPlanVisitor for IndentVisitor<'a, 'b> {
@@ -262,7 +295,15 @@ impl<'a, 'b> ExecutionPlanVisitor for IndentVisitor<'a, 'b> {
             }
         }
         if self.show_statistics {
-            write!(self.f, ", statistics=[{}]", plan.statistics())?;
+            let stats = plan.statistics().map_err(|_e| fmt::Error)?;
+            write!(self.f, ", statistics=[{}]", stats)?;
+        }
+        if self.show_schema {
+            write!(
+                self.f,
+                ", schema={}",
+                display_schema(plan.schema().as_ref())
+            )?;
         }
         writeln!(self.f)?;
         self.indent += 1;
@@ -302,10 +343,7 @@ impl GraphvizVisitor<'_, '_> {
 impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
     type Error = fmt::Error;
 
-    fn pre_visit(
-        &mut self,
-        plan: &dyn ExecutionPlan,
-    ) -> datafusion_common::Result<bool, Self::Error> {
+    fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
         let id = self.graphviz_builder.next_id();
 
         struct Wrapper<'a>(&'a dyn ExecutionPlan, DisplayFormatType);
@@ -342,7 +380,8 @@ impl ExecutionPlanVisitor for GraphvizVisitor<'_, '_> {
         };
 
         let statistics = if self.show_statistics {
-            format!("statistics=[{}]", plan.statistics())
+            let stats = plan.statistics().map_err(|_e| fmt::Error)?;
+            format!("statistics=[{}]", stats)
         } else {
             "".to_string()
         };
@@ -433,5 +472,145 @@ impl<'a> fmt::Display for OutputOrderingDisplay<'a> {
             write!(f, "{e}")?;
         }
         write!(f, "]")
+    }
+}
+
+pub fn display_orderings(f: &mut Formatter, orderings: &[LexOrdering]) -> fmt::Result {
+    if let Some(ordering) = orderings.first() {
+        if !ordering.is_empty() {
+            let start = if orderings.len() == 1 {
+                ", output_ordering="
+            } else {
+                ", output_orderings=["
+            };
+            write!(f, "{}", start)?;
+            for (idx, ordering) in
+                orderings.iter().enumerate().filter(|(_, o)| !o.is_empty())
+            {
+                match idx {
+                    0 => write!(f, "{}", OutputOrderingDisplay(ordering))?,
+                    _ => write!(f, ", {}", OutputOrderingDisplay(ordering))?,
+                }
+            }
+            let end = if orderings.len() == 1 { "" } else { "]" };
+            write!(f, "{}", end)?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write;
+    use std::sync::Arc;
+
+    use datafusion_common::{DataFusionError, Result, Statistics};
+    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+
+    use crate::{DisplayAs, ExecutionPlan, PlanProperties};
+
+    use super::DisplayableExecutionPlan;
+
+    #[derive(Debug, Clone, Copy)]
+    enum TestStatsExecPlan {
+        Panic,
+        Error,
+        Ok,
+    }
+
+    impl DisplayAs for TestStatsExecPlan {
+        fn fmt_as(
+            &self,
+            _t: crate::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "TestStatsExecPlan")
+        }
+    }
+
+    impl ExecutionPlan for TestStatsExecPlan {
+        fn name(&self) -> &'static str {
+            "TestStatsExecPlan"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn properties(&self) -> &PlanProperties {
+            unimplemented!()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!()
+        }
+
+        fn execute(
+            &self,
+            _: usize,
+            _: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            todo!()
+        }
+
+        fn statistics(&self) -> Result<Statistics> {
+            match self {
+                Self::Panic => panic!("expected panic"),
+                Self::Error => {
+                    Err(DataFusionError::Internal("expected error".to_string()))
+                }
+                Self::Ok => Ok(Statistics::new_unknown(self.schema().as_ref())),
+            }
+        }
+    }
+
+    fn test_stats_display(exec: TestStatsExecPlan, show_stats: bool) {
+        let display =
+            DisplayableExecutionPlan::new(&exec).set_show_statistics(show_stats);
+
+        let mut buf = String::new();
+        write!(&mut buf, "{}", display.one_line()).unwrap();
+        let buf = buf.trim();
+        assert_eq!(buf, "TestStatsExecPlan");
+    }
+
+    #[test]
+    fn test_display_when_stats_panic_with_no_show_stats() {
+        test_stats_display(TestStatsExecPlan::Panic, false);
+    }
+
+    #[test]
+    fn test_display_when_stats_error_with_no_show_stats() {
+        test_stats_display(TestStatsExecPlan::Error, false);
+    }
+
+    #[test]
+    fn test_display_when_stats_ok_with_no_show_stats() {
+        test_stats_display(TestStatsExecPlan::Ok, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected panic")]
+    fn test_display_when_stats_panic_with_show_stats() {
+        test_stats_display(TestStatsExecPlan::Panic, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error")] // fmt::Error
+    fn test_display_when_stats_error_with_show_stats() {
+        test_stats_display(TestStatsExecPlan::Error, true);
+    }
+
+    #[test]
+    fn test_display_when_stats_ok_with_show_stats() {
+        test_stats_display(TestStatsExecPlan::Ok, false);
     }
 }

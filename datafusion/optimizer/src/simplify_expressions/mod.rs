@@ -15,14 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod context;
+//! [`SimplifyExpressions`] simplifies expressions in the logical plan,
+//! [`ExprSimplifier`] simplifies individual `Expr`s.
+
 pub mod expr_simplifier;
 mod guarantees;
-mod or_in_list_simplifier;
+mod inlist_simplifier;
 mod regex;
 pub mod simplify_exprs;
 mod utils;
 
-pub use context::*;
+// backwards compatibility
+pub use datafusion_expr::simplify::{SimplifyContext, SimplifyInfo};
+
 pub use expr_simplifier::*;
 pub use simplify_exprs::*;
+
+// Export for test in datafusion/core/tests/optimizer_integration.rs
+pub use guarantees::GuaranteeRewriter;

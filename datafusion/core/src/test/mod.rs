@@ -17,6 +17,16 @@
 
 //! Common unit test utility methods
 
+use std::any::Any;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::datasource::file_format::csv::CsvFormat;
+use crate::datasource::file_format::file_compression_type::FileCompressionType;
+use crate::datasource::file_format::FileFormat;
 use crate::datasource::listing::PartitionedFile;
 use crate::datasource::object_store::ObjectStoreUrl;
 use crate::datasource::physical_plan::{CsvExec, FileScanConfig};
@@ -26,29 +36,26 @@ use crate::logical_expr::LogicalPlan;
 use crate::physical_plan::ExecutionPlan;
 use crate::test::object_store::local_unpartitioned_file;
 use crate::test_util::{aggr_test_schema, arrow_test_data};
-use array::ArrayRef;
-use arrow::array::{self, Array, Decimal128Builder, Int32Array};
+
+use arrow::array::{self, Array, ArrayRef, Decimal128Builder, Int32Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::{DataFusionError, Statistics};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalSortExpr};
+use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use datafusion_physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionMode, PlanProperties,
+};
+
 #[cfg(feature = "compression")]
 use bzip2::write::BzEncoder;
 #[cfg(feature = "compression")]
 use bzip2::Compression as BzCompression;
-use datafusion_common::{DataFusionError, Statistics};
-use datafusion_common::{FileCompressionType, FileType};
-use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{Partitioning, PhysicalSortExpr};
-use datafusion_physical_plan::{DisplayAs, DisplayFormatType};
 #[cfg(feature = "compression")]
 use flate2::write::GzEncoder;
 #[cfg(feature = "compression")]
 use flate2::Compression as GzCompression;
-use std::any::Any;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
-use std::sync::Arc;
 #[cfg(feature = "compression")]
 use xz2::write::XzEncoder;
 #[cfg(feature = "compression")]
@@ -80,19 +87,22 @@ pub fn scan_partitioned_csv(partitions: usize, work_dir: &Path) -> Result<Arc<Cs
         path.as_str(),
         filename,
         partitions,
-        FileType::CSV,
+        Arc::new(CsvFormat::default()),
         FileCompressionType::UNCOMPRESSED,
         work_dir,
     )?;
-    let config = partitioned_csv_config(schema, file_groups)?;
-    Ok(Arc::new(CsvExec::new(
-        config,
-        true,
-        b',',
-        b'"',
-        None,
-        FileCompressionType::UNCOMPRESSED,
-    )))
+    let config = partitioned_csv_config(schema, file_groups);
+    Ok(Arc::new(
+        CsvExec::builder(config)
+            .with_has_header(true)
+            .with_delimeter(b',')
+            .with_quote(b'"')
+            .with_escape(None)
+            .with_comment(None)
+            .with_newlines_in_values(false)
+            .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+            .build(),
+    ))
 }
 
 /// Returns file groups [`Vec<Vec<PartitionedFile>>`] for scanning `partitions` of `filename`
@@ -100,7 +110,7 @@ pub fn partitioned_file_groups(
     path: &str,
     filename: &str,
     partitions: usize,
-    file_type: FileType,
+    file_format: Arc<dyn FileFormat>,
     file_compression_type: FileCompressionType,
     work_dir: &Path,
 ) -> Result<Vec<Vec<PartitionedFile>>> {
@@ -112,9 +122,8 @@ pub fn partitioned_file_groups(
         let filename = format!(
             "partition-{}{}",
             i,
-            file_type
-                .to_owned()
-                .get_ext_with_compression(file_compression_type.to_owned())
+            file_format
+                .get_ext_with_compression(&file_compression_type)
                 .unwrap()
         );
         let filename = work_dir.join(filename);
@@ -159,7 +168,7 @@ pub fn partitioned_file_groups(
     for (i, line) in f.lines().enumerate() {
         let line = line.unwrap();
 
-        if i == 0 && file_type == FileType::CSV {
+        if i == 0 && file_format.get_ext() == CsvFormat::default().get_ext() {
             // write header to all partitions
             for w in writers.iter_mut() {
                 w.write_all(line.as_bytes()).unwrap();
@@ -189,18 +198,9 @@ pub fn partitioned_file_groups(
 pub fn partitioned_csv_config(
     schema: SchemaRef,
     file_groups: Vec<Vec<PartitionedFile>>,
-) -> Result<FileScanConfig> {
-    Ok(FileScanConfig {
-        object_store_url: ObjectStoreUrl::local_filesystem(),
-        file_schema: schema,
-        file_groups,
-        statistics: Default::default(),
-        projection: None,
-        limit: None,
-        table_partition_cols: vec![],
-        output_ordering: vec![],
-        infinite_source: false,
-    })
+) -> FileScanConfig {
+    FileScanConfig::new(ObjectStoreUrl::local_filesystem(), schema)
+        .with_file_groups(file_groups)
 }
 
 pub fn assert_fields_eq(plan: &LogicalPlan, expected: Vec<&str>) {
@@ -273,28 +273,90 @@ fn make_decimal() -> RecordBatch {
 pub fn csv_exec_sorted(
     schema: &SchemaRef,
     sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
-    infinite_source: bool,
 ) -> Arc<dyn ExecutionPlan> {
     let sort_exprs = sort_exprs.into_iter().collect();
 
-    Arc::new(CsvExec::new(
-        FileScanConfig {
-            object_store_url: ObjectStoreUrl::parse("test:///").unwrap(),
-            file_schema: schema.clone(),
-            file_groups: vec![vec![PartitionedFile::new("x".to_string(), 100)]],
-            statistics: Statistics::default(),
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![sort_exprs],
-            infinite_source,
-        },
-        false,
-        0,
-        0,
-        None,
-        FileCompressionType::UNCOMPRESSED,
-    ))
+    Arc::new(
+        CsvExec::builder(
+            FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
+                schema.clone(),
+            )
+            .with_file(PartitionedFile::new("x".to_string(), 100))
+            .with_output_ordering(vec![sort_exprs]),
+        )
+        .with_has_header(false)
+        .with_delimeter(0)
+        .with_quote(0)
+        .with_escape(None)
+        .with_comment(None)
+        .with_newlines_in_values(false)
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+        .build(),
+    )
+}
+
+// construct a stream partition for test purposes
+pub(crate) struct TestStreamPartition {
+    pub schema: SchemaRef,
+}
+
+impl PartitionStream for TestStreamPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        unreachable!()
+    }
+}
+
+/// Create an unbounded stream exec
+pub fn stream_exec_ordered(
+    schema: &SchemaRef,
+    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+) -> Arc<dyn ExecutionPlan> {
+    let sort_exprs = sort_exprs.into_iter().collect();
+
+    Arc::new(
+        StreamingTableExec::try_new(
+            schema.clone(),
+            vec![Arc::new(TestStreamPartition {
+                schema: schema.clone(),
+            }) as _],
+            None,
+            vec![sort_exprs],
+            true,
+            None,
+        )
+        .unwrap(),
+    )
+}
+
+/// Create a csv exec for tests
+pub fn csv_exec_ordered(
+    schema: &SchemaRef,
+    sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+) -> Arc<dyn ExecutionPlan> {
+    let sort_exprs = sort_exprs.into_iter().collect();
+
+    Arc::new(
+        CsvExec::builder(
+            FileScanConfig::new(
+                ObjectStoreUrl::parse("test:///").unwrap(),
+                schema.clone(),
+            )
+            .with_file(PartitionedFile::new("file_path".to_string(), 100))
+            .with_output_ordering(vec![sort_exprs]),
+        )
+        .with_has_header(true)
+        .with_delimeter(0)
+        .with_quote(b'"')
+        .with_escape(None)
+        .with_comment(None)
+        .with_newlines_in_values(false)
+        .with_file_compression_type(FileCompressionType::UNCOMPRESSED)
+        .build(),
+    )
 }
 
 /// A mock execution plan that simply returns the provided statistics
@@ -302,21 +364,33 @@ pub fn csv_exec_sorted(
 pub struct StatisticsExec {
     stats: Statistics,
     schema: Arc<Schema>,
+    cache: PlanProperties,
 }
+
 impl StatisticsExec {
     pub fn new(stats: Statistics, schema: Schema) -> Self {
-        assert!(
-            stats
-                .column_statistics
-                .as_ref()
-                .map(|cols| cols.len() == schema.fields().len())
-                .unwrap_or(true),
+        assert_eq!(
+            stats.column_statistics.len(), schema.fields().len(),
             "if defined, the column statistics vector length should be the number of fields"
         );
+        let cache = Self::compute_properties(Arc::new(schema.clone()));
         Self {
             stats,
             schema: Arc::new(schema),
+            cache,
         }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq_properties,
+            // Output Partitioning
+            Partitioning::UnknownPartitioning(2),
+            // Execution Mode
+            ExecutionMode::Bounded,
+        )
     }
 }
 
@@ -340,23 +414,19 @@ impl DisplayAs for StatisticsExec {
 }
 
 impl ExecutionPlan for StatisticsExec {
+    fn name(&self) -> &'static str {
+        Self::static_name()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(2)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -375,8 +445,8 @@ impl ExecutionPlan for StatisticsExec {
         unimplemented!("This plan only serves for testing statistics")
     }
 
-    fn statistics(&self) -> Statistics {
-        self.stats.clone()
+    fn statistics(&self) -> Result<Statistics> {
+        Ok(self.stats.clone())
     }
 }
 

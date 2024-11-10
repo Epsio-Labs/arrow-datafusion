@@ -18,14 +18,20 @@
 //! FunctionalDependencies keeps track of functional dependencies
 //! inside DFSchema.
 
-use crate::{DFSchema, DFSchemaRef, DataFusionError, JoinType, Result};
-use sqlparser::ast::TableConstraint;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::ops::Deref;
+use std::vec::IntoIter;
+
+use crate::error::_plan_err;
+use crate::utils::{merge_and_order_indices, set_difference};
+use crate::{DFSchema, DFSchemaRef, DataFusionError, JoinType, Result};
+
+use sqlparser::ast::TableConstraint;
 
 /// This object defines a constraint on a table.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Constraint {
+pub enum Constraint {
     /// Columns with the given indices form a composite primary key (they are
     /// jointly unique and not nullable):
     PrimaryKey(Vec<usize>),
@@ -42,13 +48,15 @@ pub struct Constraints {
 impl Constraints {
     /// Create empty constraints
     pub fn empty() -> Self {
-        Constraints::new(vec![])
+        Constraints::new_unverified(vec![])
     }
 
-    // This method is private.
-    // Outside callers can either create empty constraint using `Constraints::empty` API.
-    // or create constraint from table constraints using `Constraints::new_from_table_constraints` API.
-    fn new(constraints: Vec<Constraint>) -> Self {
+    /// Create a new `Constraints` object from the given `constraints`.
+    /// Users should use the `empty` or `new_from_table_constraints` functions
+    /// for constructing `Constraints`. This constructor is for internal
+    /// purposes only and does not check whether the argument is valid. The user
+    /// is responsible for supplying a valid vector of `Constraint` objects.
+    pub fn new_unverified(constraints: Vec<Constraint>) -> Self {
         Self { inner: constraints }
     }
 
@@ -60,55 +68,78 @@ impl Constraints {
         let constraints = constraints
             .iter()
             .map(|c: &TableConstraint| match c {
-                TableConstraint::Unique {
-                    columns,
-                    is_primary,
-                    ..
-                } => {
-                    // Get primary key and/or unique indices in the schema:
+                TableConstraint::Unique { name, columns, .. } => {
+                    let field_names = df_schema.field_names();
+                    // Get unique constraint indices in the schema:
                     let indices = columns
                         .iter()
-                        .map(|pk| {
-                            let idx = df_schema
-                                .fields()
+                        .map(|u| {
+                            let idx = field_names
                                 .iter()
-                                .position(|item| {
-                                    item.qualified_name() == pk.value.clone()
-                                })
+                                .position(|item| *item == u.value)
                                 .ok_or_else(|| {
+                                    let name = name
+                                        .as_ref()
+                                        .map(|name| format!("with name '{name}' "))
+                                        .unwrap_or("".to_string());
                                     DataFusionError::Execution(
-                                        "Primary key doesn't exist".to_string(),
+                                        format!("Column for unique constraint {}not found in schema: {}", name,u.value)
                                     )
                                 })?;
                             Ok(idx)
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    Ok(if *is_primary {
-                        Constraint::PrimaryKey(indices)
-                    } else {
-                        Constraint::Unique(indices)
-                    })
+                    Ok(Constraint::Unique(indices))
                 }
-                TableConstraint::ForeignKey { .. } => Err(DataFusionError::Plan(
-                    "Foreign key constraints are not currently supported".to_string(),
-                )),
-                TableConstraint::Check { .. } => Err(DataFusionError::Plan(
-                    "Check constraints are not currently supported".to_string(),
-                )),
-                TableConstraint::Index { .. } => Err(DataFusionError::Plan(
-                    "Indexes are not currently supported".to_string(),
-                )),
-                TableConstraint::FulltextOrSpatial { .. } => Err(DataFusionError::Plan(
-                    "Indexes are not currently supported".to_string(),
-                )),
+                TableConstraint::PrimaryKey { columns, .. } => {
+                    let field_names = df_schema.field_names();
+                    // Get primary key indices in the schema:
+                    let indices = columns
+                        .iter()
+                        .map(|pk| {
+                            let idx = field_names
+                                .iter()
+                                .position(|item| *item == pk.value)
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Column for primary key not found in schema: {}",
+                                        pk.value
+                                    ))
+                                })?;
+                            Ok(idx)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Constraint::PrimaryKey(indices))
+                }
+                TableConstraint::ForeignKey { .. } => {
+                    _plan_err!("Foreign key constraints are not currently supported")
+                }
+                TableConstraint::Check { .. } => {
+                    _plan_err!("Check constraints are not currently supported")
+                }
+                TableConstraint::Index { .. } => {
+                    _plan_err!("Indexes are not currently supported")
+                }
+                TableConstraint::FulltextOrSpatial { .. } => {
+                    _plan_err!("Indexes are not currently supported")
+                }
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Constraints::new(constraints))
+        Ok(Constraints::new_unverified(constraints))
     }
 
     /// Check whether constraints is empty
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+}
+
+impl IntoIterator for Constraints {
+    type Item = Constraint;
+    type IntoIter = IntoIter<Constraint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
     }
 }
 
@@ -121,6 +152,14 @@ impl Display for Constraints {
         } else {
             write!(f, "")
         }
+    }
+}
+
+impl Deref for Constraints {
+    type Target = [Constraint];
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_slice()
     }
 }
 
@@ -247,6 +286,29 @@ impl FunctionalDependencies {
         self.deps.extend(other.deps);
     }
 
+    /// Sanity checks if functional dependencies are valid. For example, if
+    /// there are 10 fields, we cannot receive any index further than 9.
+    pub fn is_valid(&self, n_field: usize) -> bool {
+        self.deps.iter().all(
+            |FunctionalDependence {
+                 source_indices,
+                 target_indices,
+                 ..
+             }| {
+                source_indices
+                    .iter()
+                    .max()
+                    .map(|&max_index| max_index < n_field)
+                    .unwrap_or(true)
+                    && target_indices
+                        .iter()
+                        .max()
+                        .map(|&max_index| max_index < n_field)
+                        .unwrap_or(true)
+            },
+        )
+    }
+
     /// Adds the `offset` value to `source_indices` and `target_indices` for
     /// each functional dependency.
     pub fn add_offset(&mut self, offset: usize) {
@@ -371,7 +433,7 @@ impl FunctionalDependencies {
     }
 
     /// This function ensures that functional dependencies involving uniquely
-    /// occuring determinant keys cover their entire table in terms of
+    /// occurring determinant keys cover their entire table in terms of
     /// dependent columns.
     pub fn extend_target_indices(&mut self, n_out: usize) {
         self.deps.iter_mut().for_each(
@@ -389,6 +451,14 @@ impl FunctionalDependencies {
     }
 }
 
+impl Deref for FunctionalDependencies {
+    type Target = [FunctionalDependence];
+
+    fn deref(&self) -> &Self::Target {
+        self.deps.as_slice()
+    }
+}
+
 /// Calculates functional dependencies for aggregate output, when there is a GROUP BY expression.
 pub fn aggregate_functional_dependencies(
     aggr_input_schema: &DFSchema,
@@ -396,7 +466,7 @@ pub fn aggregate_functional_dependencies(
     aggr_schema: &DFSchema,
 ) -> FunctionalDependencies {
     let mut aggregate_func_dependencies = vec![];
-    let aggr_input_fields = aggr_input_schema.fields();
+    let aggr_input_fields = aggr_input_schema.field_names();
     let aggr_fields = aggr_schema.fields();
     // Association covers the whole table:
     let target_indices = (0..aggr_schema.fields().len()).collect::<Vec<_>>();
@@ -410,54 +480,75 @@ pub fn aggregate_functional_dependencies(
     } in &func_dependencies.deps
     {
         // Keep source indices in a `HashSet` to prevent duplicate entries:
-        let mut new_source_indices = HashSet::new();
+        let mut new_source_indices = vec![];
+        let mut new_source_field_names = vec![];
         let source_field_names = source_indices
             .iter()
-            .map(|&idx| aggr_input_fields[idx].qualified_name())
+            .map(|&idx| &aggr_input_fields[idx])
             .collect::<Vec<_>>();
+
         for (idx, group_by_expr_name) in group_by_expr_names.iter().enumerate() {
             // When one of the input determinant expressions matches with
             // the GROUP BY expression, add the index of the GROUP BY
             // expression as a new determinant key:
-            if source_field_names.contains(group_by_expr_name) {
-                new_source_indices.insert(idx);
+            if source_field_names.contains(&group_by_expr_name) {
+                new_source_indices.push(idx);
+                new_source_field_names.push(group_by_expr_name.clone());
             }
         }
+        let existing_target_indices =
+            get_target_functional_dependencies(aggr_input_schema, group_by_expr_names);
+        let new_target_indices = get_target_functional_dependencies(
+            aggr_input_schema,
+            &new_source_field_names,
+        );
+        let mode = if existing_target_indices == new_target_indices
+            && new_target_indices.is_some()
+        {
+            // If dependency covers all GROUP BY expressions, mode will be `Single`:
+            Dependency::Single
+        } else {
+            // Otherwise, existing mode is preserved:
+            *mode
+        };
         // All of the composite indices occur in the GROUP BY expression:
         if new_source_indices.len() == source_indices.len() {
             aggregate_func_dependencies.push(
                 FunctionalDependence::new(
-                    new_source_indices.into_iter().collect(),
+                    new_source_indices,
                     target_indices.clone(),
                     *nullable,
                 )
-                // input uniqueness stays the same when GROUP BY matches with input functional dependence determinants
-                .with_mode(*mode),
+                .with_mode(mode),
             );
         }
     }
-    // If we have a single GROUP BY key, we can guarantee uniqueness after
+
+    // When we have a GROUP BY key, we can guarantee uniqueness after
     // aggregation:
-    if group_by_expr_names.len() == 1 {
-        // If `source_indices` contain 0, delete this functional dependency
-        // as it will be added anyway with mode `Dependency::Single`:
-        if let Some(idx) = aggregate_func_dependencies
+    if !group_by_expr_names.is_empty() {
+        let count = group_by_expr_names.len();
+        let source_indices = (0..count).collect::<Vec<_>>();
+        let nullable = source_indices
             .iter()
-            .position(|item| item.source_indices.contains(&0))
-        {
-            // Delete the functional dependency that contains zeroth idx:
-            aggregate_func_dependencies.remove(idx);
+            .any(|idx| aggr_fields[*idx].is_nullable());
+        // If GROUP BY expressions do not already act as a determinant:
+        if !aggregate_func_dependencies.iter().any(|item| {
+            // If `item.source_indices` is a subset of GROUP BY expressions, we shouldn't add
+            // them since `item.source_indices` defines this relation already.
+
+            // The following simple comparison is working well because
+            // GROUP BY expressions come here as a prefix.
+            item.source_indices.iter().all(|idx| idx < &count)
+        }) {
+            // Add a new functional dependency associated with the whole table:
+            // Use nullable property of the GROUP BY expression:
+            aggregate_func_dependencies.push(
+                // Use nullable property of the GROUP BY expression:
+                FunctionalDependence::new(source_indices, target_indices, nullable)
+                    .with_mode(Dependency::Single),
+            );
         }
-        // Add a new functional dependency associated with the whole table:
-        aggregate_func_dependencies.push(
-            // Use nullable property of the group by expression
-            FunctionalDependence::new(
-                vec![0],
-                target_indices,
-                aggr_fields[0].is_nullable(),
-            )
-            .with_mode(Dependency::Single),
-        );
     }
     FunctionalDependencies::new(aggregate_func_dependencies)
 }
@@ -470,11 +561,7 @@ pub fn get_target_functional_dependencies(
 ) -> Option<Vec<usize>> {
     let mut combined_target_indices = HashSet::new();
     let dependencies = schema.functional_dependencies();
-    let field_names = schema
-        .fields()
-        .iter()
-        .map(|item| item.qualified_name())
-        .collect::<Vec<_>>();
+    let field_names = schema.field_names();
     for FunctionalDependence {
         source_indices,
         target_indices,
@@ -483,7 +570,7 @@ pub fn get_target_functional_dependencies(
     {
         let source_key_names = source_indices
             .iter()
-            .map(|id_key_idx| field_names[*id_key_idx].clone())
+            .map(|id_key_idx| &field_names[*id_key_idx])
             .collect::<Vec<_>>();
         // If the GROUP BY expression contains a determinant key, we can use
         // the associated fields after aggregation even if they are not part
@@ -495,8 +582,57 @@ pub fn get_target_functional_dependencies(
             combined_target_indices.extend(target_indices.iter());
         }
     }
-    (!combined_target_indices.is_empty())
-        .then_some(combined_target_indices.iter().cloned().collect::<Vec<_>>())
+    (!combined_target_indices.is_empty()).then_some({
+        let mut result = combined_target_indices.into_iter().collect::<Vec<_>>();
+        result.sort();
+        result
+    })
+}
+
+/// Returns indices for the minimal subset of GROUP BY expressions that are
+/// functionally equivalent to the original set of GROUP BY expressions.
+pub fn get_required_group_by_exprs_indices(
+    schema: &DFSchema,
+    group_by_expr_names: &[String],
+) -> Option<Vec<usize>> {
+    let dependencies = schema.functional_dependencies();
+    let field_names = schema.field_names();
+    let mut groupby_expr_indices = group_by_expr_names
+        .iter()
+        .map(|group_by_expr_name| {
+            field_names
+                .iter()
+                .position(|field_name| field_name == group_by_expr_name)
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    groupby_expr_indices.sort();
+    for FunctionalDependence {
+        source_indices,
+        target_indices,
+        ..
+    } in &dependencies.deps
+    {
+        if source_indices
+            .iter()
+            .all(|source_idx| groupby_expr_indices.contains(source_idx))
+        {
+            // If all source indices are among GROUP BY expression indices, we
+            // can remove target indices from GROUP BY expression indices and
+            // use source indices instead.
+            groupby_expr_indices = set_difference(&groupby_expr_indices, target_indices);
+            groupby_expr_indices =
+                merge_and_order_indices(groupby_expr_indices, source_indices);
+        }
+    }
+    groupby_expr_indices
+        .iter()
+        .map(|idx| {
+            group_by_expr_names
+                .iter()
+                .position(|name| &field_names[*idx] == name)
+        })
+        .collect()
 }
 
 /// Updates entries inside the `entries` vector with their corresponding
@@ -517,4 +653,38 @@ fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
     offset: T,
 ) -> Vec<T> {
     in_data.iter().map(|&item| item + offset).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constraints_iter() {
+        let constraints = Constraints::new_unverified(vec![
+            Constraint::PrimaryKey(vec![10]),
+            Constraint::Unique(vec![20]),
+        ]);
+        let mut iter = constraints.iter();
+        assert_eq!(iter.next(), Some(&Constraint::PrimaryKey(vec![10])));
+        assert_eq!(iter.next(), Some(&Constraint::Unique(vec![20])));
+        assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_get_updated_id_keys() {
+        let fund_dependencies =
+            FunctionalDependencies::new(vec![FunctionalDependence::new(
+                vec![1],
+                vec![0, 1, 2],
+                true,
+            )]);
+        let res = fund_dependencies.project_functional_dependencies(&[1, 2], 2);
+        let expected = FunctionalDependencies::new(vec![FunctionalDependence::new(
+            vec![0],
+            vec![0, 1],
+            true,
+        )]);
+        assert_eq!(res, expected);
+    }
 }

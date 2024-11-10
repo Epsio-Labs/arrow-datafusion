@@ -15,28 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use async_trait::async_trait;
-use datafusion::arrow::array::{UInt64Builder, UInt8Builder};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::dataframe::DataFrame;
-use datafusion::datasource::provider_as_source;
-use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result;
-use datafusion::execution::context::{SessionState, TaskContext};
-use datafusion::physical_plan::expressions::PhysicalSortExpr;
-use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::{
-    project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
-    SendableRecordBatchStream, Statistics,
-};
-use datafusion::prelude::*;
-use datafusion_expr::{Expr, LogicalPlanBuilder};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use datafusion::arrow::array::{UInt64Builder, UInt8Builder};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::{provider_as_source, TableProvider, TableType};
+use datafusion::error::Result;
+use datafusion::execution::context::TaskContext;
+use datafusion::physical_plan::memory::MemoryStream;
+use datafusion::physical_plan::{
+    project_schema, DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan,
+    Partitioning, PlanProperties, SendableRecordBatchStream,
+};
+use datafusion::prelude::*;
+use datafusion_expr::LogicalPlanBuilder;
+use datafusion_physical_expr::EquivalenceProperties;
+
+use async_trait::async_trait;
+use datafusion::catalog::Session;
 use tokio::time::timeout;
 
 /// This example demonstrates executing a simple query against a custom datasource
@@ -79,7 +80,7 @@ async fn search_accounts(
 
     timeout(Duration::from_secs(10), async move {
         let result = dataframe.collect().await.unwrap();
-        let record_batch = result.get(0).unwrap();
+        let record_batch = result.first().unwrap();
 
         assert_eq!(expected_result_length, record_batch.column(1).len());
         dbg!(record_batch.columns());
@@ -175,7 +176,7 @@ impl TableProvider for CustomDataSource {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         // filters and limit can be used here to inject some push-down operations if needed
         _filters: &[Expr],
@@ -189,6 +190,7 @@ impl TableProvider for CustomDataSource {
 struct CustomExec {
     db: CustomDataSource,
     projected_schema: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl CustomExec {
@@ -198,10 +200,22 @@ impl CustomExec {
         db: CustomDataSource,
     ) -> Self {
         let projected_schema = project_schema(&schema, projections).unwrap();
+        let cache = Self::compute_properties(projected_schema.clone());
         Self {
             db,
             projected_schema,
+            cache,
         }
+    }
+
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    fn compute_properties(schema: SchemaRef) -> PlanProperties {
+        let eq_properties = EquivalenceProperties::new(schema);
+        PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        )
     }
 }
 
@@ -212,23 +226,19 @@ impl DisplayAs for CustomExec {
 }
 
 impl ExecutionPlan for CustomExec {
+    fn name(&self) -> &'static str {
+        "CustomExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn schema(&self) -> SchemaRef {
-        self.projected_schema.clone()
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -268,9 +278,5 @@ impl ExecutionPlan for CustomExec {
             self.schema(),
             None,
         )?))
-    }
-
-    fn statistics(&self) -> Statistics {
-        Statistics::default()
     }
 }

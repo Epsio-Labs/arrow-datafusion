@@ -137,12 +137,16 @@ impl AggregateStream {
                     None => {
                         this.finished = true;
                         let timer = this.baseline_metrics.elapsed_compute().timer();
-                        let result = finalize_aggregation(&this.accumulators, &this.mode)
-                            .and_then(|columns| {
-                                RecordBatch::try_new(this.schema.clone(), columns)
+                        let result =
+                            finalize_aggregation(&mut this.accumulators, &this.mode)
+                                .and_then(|columns| {
+                                    RecordBatch::try_new(
+                                        Arc::clone(&this.schema),
+                                        columns,
+                                    )
                                     .map_err(Into::into)
-                            })
-                            .record_output(&this.baseline_metrics);
+                                })
+                                .record_output(&this.baseline_metrics);
 
                         timer.done();
 
@@ -180,7 +184,7 @@ impl Stream for AggregateStream {
 
 impl RecordBatchStream for AggregateStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
@@ -214,11 +218,14 @@ fn aggregate_batch(
                 Some(filter) => Cow::Owned(batch_filter(&batch, filter)?),
                 None => Cow::Borrowed(&batch),
             };
+
             // 1.3
             let values = &expr
                 .iter()
-                .map(|e| e.evaluate(&batch))
-                .map(|r| r.map(|v| v.into_array(batch.num_rows())))
+                .map(|e| {
+                    e.evaluate(&batch)
+                        .and_then(|v| v.into_array(batch.num_rows()))
+                })
                 .collect::<Result<Vec<_>>>()?;
 
             // 1.4
