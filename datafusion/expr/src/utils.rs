@@ -901,10 +901,7 @@ pub fn expr_as_column_expr(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {
     match expr {
         Expr::Column(col) => {
             let (qualifier, field) = plan.schema().qualified_field_from_column(col)?;
-            Ok(Expr::Column(Column::new(
-                qualifier.cloned(),
-                col.name.clone(),
-            )))
+            Ok(Expr::Column(Column::new(qualifier.cloned(), field.name())))
         }
         _ => Ok(Expr::Column(Column::from_name(
             expr.schema_name().to_string(),
