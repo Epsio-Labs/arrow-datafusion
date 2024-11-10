@@ -150,7 +150,15 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             Expr::Column(col) => match &col.relation {
                 Some(q) => match schema.field_with_qualified_name(q, &col.name) {
                     Ok(found) => {
-                        Column::new(Some(q.clone()), &found.name().clone()).into()
+                        if found.name() == &col.name {
+                            Expr::Column(col)
+                        } else {
+                            Expr::Column(Column::new(
+                                Some(q.clone()),
+                                &found.name().clone(),
+                            ))
+                            .alias(col.name.clone())
+                        }
                     }
                     Err(_) => Expr::Column(col),
                 },
