@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Signature, TypeSignature};
+use crate::{json_type, Signature, TypeSignature};
 use arrow::{
     compute::can_cast_types,
     datatypes::{DataType, TimeUnit},
@@ -195,6 +195,10 @@ pub fn can_coerce_from(type_into: &DataType, type_from: &DataType) -> bool {
         }
         Utf8 | LargeUtf8 => true,
         Null => can_cast_types(type_from, type_into),
+        Struct(_) if json_type().equals_datatype(type_into) => {
+            matches!(type_from, Null | Struct(_) | Utf8 | LargeUtf8)
+        }
+        List(_) => matches!(type_from, Null | Utf8 | LargeUtf8 | List(_)),
         _ => false,
     }
 }

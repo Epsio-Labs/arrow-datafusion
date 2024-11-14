@@ -23,7 +23,7 @@ use std::vec;
 use arrow_schema::*;
 use datafusion_common::field_not_found;
 use datafusion_common::internal_err;
-use datafusion_expr::WindowUDF;
+use datafusion_expr::{json_type, WindowUDF};
 use sqlparser::ast::ExactNumberInfo;
 use sqlparser::ast::TimezoneInfo;
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
@@ -304,7 +304,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 let data_type = self.convert_simple_data_type(inner_sql_type)?;
 
                 Ok(DataType::List(Arc::new(Field::new(
-                    "field", data_type, true,
+                    "item", data_type, true,
                 ))))
             }
             SQLDataType::Array(None) => {
@@ -374,11 +374,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+            SQLDataType::JSON => Ok(json_type()),
             // Explicitly list all other types so that if sqlparser
             // adds/changes the `SQLDataType` the compiler will tell us on upgrade
             // and avoid bugs like https://github.com/apache/arrow-datafusion/issues/3059
             SQLDataType::Nvarchar(_)
-            | SQLDataType::JSON
             | SQLDataType::Uuid
             | SQLDataType::Binary(_)
             | SQLDataType::Varbinary(_)
