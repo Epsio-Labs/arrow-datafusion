@@ -160,6 +160,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             })
             .collect::<Result<Vec<Expr>>>()?;
 
+        // Get unique group by - since we already got the expressions unaliased, we want to make
+        // sure we're not grouping by the same column twice since this can cause ambiguous
+        // reference errors down the line
+        let group_by_exprs = group_by_exprs.into_iter().collect::<HashSet<_>>().into_iter().collect::<Vec<_>>();
+
         // process group by, aggregation or having
         let (plan, mut select_exprs_post_aggr, having_expr_post_aggr) = if !group_by_exprs
             .is_empty()
