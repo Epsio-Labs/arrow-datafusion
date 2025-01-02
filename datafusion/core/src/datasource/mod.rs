@@ -32,6 +32,7 @@ mod statistics;
 pub mod streaming;
 pub mod view;
 
+pub mod cte_worktable;
 // backwards compatibility
 pub use datafusion_execution::object_store;
 
