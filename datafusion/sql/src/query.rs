@@ -16,22 +16,18 @@
 // under the License.
 
 use std::sync::Arc;
-
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-
+use arrow::datatypes::Schema;
 use datafusion_common::{
     not_impl_err, plan_err, sql_err, Constraints, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::expr_rewriter::normalize_col;
-use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Expr, LogicalPlan, LogicalPlanBuilder,
-};
-use sqlparser::ast::{
-    Expr as SQLExpr, Offset as SQLOffset, OrderByExpr, Query, SetExpr, Value,
-};
+use datafusion_expr::{CreateMemoryTable, DdlStatement, Expr, LogicalPlan, LogicalPlanBuilder, TableSource};
+use sqlparser::ast::{Cte, Expr as SQLExpr, Offset as SQLOffset, OrderByExpr, Query, SetExpr, SetOperator, SetQuantifier, Value};
 
 use crate::utils::{extract_aliases, resolve_aliases_to_exprs};
 use sqlparser::parser::ParserError::ParserError;
+use crate::cte_worktable::CteWorkTable;
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Generate a logical plan from an SQL query
@@ -55,9 +51,9 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         if let Some(with) = query.with {
             // Process CTEs from top to bottom
             // do not allow self-references
-            if with.recursive {
-                return not_impl_err!("Recursive CTEs are not supported");
-            }
+            // if with.recursive {
+            //     return not_impl_err!("Recursive CTEs are not supported");
+            // }
 
             for cte in with.cte_tables {
                 // A `WITH` block can't use the same name more than once
@@ -67,10 +63,14 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         "WITH query name {cte_name:?} specified more than once"
                     )));
                 }
+
+                let logical_plan = if with.recursive {
+                    self.recursive_query(cte.clone(), &mut planner_context.clone())?
+                } else{
                 // create logical plan & pass backreferencing CTEs
                 // CTE expr don't need extend outer_query_schema
-                let logical_plan =
-                    self.query_to_plan(*cte.query, &mut planner_context.clone())?;
+                    self.query_to_plan(*cte.query, &mut planner_context.clone())?
+                };
 
                 // Each `WITH` block can change the column names in the last
                 // projection (e.g. "WITH table(t1, t2) AS SELECT 1, 2").
@@ -99,6 +99,61 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         };
 
         Ok(plan)
+    }
+
+    fn recursive_query(&self, cte: Cte, planner_context: &mut PlannerContext) -> Result<LogicalPlan> {
+        let (left_expr, right_expr, set_quantifier) = match *cte.query.body {
+            SetExpr::SetOperation {
+                op: SetOperator::Union,
+                left,
+                right,
+                set_quantifier,
+            } => (left, right, set_quantifier),
+            _ => {
+                return plan_err!("A recursive query must have a UNION as the outermost component");
+            }
+        };
+
+        // The static part of the plan
+        let plan = self.set_expr_to_plan(*left_expr, planner_context)?;
+
+        let cte_name = self.normalizer.normalize(cte.alias.name.clone());
+
+        let cte_worktable: Arc<dyn TableSource> = Arc::new(CteWorkTable::new(&cte_name, Arc::new(Schema::from(plan.schema().as_ref()))));
+
+        let work_table_plan = LogicalPlanBuilder::scan(
+            cte_name.to_string(),
+            Arc::clone(&cte_worktable),
+            None,
+        )?
+            .build()?;
+
+        planner_context.insert_cte(cte_name.clone(), work_table_plan);
+
+        let recursive_plan = self.set_expr_to_plan(*right_expr, planner_context)?;
+        let distinct = !Self::is_union_all(set_quantifier)?;
+
+        if distinct {
+            return not_impl_err!("UNION is not supported in recursive CTEs (you must \
+            use UNION ALL)");
+        }
+
+        LogicalPlanBuilder::from(plan)
+            .to_recursive_query(cte_name, recursive_plan, distinct)?
+            .build()
+    }
+
+    pub(super) fn is_union_all(set_quantifier: SetQuantifier) -> Result<bool> {
+        match set_quantifier {
+            SetQuantifier::All => Ok(true),
+            SetQuantifier::Distinct | SetQuantifier::None => Ok(false),
+            SetQuantifier::ByName => {
+                not_impl_err!("UNION BY NAME not implemented")
+            }
+            SetQuantifier::AllByName => {
+                not_impl_err!("UNION ALL BY NAME not implemented")
+            }
+        }
     }
 
     /// Wrap a plan in a limit

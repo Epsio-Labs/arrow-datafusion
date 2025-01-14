@@ -154,6 +154,8 @@ pub enum LogicalPlan {
     /// Unnest a column that contains a nested list type such as an
     /// ARRAY. This is used to implement SQL `UNNEST`
     Unnest(Unnest),
+
+    RecursiveQuery(RecursiveQuery),
 }
 
 impl LogicalPlan {
@@ -190,6 +192,9 @@ impl LogicalPlan {
             LogicalPlan::Copy(CopyTo { input, .. }) => input.schema(),
             LogicalPlan::Ddl(ddl) => ddl.schema(),
             LogicalPlan::Unnest(Unnest { schema, .. }) => schema,
+            LogicalPlan::RecursiveQuery(RecursiveQuery { static_term, .. }) => {
+                static_term.schema()
+            }
         }
     }
 
@@ -254,6 +259,9 @@ impl LogicalPlan {
             }
             // return empty
             LogicalPlan::Statement(_) | LogicalPlan::DescribeTable(_) => vec![],
+            LogicalPlan::RecursiveQuery(RecursiveQuery { static_term, .. }) => {
+                vec![static_term.schema()]
+            }
         }
     }
 
@@ -389,7 +397,8 @@ impl LogicalPlan {
             | LogicalPlan::Copy(_)
             | LogicalPlan::Distinct(_)
             | LogicalPlan::DescribeTable(_)
-            | LogicalPlan::Prepare(_) => Ok(()),
+            | LogicalPlan::Prepare(_)
+            | LogicalPlan::RecursiveQuery(_) => Ok(()),
         }
     }
 
@@ -420,6 +429,11 @@ impl LogicalPlan {
             LogicalPlan::Ddl(ddl) => ddl.inputs(),
             LogicalPlan::Unnest(Unnest { input, .. }) => vec![input],
             LogicalPlan::Prepare(Prepare { input, .. }) => vec![input],
+            LogicalPlan::RecursiveQuery(RecursiveQuery {
+                static_term,
+                recursive_term,
+                ..
+            }) => vec![static_term, recursive_term],
             // plans without inputs
             LogicalPlan::TableScan { .. }
             | LogicalPlan::Statement { .. }
@@ -513,6 +527,9 @@ impl LogicalPlan {
                         )?))
                     })
                     .map_or(Ok(None), |v| v.map(Some))
+            }
+            LogicalPlan::RecursiveQuery(RecursiveQuery { static_term, .. }) => {
+                static_term.head_output_expr()
             }
             LogicalPlan::Subquery(_) => Ok(None),
             LogicalPlan::EmptyRelation(_)
@@ -929,6 +946,20 @@ impl LogicalPlan {
                     options: options.clone(),
                 }))
             }
+            LogicalPlan::RecursiveQuery(RecursiveQuery {
+                name, is_distinct, ..
+            }) => {
+                assert!(expr.is_empty(), "{self:?} should have no exprs");
+
+                let (static_term, recursive_term) =
+                    (inputs[0].clone(), inputs[1].clone());
+                Ok(LogicalPlan::RecursiveQuery(RecursiveQuery {
+                    name: name.clone(),
+                    static_term: Arc::new(static_term),
+                    recursive_term: Arc::new(recursive_term),
+                    is_distinct: *is_distinct,
+                }))
+            }
         }
     }
     /// Convert a prepared [`LogicalPlan`] into its inner logical plan
@@ -1049,6 +1080,7 @@ impl LogicalPlan {
             LogicalPlan::Distinct(Distinct { input, .. }) => input.max_rows(),
             LogicalPlan::Values(v) => Some(v.values.len()),
             LogicalPlan::Unnest(_) => None,
+            LogicalPlan::RecursiveQuery(_) => None,
             LogicalPlan::Ddl(_)
             | LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
@@ -1659,6 +1691,11 @@ impl LogicalPlan {
                     }
                     LogicalPlan::Unnest(Unnest { column, .. }) => {
                         write!(f, "Unnest: {column}")
+                    }
+                    LogicalPlan::RecursiveQuery(RecursiveQuery {
+                        is_distinct, ..
+                    }) => {
+                        write!(f, "RecursiveQuery: is_distinct={}", is_distinct)
                     }
                 }
             }
@@ -2327,6 +2364,20 @@ pub struct Unnest {
     pub schema: DFSchemaRef,
     /// Options
     pub options: UnnestOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RecursiveQuery {
+    /// Name of the query
+    pub name: String,
+    /// The static term (initial contents of the working table)
+    pub static_term: Arc<LogicalPlan>,
+    /// The recursive term (evaluated on the contents of the working table until
+    /// it returns an empty set)
+    pub recursive_term: Arc<LogicalPlan>,
+    /// Should the output of the recursive term be deduplicated (`UNION`) or
+    /// not (`UNION ALL`).
+    pub is_distinct: bool,
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ mod set_expr;
 mod statement;
 pub mod utils;
 mod values;
+pub mod cte_worktable;
 
 pub use datafusion_common::{ResolvedTableReference, TableReference};
 pub use expr::arrow_cast::parse_data_type;

@@ -36,7 +36,6 @@ pub struct Column {
     pub name: String,
 }
 
-
 impl Column {
     /// Create Column from optional qualifier and name. The optional qualifier, if present,
     /// will be parsed and normalized by default.

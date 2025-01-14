@@ -347,6 +347,7 @@ impl OptimizerRule for CommonSubexprEliminate {
             }
             LogicalPlan::Sort(sort) => Some(self.try_optimize_sort(sort, config)?),
             LogicalPlan::Join(_)
+            | LogicalPlan::RecursiveQuery(_)
             | LogicalPlan::CrossJoin(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)

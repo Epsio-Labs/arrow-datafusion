@@ -24,6 +24,7 @@ use crate::expr_rewriter::{
     normalize_col_with_schemas_and_ambiguity_check, normalize_cols,
     rewrite_sort_cols_by_aggs,
 };
+use crate::logical_plan::plan::RecursiveQuery;
 use crate::type_coercion::binary::comparison_coercion;
 use crate::utils::{columnize_expr, compare_sort_expr};
 use crate::{and, binary_expr, DmlStatement, Operator, WriteOp};
@@ -247,6 +248,32 @@ impl LogicalPlanBuilder {
             file_format,
             single_file_output,
             copy_options,
+        })))
+    }
+
+    pub fn to_recursive_query(
+        self,
+        name: String,
+        recursive_term: LogicalPlan,
+        is_distinct: bool,
+    ) -> Result<Self> {
+        // Ensure that the static term and the recursive term have the same number of fields
+        let static_fields_len = self.plan.schema().fields().len();
+        let recursive_fields_len = recursive_term.schema().fields().len();
+        if static_fields_len != recursive_fields_len {
+            return plan_err!(
+                "Non-recursive term and recursive term must have the same number of columns ({} != {})",
+                static_fields_len, recursive_fields_len
+            );
+        }
+        // Ensure that the recursive term has the same field types as the static term
+        let coerced_recursive_term =
+            coerce_plan_expr_for_schema(&recursive_term, self.plan.schema())?;
+        Ok(Self::from(LogicalPlan::RecursiveQuery(RecursiveQuery {
+            name,
+            static_term: Arc::new(self.plan),
+            recursive_term: Arc::new(coerced_recursive_term),
+            is_distinct,
         })))
     }
 
