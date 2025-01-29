@@ -712,6 +712,7 @@ fn string_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
         (Utf8, Utf8) => Some(Utf8),
         (LargeUtf8, Utf8) => Some(LargeUtf8),
         (Utf8, LargeUtf8) => Some(LargeUtf8),
+        (Utf8, FixedSizeBinary(_)) | (FixedSizeBinary(_), Utf8) => Some(Utf8),
         (LargeUtf8, LargeUtf8) => Some(LargeUtf8),
         // TODO: cast between array elements (#6558)
         (List(_), List(_)) => Some(lhs_type.clone()),
