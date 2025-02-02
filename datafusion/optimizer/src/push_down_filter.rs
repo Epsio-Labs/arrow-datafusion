@@ -232,7 +232,7 @@ fn extract_or_clauses_for_join(
     schema: &DFSchema,
     preserved: bool,
 ) -> Vec<Expr> {
-    if !preserved {
+    if preserved {
         return vec![];
     }
 
@@ -465,12 +465,12 @@ fn push_down_all_join(
     let or_to_left = extract_or_clauses_for_join(
         &keep_predicates.iter().collect::<Vec<_>>(),
         left.schema(),
-        left_preserved,
+        false,
     );
     let or_to_right = extract_or_clauses_for_join(
         &keep_predicates.iter().collect::<Vec<_>>(),
         right.schema(),
-        right_preserved,
+        false,
     );
     let on_or_to_left = extract_or_clauses_for_join(
         &join_conditions.iter().collect::<Vec<_>>(),
