@@ -1149,54 +1149,6 @@ impl<'a, S: SimplifyInfo> TreeNodeRewriter for Simplifier<'a, S> {
             //
             Expr::Negative(inner) => distribute_negation(*inner),
 
-            //
-            // Rules for Case
-            //
-
-            // CASE
-            //   WHEN X THEN A
-            //   WHEN Y THEN B
-            //   ...
-            //   ELSE Q
-            // END
-            //
-            // ---> (X AND A) OR (Y AND B AND NOT X) OR ... (NOT (X OR Y) AND Q)
-            //
-            // Note: the rationale for this rewrite is that the expr can then be further
-            // simplified using the existing rules for AND/OR
-            Expr::Case(Case {
-                expr: None,
-                when_then_expr,
-                else_expr,
-            }) if !when_then_expr.is_empty()
-                && when_then_expr.len() < 3 // The rewrite is O(n!) so limit to small number
-                && info.is_boolean_type(&when_then_expr[0].1)? =>
-            {
-                // The disjunction of all the when predicates encountered so far
-                let mut filter_expr = lit(false);
-                // The disjunction of all the cases
-                let mut out_expr = lit(false);
-
-                for (when, then) in when_then_expr {
-                    let case_expr = when
-                        .as_ref()
-                        .clone()
-                        .and(filter_expr.clone().not())
-                        .and(*then);
-
-                    out_expr = out_expr.or(case_expr);
-                    filter_expr = filter_expr.or(*when);
-                }
-
-                if let Some(else_expr) = else_expr {
-                    let case_expr = filter_expr.not().and(*else_expr);
-                    out_expr = out_expr.or(case_expr);
-                }
-
-                // Do a first pass at simplification
-                out_expr.rewrite(self)?
-            }
-
             // log
             Expr::ScalarFunction(ScalarFunction {
                 fun: BuiltinScalarFunction::Log,
