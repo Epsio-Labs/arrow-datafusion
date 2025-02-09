@@ -17,8 +17,6 @@
 
 //! Expression simplification API
 
-use std::ops::Not;
-
 use super::or_in_list_simplifier::OrInListSimplifier;
 use super::utils::*;
 
@@ -36,7 +34,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{InList, InSubquery, ScalarFunction};
 use datafusion_expr::{
-    and, expr, lit, or, BinaryExpr, BuiltinScalarFunction, Case, ColumnarValue, Expr,
+    and, expr, lit, or, BinaryExpr, BuiltinScalarFunction, ColumnarValue, Expr,
     Like, Volatility,
 };
 use datafusion_physical_expr::{
