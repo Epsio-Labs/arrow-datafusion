@@ -65,6 +65,11 @@ pub trait ContextProvider {
 pub struct ParserOptions {
     pub parse_float_as_decimal: bool,
     pub enable_ident_normalization: bool,
+    /// When we encounter a numeric constant, we need to parse it with precision and scale values.
+    /// Since it doesn't arrive from a column whose type we know, we need to use a default precision and scale.
+    /// This is what this configuration controls
+    pub default_decimal128_precision: u8,
+    pub default_decimal128_scale: i8,
 }
 
 impl Default for ParserOptions {
@@ -72,6 +77,8 @@ impl Default for ParserOptions {
         Self {
             parse_float_as_decimal: false,
             enable_ident_normalization: true,
+            default_decimal128_precision: DECIMAL128_MAX_PRECISION,
+            default_decimal128_scale: DECIMAL_DEFAULT_SCALE,
         }
     }
 }
@@ -370,7 +377,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         (Some(precision), Some(scale))
                     }
                 };
-                make_decimal_type(precision, scale)
+                make_decimal_type(precision, scale, self.options.default_decimal128_precision, self.options.default_decimal128_scale)
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
