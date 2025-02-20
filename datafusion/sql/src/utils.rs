@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 // use arrow_schema::DECIMAL_DEFAULT_SCALE;
 // Default scale for decimal type is 18 (as FixedDecimal type)
-const DECIMAL_DEFAULT_SCALE: i8 = 18;
+pub const DECIMAL_DEFAULT_SCALE: i8 = 18;
 
 /// Make a best-effort attempt at resolving all columns in the expression tree
 pub(crate) fn resolve_columns(expr: &Expr, plan: &LogicalPlan) -> Result<Expr> {

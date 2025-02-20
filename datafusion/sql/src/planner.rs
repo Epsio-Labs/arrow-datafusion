@@ -40,6 +40,7 @@ use datafusion_expr::utils::find_column_exprs;
 use datafusion_expr::TableSource;
 use datafusion_expr::{col, AggregateUDF, Expr, ScalarUDF};
 
+use crate::utils;
 use crate::utils::make_decimal_type;
 
 /// The ContextProvider trait allows the query planner to obtain meta-data about tables and
@@ -78,7 +79,7 @@ impl Default for ParserOptions {
             parse_float_as_decimal: false,
             enable_ident_normalization: true,
             default_decimal128_precision: DECIMAL128_MAX_PRECISION,
-            default_decimal128_scale: DECIMAL_DEFAULT_SCALE,
+            default_decimal128_scale: utils::DECIMAL_DEFAULT_SCALE,
         }
     }
 }
