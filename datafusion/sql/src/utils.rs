@@ -220,6 +220,8 @@ pub fn window_expr_common_partition_keys(window_exprs: &[Expr]) -> Result<&[Expr
 pub(crate) fn make_decimal_type(
     precision: Option<u64>,
     scale: Option<u64>,
+    default_decimal128_precision: u8,
+    default_decimal128_scale: i8,
 ) -> Result<DataType> {
     // postgres like behavior
     let (precision, scale) = match (precision, scale) {
@@ -228,7 +230,7 @@ pub(crate) fn make_decimal_type(
         (None, Some(_)) => {
             return plan_err!("Cannot specify only scale for decimal data type")
         }
-        (None, None) => (DECIMAL128_MAX_PRECISION, DECIMAL_DEFAULT_SCALE),
+        (None, None) => (default_decimal128_precision, default_decimal128_scale),
     };
 
     // Arrow decimal is i128 meaning 38 maximum decimal digits
