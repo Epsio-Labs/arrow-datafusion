@@ -383,11 +383,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
             SQLDataType::JSON => Ok(json_type()),
+            SQLDataType::Uuid => Ok(DataType::FixedSizeBinary(16)),
             // Explicitly list all other types so that if sqlparser
             // adds/changes the `SQLDataType` the compiler will tell us on upgrade
             // and avoid bugs like https://github.com/apache/arrow-datafusion/issues/3059
             SQLDataType::Nvarchar(_)
-            | SQLDataType::Uuid
             | SQLDataType::Binary(_)
             | SQLDataType::Varbinary(_)
             | SQLDataType::Blob(_)
