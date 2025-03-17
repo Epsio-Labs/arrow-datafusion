@@ -41,7 +41,7 @@ use datafusion_expr::{
     col, expr, lit, AggregateFunction, Between, BinaryExpr, BuiltinScalarFunction, Cast,
     Expr, ExprSchemable, GetFieldAccess, GetIndexedField, Like, Operator, TryCast,
 };
-use sqlparser::ast::{ArrayAgg, Expr as SQLExpr, JsonOperator, TrimWhereField, Value};
+use sqlparser::ast::{ArrayAgg, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, JsonOperator, ObjectName, TrimWhereField, Value};
 use sqlparser::parser::ParserError::ParserError;
 
 impl<'a, S: ContextProvider> SqlToRel<'a, S> {
@@ -406,13 +406,30 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 substring_from,
                 substring_for,
                 special: false,
-            } => self.sql_substring_to_expr(
-                expr,
-                substring_from,
-                substring_for,
-                schema,
-                planner_context,
-            ),
+            } => {
+                if let Some(from) = substring_from {
+                    let mut args = vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(*expr)), FunctionArg::Unnamed(FunctionArgExpr::Expr(*from))];
+                    if let Some(f) = substring_for {
+                        args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(*f)));
+                    }
+                    return self.sql_function_to_expr(Function {
+                        name: ObjectName(vec!["substr".into()]),
+                        args,
+                        over: None,
+                        distinct: false,
+                        special: false,
+                        order_by: vec![],
+                    }, schema, planner_context)
+                }
+
+                self.sql_substring_to_expr(
+                    expr,
+                    substring_from,
+                    substring_for,
+                    schema,
+                    planner_context,
+                )
+            },
 
             #[cfg(not(feature = "unicode_expressions"))]
             SQLExpr::Substring { .. } => {
