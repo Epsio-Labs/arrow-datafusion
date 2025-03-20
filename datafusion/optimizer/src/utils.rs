@@ -308,7 +308,7 @@ pub(crate) fn collect_subquery_cols(
     })
 }
 
-pub(crate) fn replace_qualified_name(
+pub(crate) fn replace_qualified_name_preserving_case(
     expr: Expr,
     cols: &BTreeSet<Column>,
     subquery_alias: &str,
@@ -316,7 +316,7 @@ pub(crate) fn replace_qualified_name(
     let alias_cols: Vec<Column> = cols
         .iter()
         .map(|col| {
-            Column::from_qualified_name(format!("{}.{}", subquery_alias, col.name))
+            Column::from_qualified_name_ignore_case(format!("{}.{}", subquery_alias, col.name))
         })
         .collect();
     let replace_map: HashMap<&Column, &Column> =

@@ -17,7 +17,7 @@
 
 use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
 use crate::optimizer::ApplyOrder;
-use crate::utils::{conjunction, replace_qualified_name};
+use crate::utils::{conjunction, replace_qualified_name_preserving_case};
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{
@@ -303,7 +303,7 @@ fn build_join(
     // alias the join filter
     let join_filter_opt =
         conjunction(pull_up.join_filters).map_or(Ok(None), |filter| {
-            replace_qualified_name(filter, &all_correlated_cols, subquery_alias)
+            replace_qualified_name_preserving_case(filter, &all_correlated_cols, subquery_alias)
                 .map(Option::Some)
         })?;
 
