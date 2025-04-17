@@ -653,10 +653,27 @@ pub fn enum_type(enum_name: String) -> DataType {
     DataType::Struct(json_struct)
 }
 
+pub fn vector_type(size: usize) -> DataType {
+    let vector_struct = Fields::from(vec![
+        Field::new("vector", DataType::Utf8, false),
+        Field::new(size.to_string(), DataType::Utf8, false),
+    ]);
+    DataType::Struct(vector_struct)
+}
+
 pub fn extract_enum_name(t: &DataType) -> Option<String> {
     if let DataType::Struct(fields) = t {
         if fields.len() == 2 && fields[0].name() == "enum" {
             return Some(fields[1].name().to_string());
+        }
+    }
+    None
+}
+
+pub fn extract_vector_size(t: &DataType) -> Option<usize> {
+    if let DataType::Struct(fields) = t {
+        if fields.len() == 2 && fields[0].name() == "vector" {
+            return Some(fields[1].name().to_string().parse().unwrap());
         }
     }
     None
