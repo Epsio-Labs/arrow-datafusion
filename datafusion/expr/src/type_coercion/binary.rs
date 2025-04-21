@@ -184,6 +184,12 @@ fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature>
             } else if let Some(numeric) = mathematics_numerical_coercion(lhs, rhs) {
                 // Numeric arithmetic, e.g. Int32 + Int32
                 Ok(Signature::uniform(numeric))
+            } else if let Some(json_result_type) = json_coercion(lhs, rhs) {
+                Ok(Signature {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    ret: json_result_type,
+                })
             } else {
                 plan_err!("Cannot coerce arithmetic expression {lhs} {op} {rhs} to valid types")
             }
@@ -554,6 +560,18 @@ fn mathematics_numerical_coercion(
         (UInt32, _) | (_, UInt32) => Some(UInt32),
         (UInt16, _) | (_, UInt16) => Some(UInt16),
         (UInt8, _) | (_, UInt8) => Some(UInt8),
+        _ => None,
+    }
+}
+
+/// The JSONB type in postgres supports some binary operators, like "-" to delete a key from an object.
+/// This coercion is for these kind of operators
+fn json_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
+    if lhs_type != &json_type() {
+        return None;
+    }
+    match rhs_type {
+        DataType::Utf8 | DataType::LargeUtf8 => Some(json_type()),
         _ => None,
     }
 }
