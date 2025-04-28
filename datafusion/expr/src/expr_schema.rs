@@ -22,7 +22,7 @@ use crate::expr::{
     TryCast, WindowFunction,
 };
 use crate::field_util::GetFieldAccessSchema;
-use crate::type_coercion::binary::{extract_enum_name, get_result_type};
+use crate::type_coercion::binary::{extract_enum_schema_and_name, get_result_type};
 use crate::{LogicalPlan, Projection, Subquery};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field};
@@ -325,7 +325,7 @@ impl ExprSchemable for Expr {
         }
 
         // Specific handling for enum
-        if extract_enum_name(&this_type).is_some() && cast_to_type == &DataType::Utf8 {
+        if extract_enum_schema_and_name(&this_type).is_some() && cast_to_type == &DataType::Utf8 {
             return Ok(self);
         }
 
