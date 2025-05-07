@@ -41,6 +41,7 @@ dictionary_expressions = ["arrow/dyn_cmp_dict"]
 encoding_expressions = ["base64", "hex"]
 regex_expressions = ["regex"]
 unicode_expressions = ["unicode-segmentation"]
+force_hash_collisions= []
 
 [dependencies]
 ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
@@ -69,7 +70,6 @@ regex = { version = "1.8", optional = true }
 sha2 = { version = "^0.10.1", optional = true }
 unicode-segmentation = { version = "^1.7.1", optional = true }
 uuid = { version = "^1.2", features = ["v4"] }
-
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"

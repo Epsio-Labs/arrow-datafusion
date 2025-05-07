@@ -96,10 +96,11 @@ impl<'a> SimplifyContext<'a> {
     }
 }
 
+
 impl<'a> SimplifyInfo for SimplifyContext<'a> {
     /// returns true if this Expr has boolean type
     fn is_boolean_type(&self, expr: &Expr) -> Result<bool> {
-        for schema in &self.schema {
+        while let Some(schema) = &self.schema {
             if let Ok(DataType::Boolean) = expr.get_type(schema) {
                 return Ok(true);
             }
