@@ -60,12 +60,15 @@ pub enum TypeSignature {
     Any(usize),
     /// One of a list of signatures
     OneOf(Vec<TypeSignature>),
+    /// Variadic, but replace nulls with the first non-null type. If no such type exist, we keep all nulls
+    VariadicFilterNulls(Vec<DataType>),
 }
 
 impl TypeSignature {
     pub(crate) fn to_string_repr(&self) -> Vec<String> {
         match self {
-            TypeSignature::Variadic(types) => {
+            TypeSignature::Variadic(types)
+            | TypeSignature::VariadicFilterNulls(types) => {
                 vec![format!("{}, ..", Self::join_types(types, "/"))]
             }
             TypeSignature::Uniform(arg_count, valid_types) => {
@@ -172,6 +175,14 @@ impl Signature {
     pub fn one_of(type_signatures: Vec<TypeSignature>, volatility: Volatility) -> Self {
         Signature {
             type_signature: TypeSignature::OneOf(type_signatures),
+            volatility,
+        }
+    }
+    /// variadic - Creates a variadic signature that represents an arbitrary number of arguments all from a type in common_types,
+    /// filtering nulls in the input types
+    pub fn variadic_filter_nulls(common_types: Vec<DataType>, volatility: Volatility) -> Self {
+        Self {
+            type_signature: TypeSignature::VariadicFilterNulls(common_types),
             volatility,
         }
     }

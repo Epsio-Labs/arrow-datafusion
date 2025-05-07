@@ -36,17 +36,39 @@ pub fn data_types(
     if current_types.is_empty() {
         return Ok(vec![]);
     }
-    let valid_types = get_valid_types(&signature.type_signature, current_types)?;
+    // In case of `VariadicFilterNulls`, we want to replace all null types with the first non-null type before
+    // we try coercing. If there aren't null types we do the usual variadic behavior
+    let has_nulls = current_types
+        .iter()
+        .any(|current_type| matches!(current_type, DataType::Null));
+    let should_filter_nulls = matches!(
+        signature.type_signature,
+        TypeSignature::VariadicFilterNulls(_)
+    );
+    let current_types = if should_filter_nulls && has_nulls {
+        // If all types passed are null we have no choice but keep a null
+        let first_non_null = current_types
+            .iter()
+            .find(|current_type| !matches!(current_type, DataType::Null))
+            .unwrap_or(&DataType::Null);
+        current_types
+            .iter()
+            .map(|_| first_non_null.clone())
+            .collect()
+    } else {
+        current_types.to_vec()
+    };
 
+    let valid_types = get_valid_types(&signature.type_signature, &current_types)?;
     if valid_types
         .iter()
-        .any(|data_type| data_type == current_types)
+        .any(|data_type| data_type == &current_types)
     {
         return Ok(current_types.to_vec());
     }
 
     for valid_types in valid_types {
-        if let Some(types) = maybe_data_types(&valid_types, current_types) {
+        if let Some(types) = maybe_data_types(&valid_types, &current_types) {
             return Ok(types);
         }
     }
@@ -64,7 +86,8 @@ fn get_valid_types(
     current_types: &[DataType],
 ) -> Result<Vec<Vec<DataType>>> {
     let valid_types = match signature {
-        TypeSignature::Variadic(valid_types) => valid_types
+        TypeSignature::Variadic(valid_types)
+        | TypeSignature::VariadicFilterNulls(valid_types) => valid_types
             .iter()
             .map(|valid_type| current_types.iter().map(|_| valid_type.clone()).collect())
             .collect(),
