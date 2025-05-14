@@ -466,6 +466,10 @@ config_namespace! {
         /// The maximum estimated size in bytes for one input side of a HashJoin
         /// will be collected into a single partition
         pub hash_join_single_partition_threshold: usize, default = 1024 * 1024
+
+        /// Is emitting a semijoin as an optimization supported?
+        /// If so we emit it as a join type, otherwise we translate it to a join + distinct
+        pub emit_semijoin: bool, default = true
     }
 }
 

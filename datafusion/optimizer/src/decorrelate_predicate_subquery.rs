@@ -17,7 +17,9 @@
 
 use crate::decorrelate::PullUpCorrelatedExpr;
 use crate::optimizer::ApplyOrder;
-use crate::utils::{conjunction, replace_qualified_name_preserving_case, split_conjunction};
+use crate::utils::{
+    conjunction, replace_qualified_name_preserving_case, split_conjunction,
+};
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::TreeNode;
@@ -113,9 +115,12 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
                 // iterate through all exists clauses in predicate, turning each into a join
                 let mut cur_input = filter.input.as_ref().clone();
                 for subquery in subqueries {
-                    if let Some(plan) =
-                        build_join(&subquery, &cur_input, config.alias_generator())?
-                    {
+                    if let Some(plan) = build_join(
+                        &subquery,
+                        &cur_input,
+                        config.alias_generator(),
+                        config.options().optimizer.emit_semijoin,
+                    )? {
                         cur_input = plan;
                     } else {
                         // If the subquery can not be converted to a Join, reconstruct the subquery expression and add it to the Filter
@@ -199,6 +204,7 @@ fn build_join(
     query_info: &SubqueryInfo,
     left: &LogicalPlan,
     alias: Arc<AliasGenerator>,
+    semijoin_supported: bool,
 ) -> Result<Option<LogicalPlan>> {
     let where_in_expr_opt = &query_info.where_in_expr;
     let in_predicate_opt = where_in_expr_opt
@@ -244,51 +250,90 @@ fn build_join(
     // alias the join filter
     let join_filter_opt =
         conjunction(pull_up.join_filters).map_or(Ok(None), |filter| {
-            replace_qualified_name_preserving_case(filter, &all_correlated_cols, &subquery_alias)
-                .map(Option::Some)
+            replace_qualified_name_preserving_case(
+                filter,
+                &all_correlated_cols,
+                &subquery_alias,
+            )
+            .map(Option::Some)
         })?;
-
-    if let Some(join_filter) = match (join_filter_opt, in_predicate_opt) {
-        (
-            Some(join_filter),
-            Some(Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Eq,
-                right,
-            })),
-        ) => {
-            let right_col = create_col_from_scalar_expr(right.deref(), subquery_alias)?;
-            let in_predicate = Expr::eq(left.deref().clone(), Expr::Column(right_col));
-            Some(in_predicate.and(join_filter))
+    // when translating a semi join to join + distinct, a more optimized version is translating
+    // to distinct on the in predicate if possible
+    if let Some((join_filter, right_distinct_key)) =
+        match (join_filter_opt, in_predicate_opt) {
+            (
+                Some(join_filter),
+                Some(Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op: Operator::Eq,
+                    right,
+                })),
+            ) => {
+                let right_col = Expr::Column(create_col_from_scalar_expr(
+                    right.deref(),
+                    subquery_alias,
+                )?);
+                let in_predicate = Expr::eq(left.deref().clone(), right_col.clone());
+                Some((in_predicate.and(join_filter), None))
+            }
+            (Some(join_filter), _) => Some((join_filter, None)),
+            (
+                _,
+                Some(Expr::BinaryExpr(BinaryExpr {
+                    left,
+                    op: Operator::Eq,
+                    right,
+                })),
+            ) => {
+                let right_col = Expr::Column(create_col_from_scalar_expr(
+                    right.deref(),
+                    subquery_alias,
+                )?);
+                let in_predicate = Expr::eq(left.deref().clone(), right_col.clone());
+                Some((in_predicate, Some(right_col)))
+            }
+            _ => None,
         }
-        (Some(join_filter), _) => Some(join_filter),
-        (
-            _,
-            Some(Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::Eq,
-                right,
-            })),
-        ) => {
-            let right_col = create_col_from_scalar_expr(right.deref(), subquery_alias)?;
-            let in_predicate = Expr::eq(left.deref().clone(), Expr::Column(right_col));
-            Some(in_predicate)
-        }
-        _ => None,
-    } {
+    {
         // join our sub query into the main plan
         let join_type = match query_info.negated {
             true => JoinType::LeftAnti,
             false => JoinType::LeftSemi,
         };
-        let new_plan = LogicalPlanBuilder::from(left.clone())
+        let plan = LogicalPlanBuilder::from(left.clone())
             .join(
-                sub_query_alias,
+                sub_query_alias.clone(),
                 join_type,
                 (Vec::<Column>::new(), Vec::<Column>::new()),
-                Some(join_filter),
+                Some(join_filter.clone()),
             )?
             .build()?;
+        let new_plan = match join_type {
+            JoinType::LeftAnti => plan,
+            JoinType::LeftSemi if semijoin_supported => plan,
+            JoinType::LeftSemi if right_distinct_key.is_some() => {
+                // Translate to distinct on the `IN` key in the right side + join + projection of the left side
+                let left_columns = left
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| Expr::Column(f.qualified_column()));
+                let right_side_distinct = LogicalPlanBuilder::from(sub_query_alias)
+                    .distinct(right_distinct_key.map(|expr| vec![expr]))?
+                    .build()?;
+                let plan = LogicalPlanBuilder::from(left.clone())
+                    .join(
+                        right_side_distinct,
+                        JoinType::Inner,
+                        (Vec::<Column>::new(), Vec::<Column>::new()),
+                        Some(join_filter),
+                    )?
+                    .project(left_columns)?
+                    .build()?;
+                plan
+            }
+            _ => return Ok(None),
+        };
         debug!(
             "predicate subquery optimized:\n{}",
             new_plan.display_indent()
