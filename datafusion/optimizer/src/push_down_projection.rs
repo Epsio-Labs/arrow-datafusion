@@ -30,6 +30,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{AggregateFunction, Alias};
 use datafusion_expr::utils::exprlist_to_fields;
+use datafusion_expr::Distinct;
 use datafusion_expr::{
     logical_plan::{Aggregate, LogicalPlan, Projection, TableScan, Union},
     utils::{expr_to_columns, exprlist_to_columns},
@@ -360,6 +361,29 @@ impl OptimizerRule for PushDownProjection {
                     generate_plan!(projection_is_empty, plan, new_sort)
                 }
             }
+            LogicalPlan::Distinct(Distinct {
+                on_expr: Some(on_expr),
+                input,
+            }) => {
+                if can_eliminate(projection, child_plan.schema()) {
+                    // can commute
+                    let new_proj = plan.with_new_inputs(&[(**input).clone()])?;
+                    child_plan.with_new_inputs(&[new_proj])?
+                } else {
+                    let mut required_columns = HashSet::new();
+                    exprlist_to_columns(&projection.expr, &mut required_columns)?;
+                    exprlist_to_columns(&on_expr, &mut required_columns)?;
+
+                    let new_expr = get_expr(&required_columns, input.schema())?;
+                    let new_projection = LogicalPlan::Projection(Projection::try_new(
+                        new_expr,
+                        input.clone(),
+                    )?);
+                    let new_distinct = child_plan.with_new_inputs(&[new_projection])?;
+
+                    generate_plan!(projection_is_empty, plan, new_distinct)
+                }
+            }
             LogicalPlan::Limit(limit) => {
                 // can commute
                 let new_proj = plan.with_new_inputs(&[limit.input.as_ref().clone()])?;
@@ -454,19 +478,12 @@ fn generate_projection(
     schema: &DFSchemaRef,
     input: Arc<LogicalPlan>,
 ) -> Result<LogicalPlan> {
-    let expr = schema
-        .fields()
-        .iter()
-        .flat_map(|field| {
-            let column = field.qualified_column();
-            if used_columns.contains(&column) {
-                Some(Expr::Column(column))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
+    let mut expr = vec![];
+    for column in used_columns {
+        if schema.is_column_from_schema(column)? {
+            expr.push(Expr::Column(column.clone()));
+        }
+    }
     Ok(LogicalPlan::Projection(Projection::try_new(expr, input)?))
 }
 
