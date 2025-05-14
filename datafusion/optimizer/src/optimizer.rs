@@ -142,6 +142,12 @@ impl OptimizerContext {
         self.options.optimizer.max_passes = v as usize;
         self
     }
+
+    /// Emitting a left semijoin might not be supported, in which case we emit a join + distinct
+    pub fn with_semijoin_supported(mut self, emit_semijoin: bool) -> Self {
+        self.options.optimizer.emit_semijoin = emit_semijoin;
+        self
+    }
 }
 
 impl Default for OptimizerContext {
