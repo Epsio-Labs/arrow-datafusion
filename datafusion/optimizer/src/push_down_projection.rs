@@ -457,15 +457,15 @@ fn get_expr(columns: &HashSet<Column>, schema: &DFSchemaRef) -> Result<Vec<Expr>
         .fields()
         .iter()
         .flat_map(|field| {
-            let qc = field.qualified_column();
-            let uqc = field.unqualified_column();
-            if columns.contains(&qc) || columns.contains(&uqc) {
-                Some(Expr::Column(qc))
+            let column = field.qualified_column();
+            if columns.iter().any(|c| c.is_equivalent_to(field)) {
+                Some(Expr::Column(column))
             } else {
                 None
             }
         })
-        .collect::<Vec<Expr>>();
+        .collect::<Vec<_>>();
+
     if columns.len() != expr.len() {
         plan_err!("required columns can't push down, columns: {columns:?}")
     } else {
@@ -478,12 +478,19 @@ fn generate_projection(
     schema: &DFSchemaRef,
     input: Arc<LogicalPlan>,
 ) -> Result<LogicalPlan> {
-    let mut expr = vec![];
-    for column in used_columns {
-        if schema.is_column_from_schema(column)? {
-            expr.push(Expr::Column(column.clone()));
-        }
-    }
+    let expr = schema
+        .fields()
+        .iter()
+        .flat_map(|field| {
+            let column = field.qualified_column();
+            if used_columns.iter().any(|c| c.is_equivalent_to(field)) {
+                Some(Expr::Column(column))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
     Ok(LogicalPlan::Projection(Projection::try_new(expr, input)?))
 }
 
@@ -504,7 +511,7 @@ fn push_down_scan(
     let mut projection: BTreeSet<usize> = used_columns
         .iter()
         .filter(|c| {
-            c.relation.is_none() || c.relation.as_ref().unwrap() == &scan.table_name
+            c.relation.is_none() || c.relation.as_ref().unwrap().resolved_eq(&scan.table_name)
         })
         .map(|c| schema.index_of(&c.name))
         .filter_map(ArrowResult::ok)

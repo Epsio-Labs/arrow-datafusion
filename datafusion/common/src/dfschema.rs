@@ -211,34 +211,7 @@ impl DFSchema {
             .fields
             .iter()
             .enumerate()
-            .filter(|(_, field)| match (qualifier, &field.qualifier) {
-                // field to lookup is qualified.
-                // current field is qualified and not shared between relations, compare both
-                // qualifier and name.
-                (Some(q), Some(field_q)) => {
-                    q.resolved_eq(field_q)
-                        && field.name().to_lowercase() == name.to_lowercase()
-                }
-                // field to lookup is qualified but current field is unqualified.
-                (Some(qq), None) => {
-                    // the original field may now be aliased with a name that matches the
-                    // original qualified name
-                    let column = Column::from_qualified_name(field.name());
-                    match column {
-                        Column {
-                            relation: Some(r),
-                            name: column_name,
-                        } => {
-                            &r == qq && column_name.to_lowercase() == name.to_lowercase()
-                        }
-                        _ => false,
-                    }
-                }
-                // field to lookup is unqualified, no need to compare qualifier
-                (None, Some(_)) | (None, None) => {
-                    field.name().to_lowercase() == name.to_lowercase()
-                }
-            })
+            .filter(|(_, field)| Column::new(qualifier.map(|q| q.to_owned_reference()), name).is_equivalent_to(field))
             .map(|(idx, _)| idx);
         Ok(matches.next())
     }

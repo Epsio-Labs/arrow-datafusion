@@ -222,6 +222,37 @@ impl Column {
         }))
     }
 
+    pub fn is_equivalent_to(&self, field: &DFField) -> bool {
+        match (&self.relation, &field.qualifier()) {
+            // field to lookup is qualified.
+            // current field is qualified and not shared between relations, compare both
+            // qualifier and name.
+            (Some(q), Some(field_q)) => {
+                q.resolved_eq(field_q)
+                    && field.name().to_lowercase() == self.name.to_lowercase()
+            }
+            // field to lookup is qualified but current field is unqualified.
+            (Some(qq), None) => {
+                // the original field may now be aliased with a name that matches the
+                // original qualified name
+                let column = Column::from_qualified_name(field.name());
+                match column {
+                    Column {
+                        relation: Some(r),
+                        name: column_name,
+                    } => {
+                        &r == qq && column_name.to_lowercase() == self.name.to_lowercase()
+                    }
+                    _ => false,
+                }
+            }
+            // field to lookup is unqualified, no need to compare qualifier
+            (None, Some(_)) | (None, None) => {
+                field.name().to_lowercase() == self.name.to_lowercase()
+            }
+        }
+    }
+
     /// Qualify column if not done yet.
     ///
     /// Will check for ambiguity at each level of `schemas`.
