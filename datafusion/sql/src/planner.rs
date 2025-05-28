@@ -40,6 +40,13 @@ use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
 
+use crate::utils::make_decimal_type;
+pub use datafusion_expr::planner::ContextProvider;
+
+// use arrow_schema::DECIMAL_DEFAULT_SCALE;
+// Default scale for decimal type is 18 (as FixedDecimal type)
+pub const DECIMAL_DEFAULT_SCALE: i8 = 18;
+
 /// SQL parser options
 #[derive(Debug, Clone, Copy)]
 pub struct ParserOptions {
@@ -57,6 +64,11 @@ pub struct ParserOptions {
     pub map_string_types_to_utf8view: bool,
     /// Default null ordering for sorting expressions.
     pub default_null_ordering: NullOrdering,
+    /// When we encounter a numeric constant, we need to parse it with precision and scale values.
+    /// Since it doesn't arrive from a column whose type we know, we need to use a default precision and scale.
+    /// This is what this configuration controls
+    pub default_decimal128_precision: u8,
+    pub default_decimal128_scale: i8,
 }
 
 impl ParserOptions {
@@ -78,6 +90,8 @@ impl ParserOptions {
             map_string_types_to_utf8view: true,
             enable_options_value_normalization: false,
             collect_spans: false,
+            default_decimal128_precision: DECIMAL128_MAX_PRECISION,
+            default_decimal128_scale: DECIMAL_DEFAULT_SCALE,
             // By default, `nulls_max` is used to follow Postgres's behavior.
             // postgres rule: https://www.postgresql.org/docs/current/queries-order.html
             default_null_ordering: NullOrdering::NullsMax,
@@ -159,6 +173,8 @@ impl From<&SqlParserOptions> for ParserOptions {
             enable_options_value_normalization: options
                 .enable_options_value_normalization,
             collect_spans: options.collect_spans,
+            default_decimal128_precision: DECIMAL128_MAX_PRECISION,
+            default_decimal128_scale: DECIMAL128_MAX_SCALE
             default_null_ordering: options.default_null_ordering.as_str().into(),
         }
     }
@@ -726,7 +742,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         (Some(precision), Some(scale))
                     }
                 };
-                make_decimal_type(precision, scale.map(|s| s as u64))
+                make_decimal_type(precision, scale, self.options.default_decimal128_precision, self.options.default_decimal128_scale)
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval { fields, precision } => {
