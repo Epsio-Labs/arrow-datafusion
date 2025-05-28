@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::Span;
+use std::fmt::{Display, Formatter};
 
 /// Additional contextual information intended for end users, to help them
 /// understand what went wrong by providing human-readable messages, and
@@ -46,6 +47,12 @@ pub struct Diagnostic {
     pub span: Option<Span>,
     pub notes: Vec<DiagnosticNote>,
     pub helps: Vec<DiagnosticHelp>,
+}
+
+impl Display for Diagnostic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("hello")
+    }
 }
 
 /// A note enriches a [`Diagnostic`] with extra information, possibly referring

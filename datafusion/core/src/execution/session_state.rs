@@ -515,7 +515,9 @@ impl SessionState {
                 .enable_options_value_normalization,
             support_varchar_with_length: sql_parser_options.support_varchar_with_length,
             map_string_types_to_utf8view: sql_parser_options.map_string_types_to_utf8view,
+            default_decimal128_precision: 28,
             collect_spans: sql_parser_options.collect_spans,
+            default_decimal128_scale: 10,
             default_null_ordering: sql_parser_options
                 .default_null_ordering
                 .as_str()
