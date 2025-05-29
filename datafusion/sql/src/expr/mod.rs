@@ -419,6 +419,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         distinct: false,
                         special: false,
                         order_by: vec![],
+                        within_group: vec![],
                     }, schema, planner_context)
                 }
 
