@@ -27,10 +27,7 @@ use datafusion_common::{
     exec_err, internal_err, plan_err, DFSchema, DFSchemaRef, DataFusionError, Result,
     ScalarValue,
 };
-use datafusion_expr::expr::{
-    self, Between, BinaryExpr, Case, Exists, InList, InSubquery, Like, ScalarFunction,
-    ScalarUDF, WindowFunction,
-};
+use datafusion_expr::expr::{self, Between, BinaryExpr, Case, Exists, InList, InSubquery, Like, ScalarFunction, ScalarUDF, Sort, WindowFunction};
 use datafusion_expr::expr_rewriter::rewrite_preserving_name;
 use datafusion_expr::expr_schema::cast_subquery;
 use datafusion_expr::logical_plan::Subquery;
@@ -367,8 +364,40 @@ impl TreeNodeRewriter for TypeCoercionRewriter {
                     &self.schema,
                     &fun.signature,
                 )?;
+
+                // We have quite the crazy hack here; since DF doesn't support signatures
+                // pertaining to ORDER BYs (which does make sense) we're in a bit of trouble with
+                // `percentile_cont`, as we need the order by to be a type supported by
+                // the function. We therefore specifically check percentile_cont and coerce it to
+                // be the same as the signature (a float64)
+                let order_by_expr = if fun.name == "percentile_cont" && order_by.is_some() {
+                    let exprs = order_by.clone().unwrap().into_iter().map(|f| {
+                        match f {
+                            Expr::Sort(s) => {
+                                Ok(s.expr.as_ref().clone())
+                            },
+                            _ => plan_err!("Unsupported expr {f:?} in sort arguments of percentile_cont")
+                        }
+                    }).collect::<Result<Vec<_>>>()?;
+                    let coerced_order_by = coerce_arguments_for_signature(exprs.as_slice(), &self.schema, &fun.signature)?;
+                    let new_order_by_expressions = coerced_order_by.into_iter().zip(order_by.unwrap()).map(|(new, sort_expr)| {
+                        let sort = match sort_expr {
+                            Expr::Sort(s) => s,
+                            _ => unreachable!()
+                        };
+                        Expr::Sort(Sort {
+                            expr: Box::new(new),
+                            asc: sort.asc,
+                            nulls_first: sort.nulls_first,
+                        })
+                    }).collect::<Vec<_>>();
+                    Some(new_order_by_expressions)
+                } else {
+                    order_by
+                };
+
                 let expr = Expr::AggregateUDF(expr::AggregateUDF::new(
-                    fun, new_expr, filter, order_by,
+                    fun, new_expr, filter, order_by_expr,
                 ));
                 Ok(expr)
             }
