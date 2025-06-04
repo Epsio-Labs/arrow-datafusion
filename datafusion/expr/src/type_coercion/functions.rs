@@ -36,7 +36,6 @@ use datafusion_expr_common::{
     type_coercion::binary::comparison_coercion_numeric,
     type_coercion::binary::string_coercion,
 };
-use itertools::Itertools as _;
 use std::sync::Arc;
 
 /// Performs type coercion for scalar function arguments.
@@ -277,10 +276,8 @@ fn try_coerce_types(
         }
     }
 
-    // none possible -> Error
     plan_err!(
-        "Failed to coerce arguments to satisfy a call to '{function_name}' function: coercion from {} to the signature {type_signature:?} failed",
-        current_types.iter().join(", ")
+        "Invalid argument(s) {current_types:?} for '{function_name}' function. The signature of `{function_name}` is {type_signature:?}"
     )
 }
 
