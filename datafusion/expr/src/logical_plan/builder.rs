@@ -40,7 +40,7 @@ use crate::logical_plan::{
 use crate::select_expr::SelectExpr;
 use crate::utils::{
     can_hash, columnize_expr, compare_sort_expr, expand_qualified_wildcard,
-    expand_wildcard, expr_to_columns, find_valid_equijoin_key_pair,
+    expand_wildcard, expr_as_column_expr, expr_to_columns, find_valid_equijoin_key_pair,
     group_window_expr_by_sort_keys,
 };
 use crate::{
@@ -881,11 +881,43 @@ impl LogicalPlanBuilder {
     pub fn distinct_on(
         self,
         on_expr: Vec<Expr>,
-        select_expr: Vec<Expr>,
-        sort_expr: Option<Vec<SortExpr>>,
+        select_expr: &[Expr],
+        sort_expr: Vec<SortExpr>,
     ) -> Result<Self> {
+        // Collect sort columns that are missing in the input plan's schema
+        let projection = LogicalPlan::Projection(Projection::try_new(
+            select_expr.to_owned(),
+            self.plan,
+        )?);
+
+        let missing_cols = on_expr
+            .iter()
+            // Although the sort should be contained within the `on_expr`, we still want to show
+            // a correct error (not "column missing in schema")
+            .chain(sort_expr.iter().map(|c| &c.expr))
+            .flat_map(|expr| {
+                let columns = expr.column_refs();
+                let output: Vec<_> = columns
+                    .into_iter()
+                    .filter(|c| !projection.schema().has_column(c))
+                    .cloned()
+                    .collect();
+                output
+            })
+            .collect::<IndexSet<Column>>();
+
+        let plan = Self::add_missing_columns(projection, &missing_cols, false)?;
+
         Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
-            DistinctOn::try_new(on_expr, select_expr, sort_expr, self.plan)?,
+            DistinctOn::try_new(
+                on_expr,
+                select_expr
+                    .iter()
+                    .map(|s| expr_as_column_expr(s, &plan))
+                    .collect::<Result<Vec<Expr>>>()?,
+                sort_expr,
+                Arc::new(plan),
+            )?,
         ))))
     }
 

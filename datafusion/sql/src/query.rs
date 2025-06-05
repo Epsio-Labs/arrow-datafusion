@@ -25,7 +25,7 @@ use datafusion_expr::expr::{Sort, WildcardOptions};
 
 use datafusion_expr::select_expr::SelectExpr;
 use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
+    CreateMemoryTable, DdlStatement, Expr, LogicalPlan, LogicalPlanBuilder,
 };
 use sqlparser::ast::{
     Expr as SQLExpr, ExprWithAliasAndOrderBy, Ident, LimitClause, Offset, OffsetRows,
@@ -307,14 +307,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(plan);
         }
 
-        if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
-            // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
-            // optimization we're effectively doing a `first_value` aggregation according to them.
-            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
-            Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
-        } else {
-            LogicalPlanBuilder::from(plan).sort(order_by)?.build()
-        }
+        LogicalPlanBuilder::from(plan).sort(order_by)?.build()
     }
 
     /// Handle AGGREGATE pipe operator

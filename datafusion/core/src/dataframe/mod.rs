@@ -929,11 +929,11 @@ impl DataFrame {
     pub fn distinct_on(
         self,
         on_expr: Vec<Expr>,
-        select_expr: Vec<Expr>,
+        select_expr: &[Expr],
         sort_expr: Option<Vec<SortExpr>>,
     ) -> Result<DataFrame> {
         let plan = LogicalPlanBuilder::from(self.plan)
-            .distinct_on(on_expr, select_expr, sort_expr)?
+            .distinct_on(on_expr, select_expr, sort_expr.unwrap_or_default())?
             .build()?;
         Ok(DataFrame {
             session_state: self.session_state,

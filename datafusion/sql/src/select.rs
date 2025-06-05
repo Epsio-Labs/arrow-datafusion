@@ -374,10 +374,29 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
+                let select_alias_map = extract_aliases(&select_exprs);
+                // First, we need to ensure the ORDER BY expressions start with our ON expression
+                // This is because the ON expression is used to determine the distinct key
+                for (on_expr, sort) in on_expr.iter().zip(order_by_rex.iter()) {
+                    let on_expr = resolve_columns(
+                        &resolve_aliases_to_exprs(on_expr.clone(), &select_alias_map)?,
+                        &base_plan,
+                    )?;
+                    let sort_expr = resolve_columns(
+                        &resolve_aliases_to_exprs(sort.expr.clone(), &select_alias_map)?,
+                        &base_plan,
+                    )?;
+                    if on_expr != sort_expr {
+                        plan_err!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions (ON expression `{}` does not match ORDER BY expression `{}`)", on_expr.human_display(), sort_expr.human_display())?
+                    }
+                }
+
                 // Build the final plan
-                LogicalPlanBuilder::from(base_plan)
-                    .distinct_on(on_expr, select_exprs, None)?
-                    .build()
+                let distinct_on_plan = LogicalPlanBuilder::from(base_plan)
+                    .distinct_on(on_expr, &select_exprs, order_by_rex)?
+                    .build()?;
+
+                return Ok(distinct_on_plan);
             }
         }?;
 
