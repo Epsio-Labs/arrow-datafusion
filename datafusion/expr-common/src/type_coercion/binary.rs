@@ -37,8 +37,6 @@ use datafusion_common::{
 };
 use itertools::Itertools;
 
-
-
 /// The type signature of an instantiation of binary operator expression such as
 /// `lhs + rhs`
 ///

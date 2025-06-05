@@ -741,7 +741,12 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         (Some(precision), Some(scale))
                     }
                 };
-                make_decimal_type(precision, scale, self.options.default_decimal128_precision, self.options.default_decimal128_scale)
+                make_decimal_type(
+                    precision,
+                    scale,
+                    self.options.default_decimal128_precision,
+                    self.options.default_decimal128_scale,
+                )
             }
             SQLDataType::Bytea => Ok(DataType::Binary),
             SQLDataType::Interval { fields, precision } => {

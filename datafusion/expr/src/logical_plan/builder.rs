@@ -38,7 +38,11 @@ use crate::logical_plan::{
     Window,
 };
 use crate::select_expr::SelectExpr;
-use crate::utils::{can_hash, columnize_expr, compare_sort_expr, expand_qualified_wildcard, expand_wildcard, expr_as_column_expr, expr_to_columns, find_valid_equijoin_key_pair, group_window_expr_by_sort_keys};
+use crate::utils::{
+    can_hash, columnize_expr, compare_sort_expr, expand_qualified_wildcard,
+    expand_wildcard, expr_as_column_expr, expr_to_columns, find_valid_equijoin_key_pair,
+    group_window_expr_by_sort_keys,
+};
 use crate::{
     and, binary_expr, lit, DmlStatement, ExplainOption, Expr, ExprSchemable, Operator,
     RecursiveQuery, Statement, TableProviderFilterPushDown, TableSource, WriteOp,
@@ -770,8 +774,6 @@ impl LogicalPlanBuilder {
         plan_err!("For SELECT DISTINCT, ORDER BY expressions {missing_col_names} must appear in select list")
     }
 
-
-
     /// Apply a sort by provided expressions with default direction
     pub fn sort_by(
         self,
@@ -834,8 +836,6 @@ impl LogicalPlanBuilder {
             is_distinct,
         )?;
 
-
-
         let sort_plan = LogicalPlan::Sort(Sort {
             expr: normalize_sorts(sorts, &plan)?,
             input: Arc::new(plan),
@@ -891,10 +891,8 @@ impl LogicalPlanBuilder {
         sort_expr: Vec<SortExpr>,
     ) -> Result<Self> {
         // Collect sort columns that are missing in the input plan's schema
-        let projection = LogicalPlan::Projection(Projection::try_new(
-            select_expr.clone(),
-            self.plan,
-        )?);
+        let projection =
+            LogicalPlan::Projection(Projection::try_new(select_expr.clone(), self.plan)?);
 
         let missing_cols = on_expr
             .iter()
@@ -906,21 +904,24 @@ impl LogicalPlanBuilder {
                 let output: Vec<_> = columns
                     .into_iter()
                     .filter(|c| !projection.schema().has_column(c))
-                    .map(|c| c.clone()).collect();
+                    .map(|c| c.clone())
+                    .collect();
                 output
-            }).collect::<IndexSet<Column>>();
+            })
+            .collect::<IndexSet<Column>>();
 
-        let plan = Self::add_missing_columns(
-            projection,
-            &missing_cols,
-            false,
-        )?;
+        let plan = Self::add_missing_columns(projection, &missing_cols, false)?;
 
         Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
-            DistinctOn::try_new(on_expr, select_expr
-                .iter()
-                .map(|s| expr_as_column_expr(s, &plan))
-                .collect::<Result<Vec<Expr>>>()?, sort_expr, Arc::new(plan))?,
+            DistinctOn::try_new(
+                on_expr,
+                select_expr
+                    .iter()
+                    .map(|s| expr_as_column_expr(s, &plan))
+                    .collect::<Result<Vec<Expr>>>()?,
+                sort_expr,
+                Arc::new(plan),
+            )?,
         ))))
     }
 
