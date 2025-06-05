@@ -16,7 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
-
+use indexmap::IndexSet;
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
 use crate::stack::StackGuard;
@@ -33,6 +33,8 @@ use sqlparser::ast::{
     SetOperator, SetQuantifier, TableAlias,
 };
 use sqlparser::tokenizer::Span;
+use datafusion_expr::utils::expr_as_column_expr;
+use crate::utils::{check_columns_satisfy_exprs, rebase_expr, CheckColumnsSatisfyExprsPurpose};
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Generate a logical plan from an SQL query/subquery
@@ -290,14 +292,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(plan);
         }
 
-        if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
-            // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
-            // optimization we're effectively doing a `first_value` aggregation according to them.
-            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
-            Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
-        } else {
-            LogicalPlanBuilder::from(plan).sort(order_by)?.build()
-        }
+        LogicalPlanBuilder::from(plan).sort(order_by)?.build()
     }
 
     /// Handle AGGREGATE pipe operator

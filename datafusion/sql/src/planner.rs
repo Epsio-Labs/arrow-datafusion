@@ -40,7 +40,6 @@ use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
 
-use crate::utils::make_decimal_type;
 pub use datafusion_expr::planner::ContextProvider;
 
 // use arrow_schema::DECIMAL_DEFAULT_SCALE;
@@ -174,7 +173,7 @@ impl From<&SqlParserOptions> for ParserOptions {
                 .enable_options_value_normalization,
             collect_spans: options.collect_spans,
             default_decimal128_precision: DECIMAL128_MAX_PRECISION,
-            default_decimal128_scale: DECIMAL128_MAX_SCALE
+            default_decimal128_scale: DECIMAL128_MAX_SCALE,
             default_null_ordering: options.default_null_ordering.as_str().into(),
         }
     }
