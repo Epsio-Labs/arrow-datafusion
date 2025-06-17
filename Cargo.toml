@@ -189,6 +189,22 @@ tokio = { version = "1.48", features = ["macros", "rt", "sync"] }
 url = "2.5.7"
 zstd = { version = "0.13", default-features = false }
 
+[patch.crates-io]
+arrow = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-arith = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-array = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-buffer = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-cast = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-csv = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-data = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-ipc = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-json = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-ord = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-row = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-schema = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-select = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+arrow-string = { git = "https://github.com/Epsio-Labs/arrow-rs.git", rev = "fd92191aade404cf3fbae9434b70810efc9236bc" }
+
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
 large_futures = "warn"
