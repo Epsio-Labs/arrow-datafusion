@@ -28,8 +28,7 @@ use crate::type_coercion::functions::{
 use crate::udf::ReturnFieldArgs;
 use crate::{utils, LogicalPlan, Projection, Subquery, WindowFunctionDefinition};
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{DataType, Field, FieldRef};
-use datafusion_common::metadata::FieldMetadata;
+use arrow::datatypes::{extract_enum_schema_and_name, DataType, Field, FieldRef};
 use datafusion_common::{
     not_impl_err, plan_datafusion_err, plan_err, Column, DataFusionError, ExprSchema,
     Result, ScalarValue, Spans, TableReference,
@@ -694,6 +693,13 @@ impl ExprSchemable for Expr {
     fn cast_to(self, cast_to_type: &DataType, schema: &dyn ExprSchema) -> Result<Expr> {
         let this_type = self.get_type(schema)?;
         if this_type == *cast_to_type {
+            return Ok(self);
+        }
+
+        // Specific handling for enum
+        if extract_enum_schema_and_name(&this_type).is_some()
+            && cast_to_type == &DataType::Utf8
+        {
             return Ok(self);
         }
 
