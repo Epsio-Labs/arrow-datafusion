@@ -29,8 +29,8 @@ use super::invariants::{
     InvariantLevel,
 };
 use super::DdlStatement;
-use crate::builder::{change_redundant_column, unnest_with_options};
-use crate::expr::{Placeholder, Sort as SortExpr, WindowFunction, WindowFunctionParams};
+use crate::builder::{unique_field_aliases, unnest_with_options};
+use crate::expr::{intersect_metadata_for_union, Alias, Placeholder, Sort as SortExpr, WindowFunction, WindowFunctionParams};
 use crate::expr_rewriter::{create_col_from_scalar_expr, normalize_cols, NamePreserver};
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
 use crate::logical_plan::extension::UserDefinedLogicalNode;

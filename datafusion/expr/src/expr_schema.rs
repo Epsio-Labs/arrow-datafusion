@@ -37,6 +37,7 @@ use datafusion_expr_common::interval_arithmetic::NullableInterval;
 use datafusion_expr_common::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
 use std::sync::Arc;
+use datafusion_common::metadata::FieldMetadata;
 
 /// Trait to allow expr to typable with respect to a schema
 pub trait ExprSchemable {

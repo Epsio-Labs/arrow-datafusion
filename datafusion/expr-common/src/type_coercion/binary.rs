@@ -24,7 +24,10 @@ use crate::operator::Operator;
 
 use arrow::array::{new_empty_array, Array};
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{enum_type, json_type, DataType, Field, FieldRef, Fields, TimeUnit, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE, DECIMAL32_MAX_PRECISION, DECIMAL32_MAX_SCALE, DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE};
+use arrow::datatypes::{
+    json_type, DataType, Field, FieldRef, Fields, TimeUnit, DECIMAL128_MAX_PRECISION,
+    DECIMAL128_MAX_SCALE, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE,
+};
 use datafusion_common::types::NativeType;
 use datafusion_common::{
     exec_err, internal_err, not_impl_err, plan_datafusion_err, plan_err, Diagnostic,
