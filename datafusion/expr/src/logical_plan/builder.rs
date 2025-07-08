@@ -1284,14 +1284,13 @@ pub fn union(left_plan: LogicalPlan, right_plan: LogicalPlan) -> Result<LogicalP
 
             Ok(DFField::new(
                 left_field.qualifier().cloned(),
-                &left_field.name(),
+                &left_field.name_with_casing(),
                 data_type,
                 nullable,
             ))
         })
         .collect::<Result<Vec<_>>>()?
         .to_dfschema()?;
-
     let inputs = vec![left_plan, right_plan]
         .into_iter()
         .flat_map(|p| match p {
