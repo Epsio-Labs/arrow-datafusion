@@ -95,7 +95,7 @@ struct FunctionArgs {
     /// WITHIN GROUP clause, if any
     within_group: Vec<OrderByExpr>,
     /// Was the function called without parenthesis, i.e. could this also be a column reference?
-    function_without_parentheses: bool,
+    function_without_paranthesis: bool,
 }
 
 impl FunctionArgs {
@@ -121,7 +121,7 @@ impl FunctionArgs {
                 null_treatment: null_treatment.map(|v| v.into()),
                 distinct: false,
                 within_group,
-                function_without_parentheses: matches!(args, FunctionArguments::None),
+                function_without_paranthesis: matches!(args, FunctionArguments::None),
             });
         };
 
@@ -208,7 +208,7 @@ impl FunctionArgs {
             null_treatment: null_treatment.map(|v| v.into()),
             distinct,
             within_group,
-            function_without_parentheses: false,
+            function_without_paranthesis: false,
         })
     }
 }
@@ -233,7 +233,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             null_treatment,
             distinct,
             within_group,
-            function_without_parentheses,
+            function_without_paranthesis,
         } = function_args;
 
         if over.is_some() && !within_group.is_empty() {
@@ -644,7 +644,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
 
         // workaround for https://github.com/apache/datafusion-sqlparser-rs/issues/1909
-        if function_without_parentheses {
+        if function_without_paranthesis {
             let maybe_ids = object_name
                 .0
                 .iter()
