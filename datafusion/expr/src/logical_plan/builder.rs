@@ -50,7 +50,7 @@ use crate::{
 use super::dml::InsertOp;
 use super::plan::{ColumnUnnestList, ExplainFormat};
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::datatypes::{json_type, DataType, Field, Fields, Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{
@@ -1462,11 +1462,13 @@ impl LogicalPlanBuilder {
     /// Unnest the given column given [`UnnestOptions`]
     pub fn unnest_column_with_options(
         self,
+        function_name: String,
         column: impl Into<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
         unnest_with_options(
             Arc::unwrap_or_clone(self.plan),
+            function_name,
             vec![column.into()],
             options,
         )
@@ -1476,11 +1478,17 @@ impl LogicalPlanBuilder {
     /// Unnest the given columns with the given [`UnnestOptions`]
     pub fn unnest_columns_with_options(
         self,
+        function_name: String,
         columns: Vec<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
-        unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
-            .map(Self::new)
+        unnest_with_options(
+            Arc::unwrap_or_clone(self.plan),
+            function_name,
+            columns,
+            options,
+        )
+        .map(Self::new)
     }
 }
 
@@ -2050,7 +2058,12 @@ impl TableSource for LogicalTableSource {
 
 /// Create a [`LogicalPlan::Unnest`] plan
 pub fn unnest(input: LogicalPlan, columns: Vec<Column>) -> Result<LogicalPlan> {
-    unnest_with_options(input, columns, UnnestOptions::default())
+    unnest_with_options(
+        input,
+        "UNNEST".to_string(),
+        columns,
+        UnnestOptions::default(),
+    )
 }
 
 // Get the data type of a multi-dimensional type after unnesting it
@@ -2084,6 +2097,15 @@ pub fn get_struct_unnested_columns(
         .collect()
 }
 
+/// Some json unnesting functions return a list of json items, others currently
+/// unsupported like `json_object_keys` return text
+pub fn get_unnested_json_return_type(function_name: &str) -> Result<DataType> {
+    match function_name {
+        "jsonb_array_elements" => Ok(json_type()),
+        _ => internal_err!("Function {} isn't an unnesting function", function_name),
+    }
+}
+
 // Based on data type, either struct or a variant of list
 // return a set of columns as the result of unnesting
 // the input columns.
@@ -2094,6 +2116,7 @@ pub fn get_struct_unnested_columns(
 // the recursion level
 pub fn get_unnested_columns(
     col_name: &String,
+    function_name: &str,
     data_type: &DataType,
     depth: usize,
 ) -> Result<Vec<(Column, Arc<Field>)>> {
@@ -2108,6 +2131,13 @@ pub fn get_unnested_columns(
                 // For example: unnest([1], []) -> 1, null
                 true,
             ));
+            let column = Column::from_name(col_name);
+            // let column = Column::from((None, &new_field));
+            qualified_columns.push((column, new_field));
+        }
+        DataType::Struct(_) if *data_type == json_type() => {
+            let result_type = get_unnested_json_return_type(function_name)?;
+            let new_field = Arc::new(Field::new(col_name, result_type, true));
             let column = Column::from_name(col_name);
             // let column = Column::from((None, &new_field));
             qualified_columns.push((column, new_field));
@@ -2162,6 +2192,7 @@ pub fn get_unnested_columns(
 /// ```
 pub fn unnest_with_options(
     input: LogicalPlan,
+    function_name: String,
     columns_to_unnest: Vec<Column>,
     options: UnnestOptions,
 ) -> Result<LogicalPlan> {
@@ -2213,6 +2244,7 @@ pub fn unnest_with_options(
                             ));
                             Ok(get_unnested_columns(
                                 &r.output_column.name,
+                                &function_name,
                                 original_field.data_type(),
                                 r.depth,
                             )?
@@ -2224,16 +2256,19 @@ pub fn unnest_with_options(
                     if transformed_columns.is_empty() {
                         transformed_columns = get_unnested_columns(
                             &column_to_unnest.name,
+                            &function_name,
                             original_field.data_type(),
                             1,
                         )?;
                         match original_field.data_type() {
-                            DataType::Struct(_) => {
+                            dt@ DataType::Struct(_) if *dt != json_type() => {
                                 struct_columns.push(index);
                             }
                             DataType::List(_)
                             | DataType::FixedSizeList(_, _)
-                            | DataType::LargeList(_) => {
+                            | DataType::LargeList(_)
+                            // json_type
+                            | DataType::Struct(_) => {
                                 list_columns.push((
                                     index,
                                     ColumnUnnestList {
@@ -2284,6 +2319,7 @@ pub fn unnest_with_options(
         dependency_indices,
         schema,
         options,
+        function_name,
     }))
 }
 
@@ -2694,7 +2730,7 @@ mod tests {
             .collect();
 
         let plan = nested_table_scan("test_table")?
-            .unnest_columns_with_options(cols, UnnestOptions::default())?
+            .unnest_columns_with_options("UNNEST", cols, UnnestOptions::default())?
             .build()?;
 
         assert_snapshot!(plan, @r"
@@ -2709,6 +2745,7 @@ mod tests {
         // Simultaneously unnesting a list (with different depth) and a struct column
         let plan = nested_table_scan("test_table")?
             .unnest_columns_with_options(
+                "UNNEST".to_string(),
                 vec!["stringss".into(), "struct_singular".into()],
                 UnnestOptions::default()
                     .with_recursions(RecursionUnnestOption {

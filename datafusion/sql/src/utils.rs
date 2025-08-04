@@ -19,7 +19,7 @@
 
 use std::vec;
 
-use arrow::datatypes::{DataType, DECIMAL128_MAX_PRECISION};
+use arrow::datatypes::{json_type, DataType, DECIMAL128_MAX_PRECISION};
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
@@ -341,6 +341,7 @@ pub(crate) fn rewrite_recursive_unnests_bottom_up(
     input: &LogicalPlan,
     unnest_placeholder_columns: &mut IndexMap<Column, Option<Vec<ColumnUnnestList>>>,
     inner_projection_exprs: &mut Vec<Expr>,
+    function_name: &mut String,
     original_exprs: &[Expr],
 ) -> Result<Vec<Expr>> {
     Ok(original_exprs
@@ -350,6 +351,7 @@ pub(crate) fn rewrite_recursive_unnests_bottom_up(
                 input,
                 unnest_placeholder_columns,
                 inner_projection_exprs,
+                function_name,
                 expr,
             )
         })
@@ -374,6 +376,7 @@ struct RecursiveUnnestRewriter<'a> {
     inner_projection_exprs: &'a mut Vec<Expr>,
     columns_unnestings: &'a mut IndexMap<Column, Option<Vec<ColumnUnnestList>>>,
     transformed_root_exprs: Option<Vec<Expr>>,
+    function_name: &'a mut String,
 }
 impl RecursiveUnnestRewriter<'_> {
     /// This struct stores the history of expr
@@ -416,7 +419,7 @@ impl RecursiveUnnestRewriter<'_> {
         let (data_type, _) = expr_in_unnest.data_type_and_nullable(self.input_schema)?;
 
         match data_type {
-            DataType::Struct(inner_fields) => {
+            DataType::Struct(inner_fields) if data_type != json_type() => {
                 if !struct_allowed {
                     return internal_err!("unnest on struct can only be applied at the root level of select expression");
                 }
@@ -435,7 +438,9 @@ impl RecursiveUnnestRewriter<'_> {
             }
             DataType::List(_)
             | DataType::FixedSizeList(_, _)
-            | DataType::LargeList(_) => {
+            | DataType::LargeList(_)
+            // json_type is checked above
+            | DataType::Struct(_) => {
                 push_projection_dedupl(
                     self.inner_projection_exprs,
                     expr_in_unnest.clone().alias(placeholder_name.clone()),
@@ -472,6 +477,18 @@ impl TreeNodeRewriter for RecursiveUnnestRewriter<'_> {
     ///   is used to detect if some recursive unnest expr exists (e.g **unnest(unnest(unnest(3d column))))**
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         if let Expr::Unnest(ref unnest_expr) = expr {
+            // We only merge unnests with the same function name
+            let previous_name = self
+                .consecutive_unnest
+                .last()
+                .map(|expr| expr.as_ref().map(|unnest| unnest.function_name.clone()))
+                .flatten();
+            if previous_name
+                .is_some_and(|previous_name| previous_name != unnest_expr.function_name)
+            {
+                self.consecutive_unnest.push(None);
+                return Ok(Transformed::no(expr));
+            }
             let (data_type, _) =
                 unnest_expr.expr.data_type_and_nullable(self.input_schema)?;
             self.consecutive_unnest.push(Some(unnest_expr.clone()));
@@ -547,6 +564,7 @@ impl TreeNodeRewriter for RecursiveUnnestRewriter<'_> {
             // Thus
             // Unnest(Unnest(some_col)) is rewritten into Unnest(some_col, depth:=2)
             if traversing_unnest == unnest_stack.last().unwrap() {
+                *self.function_name = traversing_unnest.function_name.clone();
                 let most_inner = unnest_stack.first().unwrap();
                 let inner_expr = most_inner.expr.as_ref();
                 // unnest(unnest(struct_arr_col)) is not allow to be done recursively
@@ -611,6 +629,7 @@ pub(crate) fn rewrite_recursive_unnest_bottom_up(
     input: &LogicalPlan,
     unnest_placeholder_columns: &mut IndexMap<Column, Option<Vec<ColumnUnnestList>>>,
     inner_projection_exprs: &mut Vec<Expr>,
+    function_name: &mut String,
     original_expr: &Expr,
 ) -> Result<Vec<Expr>> {
     let mut rewriter = RecursiveUnnestRewriter {
@@ -621,6 +640,7 @@ pub(crate) fn rewrite_recursive_unnest_bottom_up(
         inner_projection_exprs,
         columns_unnestings: unnest_placeholder_columns,
         transformed_root_exprs: None,
+        function_name,
     };
 
     // This transformation is only done for list unnest
@@ -735,6 +755,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &original_expr,
         )?;
         // Only the bottom most unnest exprs are transformed
@@ -771,6 +792,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &original_expr_2,
         )?;
 
@@ -836,6 +858,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &original_expr,
         )?;
         assert_eq!(
@@ -862,6 +885,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &original_expr,
         )?;
         column_unnests_eq(
@@ -948,6 +972,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &select_expr1,
         )?;
         // Only the inner most/ bottom most unnest is transformed
@@ -978,6 +1003,7 @@ mod tests {
             &input,
             &mut unnest_placeholder_columns,
             &mut inner_projection_exprs,
+            &mut String::new(),
             &select_expr2,
         )?;
         // Only the inner most/ bottom most unnest is transformed
