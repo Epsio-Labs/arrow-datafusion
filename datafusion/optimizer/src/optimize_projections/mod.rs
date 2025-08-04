@@ -317,6 +317,7 @@ fn optimize_projections(
                 .collect::<Result<_>>()?
         }
         LogicalPlan::Copy(_)
+        | LogicalPlan::RecursiveQuery(_)
         | LogicalPlan::Ddl(_)
         | LogicalPlan::Dml(_)
         | LogicalPlan::Explain(_)
