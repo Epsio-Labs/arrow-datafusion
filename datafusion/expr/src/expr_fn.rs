@@ -390,6 +390,7 @@ pub fn when(when: Expr, then: Expr) -> CaseBuilder {
 pub fn unnest(expr: Expr) -> Expr {
     Expr::Unnest(Unnest {
         expr: Box::new(expr),
+        function_name: "UNNEST".into(),
     })
 }
 
