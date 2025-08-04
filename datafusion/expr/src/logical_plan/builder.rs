@@ -1499,11 +1499,13 @@ impl LogicalPlanBuilder {
     /// Unnest the given column given [`UnnestOptions`]
     pub fn unnest_column_with_options(
         self,
+        function_name: String,
         column: impl Into<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
         unnest_with_options(
             Arc::unwrap_or_clone(self.plan),
+            function_name,
             vec![column.into()],
             options,
         )
@@ -1513,11 +1515,17 @@ impl LogicalPlanBuilder {
     /// Unnest the given columns with the given [`UnnestOptions`]
     pub fn unnest_columns_with_options(
         self,
+        function_name: String,
         columns: Vec<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
-        unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
-            .map(Self::new)
+        unnest_with_options(
+            Arc::unwrap_or_clone(self.plan),
+            function_name,
+            columns,
+            options,
+        )
+        .map(Self::new)
     }
 }
 
@@ -2153,7 +2161,12 @@ impl TableSource for LogicalTableSource {
 
 /// Create a [`LogicalPlan::Unnest`] plan
 pub fn unnest(input: LogicalPlan, columns: Vec<Column>) -> Result<LogicalPlan> {
-    unnest_with_options(input, columns, UnnestOptions::default())
+    unnest_with_options(
+        input,
+        "UNNEST".to_string(),
+        columns,
+        UnnestOptions::default(),
+    )
 }
 
 pub fn get_struct_unnested_columns(
@@ -2197,11 +2210,13 @@ pub fn get_struct_unnested_columns(
 /// ```
 pub fn unnest_with_options(
     input: LogicalPlan,
+    function_name: String,
     columns_to_unnest: Vec<Column>,
     options: UnnestOptions,
 ) -> Result<LogicalPlan> {
     Ok(LogicalPlan::Unnest(Unnest::try_new(
         Arc::new(input),
+        function_name,
         columns_to_unnest,
         options,
     )?))
@@ -2623,7 +2638,7 @@ mod tests {
             .collect();
 
         let plan = nested_table_scan("test_table")?
-            .unnest_columns_with_options(cols, UnnestOptions::default())?
+            .unnest_columns_with_options("UNNEST", cols, UnnestOptions::default())?
             .build()?;
 
         assert_snapshot!(plan, @r"
@@ -2638,6 +2653,7 @@ mod tests {
         // Simultaneously unnesting a list (with different depth) and a struct column
         let plan = nested_table_scan("test_table")?
             .unnest_columns_with_options(
+                "UNNEST".to_string(),
                 vec!["stringss".into(), "struct_singular".into()],
                 UnnestOptions::default()
                     .with_recursions(RecursionUnnestOption {

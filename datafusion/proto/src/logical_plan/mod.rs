@@ -933,6 +933,7 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 LogicalPlanBuilder::from(input)
                     .unnest_columns_with_options(
+                        "UNNEST".to_string(),
                         unnest.exec_columns.iter().map(|c| c.into()).collect(),
                         into_required!(unnest.options)?,
                     )?
@@ -1656,6 +1657,7 @@ impl AsLogicalPlan for LogicalPlanNode {
             }
             LogicalPlan::Unnest(Unnest {
                 input,
+                function_name: _,
                 exec_columns,
                 list_type_columns,
                 struct_type_columns,

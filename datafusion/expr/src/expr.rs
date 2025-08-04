@@ -523,19 +523,24 @@ pub fn intersect_metadata_for_union<'a>(
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub struct Unnest {
     pub expr: Box<Expr>,
+    pub function_name: String,
 }
 
 impl Unnest {
     /// Create a new Unnest expression.
-    pub fn new(expr: Expr) -> Self {
+    pub fn new(expr: Expr, function_name: String) -> Self {
         Self {
             expr: Box::new(expr),
+            function_name,
         }
     }
 
     /// Create a new Unnest expression.
-    pub fn new_boxed(boxed: Box<Expr>) -> Self {
-        Self { expr: boxed }
+    pub fn new_boxed(boxed: Box<Expr>, function_name: String) -> Self {
+        Self {
+            expr: boxed,
+            function_name,
+        }
     }
 }
 
@@ -2225,11 +2230,9 @@ impl NormalizeEq for Expr {
             | (Expr::IsNotTrue(self_expr), Expr::IsNotTrue(other_expr))
             | (Expr::IsNotFalse(self_expr), Expr::IsNotFalse(other_expr))
             | (Expr::IsNotUnknown(self_expr), Expr::IsNotUnknown(other_expr))
-            | (Expr::Negative(self_expr), Expr::Negative(other_expr))
-            | (
-                Expr::Unnest(Unnest { expr: self_expr }),
-                Expr::Unnest(Unnest { expr: other_expr }),
-            ) => self_expr.normalize_eq(other_expr),
+            | (Expr::Negative(self_expr), Expr::Negative(other_expr)) => {
+                self_expr.normalize_eq(other_expr)
+            }
             (
                 Expr::Between(Between {
                     expr: self_expr,
@@ -2249,6 +2252,16 @@ impl NormalizeEq for Expr {
                     && self_low.normalize_eq(other_low)
                     && self_high.normalize_eq(other_high)
             }
+            (
+                Expr::Unnest(Unnest {
+                    expr: self_expr,
+                    function_name: self_name,
+                }),
+                Expr::Unnest(Unnest {
+                    expr: other_expr,
+                    function_name: other_name,
+                }),
+            ) => self_name == other_name && self_expr.normalize_eq(other_expr),
             (
                 Expr::Cast(Cast {
                     expr: self_expr,
@@ -2673,7 +2686,7 @@ impl HashNode for Expr {
                 field.hash(state);
                 column.hash(state);
             }
-            Expr::Unnest(Unnest { expr: _expr }) => {}
+            Expr::Unnest(Unnest { expr: _expr, .. }) => {}
         };
     }
 }
@@ -2874,8 +2887,11 @@ impl Display for SchemaDisplay<'_> {
             }
             Expr::Negative(expr) => write!(f, "(- {})", SchemaDisplay(expr)),
             Expr::Not(expr) => write!(f, "NOT {}", SchemaDisplay(expr)),
-            Expr::Unnest(Unnest { expr }) => {
-                write!(f, "UNNEST({})", SchemaDisplay(expr))
+            Expr::Unnest(Unnest {
+                expr,
+                function_name,
+            }) => {
+                write!(f, "{}({})", function_name, SchemaDisplay(expr))
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
                 match func.schema_name(args) {
@@ -3130,8 +3146,11 @@ impl Display for SqlDisplay<'_> {
             }
             Expr::Negative(expr) => write!(f, "(- {})", SqlDisplay(expr)),
             Expr::Not(expr) => write!(f, "NOT {}", SqlDisplay(expr)),
-            Expr::Unnest(Unnest { expr }) => {
-                write!(f, "UNNEST({})", SqlDisplay(expr))
+            Expr::Unnest(Unnest {
+                function_name,
+                expr,
+            }) => {
+                write!(f, "{}({})", function_name, SqlDisplay(expr))
             }
             Expr::SimilarTo(Like {
                 negated,
@@ -3471,7 +3490,7 @@ impl Display for Expr {
                 }
             },
             Expr::Placeholder(Placeholder { id, .. }) => write!(f, "{id}"),
-            Expr::Unnest(Unnest { expr }) => {
+            Expr::Unnest(Unnest { expr, .. }) => {
                 write!(f, "{UNNEST_COLUMN_PREFIX}({expr})")
             }
         }

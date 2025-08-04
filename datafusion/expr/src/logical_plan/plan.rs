@@ -49,7 +49,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
 
-use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{json_type, DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::cse::{NormalizeEq, Normalizeable};
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::metadata::check_metadata_with_storage_equal;
@@ -745,10 +745,16 @@ impl LogicalPlan {
                 input,
                 exec_columns,
                 options,
+                function_name,
                 ..
             }) => {
                 // Update schema with unnested column type.
-                unnest_with_options(Arc::unwrap_or_clone(input), exec_columns, options)
+                unnest_with_options(
+                    Arc::unwrap_or_clone(input),
+                    function_name,
+                    exec_columns,
+                    options,
+                )
             }
         }
     }
@@ -1137,13 +1143,18 @@ impl LogicalPlan {
             LogicalPlan::Unnest(Unnest {
                 exec_columns: columns,
                 options,
+                function_name,
                 ..
             }) => {
                 self.assert_no_expressions(expr)?;
                 let input = self.only_input(inputs)?;
                 // Update schema with unnested column type.
-                let new_plan =
-                    unnest_with_options(input, columns.clone(), options.clone())?;
+                let new_plan = unnest_with_options(
+                    input,
+                    function_name.clone(),
+                    columns.clone(),
+                    options.clone(),
+                )?;
                 Ok(new_plan)
             }
         }
@@ -2057,7 +2068,7 @@ impl LogicalPlan {
                     LogicalPlan::Unnest(Unnest {
                         input: plan,
                         list_type_columns: list_col_indices,
-                        struct_type_columns: struct_col_indices, .. }) => {
+                        struct_type_columns: struct_col_indices, function_name, .. }) => {
                         let input_columns = plan.schema().columns();
                         let list_type_columns = list_col_indices
                             .iter()
@@ -2070,7 +2081,7 @@ impl LogicalPlan {
                             .map(|i| &input_columns[*i])
                             .collect::<Vec<&Column>>();
                         // get items from input_columns indexed by list_col_indices
-                        write!(f, "Unnest: lists[{}] structs[{}]",
+                        write!(f, "Unnest: function={function_name} lists[{}] structs[{}]",
                         expr_vec_fmt!(list_type_columns),
                         expr_vec_fmt!(struct_type_columns))
                     }
@@ -3981,6 +3992,8 @@ impl Display for ColumnUnnestList {
 pub struct Unnest {
     /// The incoming logical plan
     pub input: Arc<LogicalPlan>,
+    /// The specific unnesting function
+    pub function_name: String,
     /// Columns to run unnest on, can be a list of (List/Struct) columns
     pub exec_columns: Vec<Column>,
     /// refer to the indices(in the input schema) of columns
@@ -4003,6 +4016,7 @@ impl PartialOrd for Unnest {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         #[derive(PartialEq, PartialOrd)]
         struct ComparableUnnest<'a> {
+            pub function_name: &'a str,
             /// The incoming logical plan
             pub input: &'a Arc<LogicalPlan>,
             /// Columns to run unnest on, can be a list of (List/Struct) columns
@@ -4021,6 +4035,7 @@ impl PartialOrd for Unnest {
         }
         let comparable_self = ComparableUnnest {
             input: &self.input,
+            function_name: &self.function_name,
             exec_columns: &self.exec_columns,
             list_type_columns: &self.list_type_columns,
             struct_type_columns: &self.struct_type_columns,
@@ -4029,6 +4044,7 @@ impl PartialOrd for Unnest {
         };
         let comparable_other = ComparableUnnest {
             input: &other.input,
+            function_name: &self.function_name,
             exec_columns: &other.exec_columns,
             list_type_columns: &other.list_type_columns,
             struct_type_columns: &other.struct_type_columns,
@@ -4045,6 +4061,7 @@ impl PartialOrd for Unnest {
 impl Unnest {
     pub fn try_new(
         input: Arc<LogicalPlan>,
+        function_name: String,
         exec_columns: Vec<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
@@ -4100,6 +4117,7 @@ impl Unnest {
                                 ));
                                 Ok(get_unnested_columns(
                                     &r.output_column.name,
+                                    &function_name,
                                     original_field.data_type(),
                                     r.depth,
                                 )?
@@ -4111,6 +4129,7 @@ impl Unnest {
                         if transformed_columns.is_empty() {
                             transformed_columns = get_unnested_columns(
                                 &column_to_unnest.name,
+                                &function_name,
                                 original_field.data_type(),
                                 1,
                             )?;
@@ -4169,6 +4188,7 @@ impl Unnest {
 
         Ok(Unnest {
             input,
+            function_name,
             exec_columns,
             list_type_columns: list_columns,
             struct_type_columns: struct_columns,
@@ -4176,6 +4196,15 @@ impl Unnest {
             schema,
             options,
         })
+    }
+}
+
+/// Some json unnesting functions return a list of json items, others currently
+/// unsupported like `json_object_keys` return text
+pub fn get_unnested_json_return_type(function_name: &str) -> Result<DataType> {
+    match function_name {
+        "jsonb_array_elements" => Ok(json_type()),
+        _ => internal_err!("Function {} isn't an unnesting function", function_name),
     }
 }
 
@@ -4189,6 +4218,7 @@ impl Unnest {
 // the recursion level
 fn get_unnested_columns(
     col_name: &String,
+    function_name: &str,
     data_type: &DataType,
     depth: usize,
 ) -> Result<Vec<(Column, Arc<Field>)>> {
@@ -4203,6 +4233,13 @@ fn get_unnested_columns(
                 // For example: unnest([1], []) -> 1, null
                 true,
             ));
+            let column = Column::from_name(col_name);
+            // let column = Column::from((None, &new_field));
+            qualified_columns.push((column, new_field));
+        }
+        DataType::Struct(_) if *data_type == json_type() => {
+            let result_type = get_unnested_json_return_type(function_name)?;
+            let new_field = Arc::new(Field::new(col_name, result_type, true));
             let column = Column::from_name(col_name);
             // let column = Column::from((None, &new_field));
             qualified_columns.push((column, new_field));
