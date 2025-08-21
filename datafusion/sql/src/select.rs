@@ -29,7 +29,7 @@ use crate::utils::{
 
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{not_impl_err, plan_err, Column, HashMap, Result};
+use datafusion_common::{not_impl_err, plan_err, Column, HashMap, Result, DFSchema};
 use datafusion_common::{RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::expr::{Alias, PlannedReplaceSelectItem, Sort, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
@@ -243,7 +243,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Try processing unnest expression or do the final projection
-        let plan = self.try_process_unnest(plan, select_exprs_post_aggr)?;
+        let plan = self.try_process_unnest(plan, select_exprs_post_aggr.clone())?;
 
         // Process distinct clause
         let plan = match select.distinct {
@@ -252,17 +252,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 LogicalPlanBuilder::from(plan).distinct()?.build()
             }
             Some(Distinct::On(on_expr)) => {
+                if !window_func_exprs.is_empty() {
+                    return not_impl_err!("DISTINCT ON expressions with window functions are not supported ");
+                }
                 if !aggr_exprs.is_empty() || !group_by_exprs.is_empty() {
                     let on_expr = on_expr
                         .into_iter()
                         .map(|e| {
                             self.sql_expr_to_logical_expr(
                                 e,
-                                plan.schema(),
+                                base_plan.schema(),
                                 planner_context,
                             )
                         })
                         .collect::<Result<Vec<_>>>()?;
+
+                    let resolved_on_expr = resolve_distinct_on_aliases(on_expr.clone(), &alias_map)?;
 
                     let distinct_select_exprs = plan
                         .schema()
@@ -275,42 +280,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         })
                         .collect::<Vec<_>>();
 
+
                     let distinct_select_alias_map =
                         extract_aliases(&distinct_select_exprs);
 
-                    let distinct_order_by = to_order_by_exprs_with_select(
-                        query_order_by,
-                        Some(&distinct_select_exprs),
-                    )?;
-
-                    let distinct_order_by_rex = self.order_by_to_sort_expr(
-                        distinct_order_by,
-                        plan.schema().as_ref(),
-                        planner_context,
-                        true,
-                        None,
-                    )?;
-                    let distinct_order_by_rex =
-                        normalize_sorts(distinct_order_by_rex, &plan)?;
+                    let distinct_order_by = map_order_by_to_schema(&order_by_rex, &select_exprs_post_aggr, &plan)?;
 
                     validate_on_expression_against_sort_exprs(
                         &plan,
-                        &on_expr,
-                        &distinct_order_by_rex,
+                        &resolved_on_expr,
+                        &distinct_order_by,
                         &distinct_select_alias_map,
                     )?;
 
                     let distinct_plan = LogicalPlanBuilder::from(plan)
                         .distinct_on(
-                            on_expr,
+                            resolved_on_expr,
                             distinct_select_exprs,
-                            distinct_order_by_rex,
+                            distinct_order_by,
                         )?
                         .build()?;
 
                     return Ok(distinct_plan);
-                } else if !window_func_exprs.is_empty() {
-                    return not_impl_err!("DISTINCT ON expressions with window functions are not supported ");
                 } else {
                     let on_expr = on_expr
                         .into_iter()
@@ -1034,4 +1025,55 @@ fn validate_on_expression_against_sort_exprs(
     }
 
     Ok(())
+}
+
+fn resolve_distinct_on_aliases(
+    on_expr: Vec<Expr>,
+    alias_map: &HashMap<String, Expr>,
+) -> Result<Vec<Expr>> {
+    // Resolve aliases in DISTINCT ON expressions, similar to HAVING and GROUP BY
+    on_expr
+        .into_iter()
+        .map(|expr| {
+            // First try to resolve column aliases
+            let expr = resolve_aliases_to_exprs(expr, alias_map)?;
+            
+            // Then check if the entire expression matches any aliased expression
+            // This handles cases like DISTINCT ON(POW(c1, 2)) where POW(c1, 2) is aliased as mypow
+            for (alias_name, aliased_expr) in alias_map {
+                // Try exact match first
+                if &expr == aliased_expr {
+                    // Replace the expression with a column reference to the alias
+                    return Ok(Expr::Column(Column::from_name(alias_name)));
+                }
+                
+                // Try normalized comparison - strip aliases and compare
+                let normalized_expr = expr.clone().unalias_nested().data;
+                let normalized_aliased = aliased_expr.clone().unalias_nested().data;
+                if normalized_expr == normalized_aliased {
+                    // Replace the expression with a column reference to the alias
+                    return Ok(Expr::Column(Column::from_name(alias_name)));
+                }
+            }
+            
+            Ok(expr)
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+/// Helper function to map ORDER BY expressions to a schema
+fn map_order_by_to_schema(
+    order_exprs: &[Sort],
+    target_exprs: &[Expr],
+    target_plan: &LogicalPlan,
+) -> Result<Vec<Sort>> {
+    order_exprs
+        .iter()
+        .map(|sort_expr| {
+            // Try to rebase the sort expression to the target schema
+            rebase_expr(&sort_expr.expr, target_exprs, target_plan)
+                .or_else(|_| normalize_col(sort_expr.expr.clone(), target_plan))
+                .map(|expr| Sort::new(expr, sort_expr.asc, sort_expr.nulls_first))
+        })
+        .collect::<Result<Vec<_>>>()
 }
