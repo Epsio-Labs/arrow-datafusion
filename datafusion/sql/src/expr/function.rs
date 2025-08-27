@@ -17,7 +17,7 @@
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{json_type, DataType};
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
     DFSchema, Dependency, Diagnostic, Result, Span,
@@ -618,17 +618,28 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<()> {
         // Check argument type, array types are supported
         let arg_data_type = arg.get_type(schema)?;
-        match arg_data_type {
-            DataType::List(_)
-            | DataType::LargeList(_)
-            | DataType::FixedSizeList(_, _)
-            | DataType::Struct(_) => Ok(()),
-            DataType::Null => {
-                not_impl_err!("{name}() does not support null yet")
-            }
-            _ => {
-                plan_err!("{name}() can't be applied to {arg_data_type} type")
-            }
+        match name {
+            "unnest" => match arg_data_type {
+                DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _) => Ok(()),
+                DataType::Null => {
+                    not_impl_err!("{name}() does not support null yet")
+                }
+                _ => {
+                    plan_err!("{name}() can't be applied to {arg_data_type} type")
+                }
+            },
+            "jsonb_array_elements" => match arg_data_type {
+                t if t == json_type() => Ok(()),
+                DataType::Null => {
+                    not_impl_err!("{name}() does not support null yet")
+                }
+                _ => {
+                    plan_err!("{name}() can't be applied to {arg_data_type} type")
+                }
+            },
+            _ => internal_err!("{name} isn't an unnesting function"),
         }
     }
 }
