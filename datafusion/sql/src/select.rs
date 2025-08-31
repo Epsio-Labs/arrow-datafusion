@@ -29,9 +29,9 @@ use crate::utils::{
 
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{not_impl_err, plan_err, Result};
+use datafusion_common::{not_impl_err, plan_err, Column, HashMap, Result};
 use datafusion_common::{RecursionUnnestOption, UnnestOptions};
-use datafusion_expr::expr::{Alias, PlannedReplaceSelectItem, WildcardOptions};
+use datafusion_expr::expr::{Alias, PlannedReplaceSelectItem, Sort, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
     normalize_col, normalize_col_with_schemas_and_ambiguity_check, normalize_sorts,
 };
@@ -99,7 +99,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let select_exprs = projected_plan.expressions();
 
         let order_by =
-            to_order_by_exprs_with_select(query_order_by, Some(&select_exprs))?;
+            to_order_by_exprs_with_select(query_order_by.clone(), Some(&select_exprs))?;
 
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
@@ -243,7 +243,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Try processing unnest expression or do the final projection
-        let plan = self.try_process_unnest(plan, select_exprs_post_aggr)?;
+        let plan = self.try_process_unnest(plan, select_exprs_post_aggr.clone())?;
 
         // Process distinct clause
         let plan = match select.distinct {
@@ -252,43 +252,77 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 LogicalPlanBuilder::from(plan).distinct()?.build()
             }
             Some(Distinct::On(on_expr)) => {
-                if !aggr_exprs.is_empty()
-                    || !group_by_exprs.is_empty()
-                    || !window_func_exprs.is_empty()
-                {
-                    return not_impl_err!("DISTINCT ON expressions with GROUP BY, aggregation or window functions are not supported ");
+                if !window_func_exprs.is_empty() {
+                    return not_impl_err!("DISTINCT ON expressions with window functions are not supported ");
                 }
+                if !aggr_exprs.is_empty() || !group_by_exprs.is_empty() {
+                    let on_expr = on_expr
+                        .into_iter()
+                        .map(|e| {
+                            self.sql_expr_to_logical_expr(
+                                e,
+                                // resolve_distinct_on_aliases unwraps aliases back to expressions,
+                                // so we need the original plan
+                                base_plan.schema(),
+                                planner_context,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
 
-                let on_expr = on_expr
-                    .into_iter()
-                    .map(|e| {
-                        self.sql_expr_to_logical_expr(e, plan.schema(), planner_context)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                    let resolved_on_expr = resolve_distinct_on_aliases(on_expr.clone(), &alias_map)?;
 
-                let select_alias_map = extract_aliases(&select_exprs);
-                // First, we need to ensure the ORDER BY expressions start with our ON expression
-                // This is because the ON expression is used to determine the distinct key
-                for (on_expr, sort) in on_expr.iter().zip(order_by_rex.iter()) {
-                    let on_expr = resolve_columns(
-                        &resolve_aliases_to_exprs(on_expr.clone(), &select_alias_map)?,
-                        &base_plan,
+                    let distinct_select_exprs = plan
+                        .schema()
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _field)| {
+                            // Use the qualified field from the schema to preserve proper column references
+                            Expr::Column(Column::from(plan.schema().qualified_field(i)))
+                        })
+                        .collect::<Vec<_>>();
+
+
+                    let distinct_select_alias_map =
+                        extract_aliases(&distinct_select_exprs);
+
+                    validate_on_expression_against_sort_exprs(
+                        &plan,
+                        &resolved_on_expr,
+                        &order_by_rex,
+                        &distinct_select_alias_map,
                     )?;
-                    let sort_expr = resolve_columns(
-                        &resolve_aliases_to_exprs(sort.expr.clone(), &select_alias_map)?,
-                        &base_plan,
-                    )?;
-                    if on_expr != sort_expr {
-                        plan_err!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions (ON expression `{}` does not match ORDER BY expression `{}`)", on_expr.human_display(), sort_expr.human_display())?
-                    }
+
+                    let distinct_plan = LogicalPlanBuilder::from(plan)
+                        .distinct_on(
+                            resolved_on_expr,
+                            distinct_select_exprs,
+                            order_by_rex,
+                        )?
+                        .build()?;
+
+                    return Ok(distinct_plan);
+                } else {
+                    let on_expr = on_expr
+                        .into_iter()
+                        .map(|e| {
+                            self.sql_expr_to_logical_expr(
+                                e,
+                                plan.schema(),
+                                planner_context,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+
+                    let select_alias_map = extract_aliases(&select_exprs);
+                    validate_on_expression_against_sort_exprs(&base_plan, &on_expr, &order_by_rex, &select_alias_map)?;
+
+                    let distinct_on_plan = LogicalPlanBuilder::from(base_plan)
+                        .distinct_on(on_expr, select_exprs, order_by_rex)?
+                        .build()?;
+
+                    return Ok(distinct_on_plan);
                 }
-
-                // Build the final plan
-                let distinct_on_plan = LogicalPlanBuilder::from(base_plan)
-                    .distinct_on(on_expr, select_exprs, order_by_rex)?
-                    .build()?;
-
-                return Ok(distinct_on_plan);
             }
         }?;
 
@@ -968,4 +1002,56 @@ fn check_conflicting_windows(window_defs: &[NamedWindowDefinition]) -> Result<()
         }
     }
     Ok(())
+}
+
+fn validate_on_expression_against_sort_exprs(
+    plan: &LogicalPlan,
+    on_expr: &Vec<Expr>,
+    sort_exprs: &Vec<Sort>,
+    select_alias_map: &HashMap<String, Expr>,
+) -> Result<()> {
+    for (on_expr, sort) in on_expr.iter().zip(sort_exprs.iter()) {
+        let on_expr = resolve_columns(
+            &resolve_aliases_to_exprs(on_expr.clone(), select_alias_map)?,
+            &plan,
+        )?;
+        let sort_expr = resolve_columns(
+            &resolve_aliases_to_exprs(sort.expr.clone(), select_alias_map)?,
+            &plan,
+        )?;
+        if on_expr != sort_expr {
+            plan_err!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions (ON expression `{}` does not match ORDER BY expression `{}`)", on_expr.human_display(), sort_expr.human_display())?
+        }
+    }
+
+    Ok(())
+}
+
+/// This matches between ON expressions and query aliases
+fn resolve_distinct_on_aliases(
+    on_expr: Vec<Expr>,
+    alias_map: &HashMap<String, Expr>,
+) -> Result<Vec<Expr>> {
+    on_expr
+        .into_iter()
+        .map(|expr| {
+            let expr = resolve_aliases_to_exprs(expr, alias_map)?;
+            
+            for (alias_name, aliased_expr) in alias_map {
+                // simple expression match
+                if &expr == aliased_expr {
+                    return Ok(Expr::Column(Column::from_name(alias_name)));
+                }
+                
+                // recursively remove aliases and compare
+                let normalized_expr = expr.clone().unalias_nested().data;
+                let normalized_aliased = aliased_expr.clone().unalias_nested().data;
+                if normalized_expr == normalized_aliased {
+                    return Ok(Expr::Column(Column::from_name(alias_name)));
+                }
+            }
+            
+            Ok(expr)
+        })
+        .collect::<Result<Vec<_>>>()
 }
