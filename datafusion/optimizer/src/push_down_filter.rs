@@ -972,13 +972,21 @@ impl OptimizerRule for PushDownFilter {
                 })))
             }
             LogicalPlan::Aggregate(agg) => {
-                // We can push down Predicate which in groupby_expr.
+                // We can push down Predicate which are in groupby_expr. Note that aggregate can create additional columns in it's schema,
+                // for instance if we aggregate by some scalar function call, a column will be created for that expression. We can't push
+                // down below a filter that's using it. Thus we filter the columns, including only those which already exist in the input schema,
+                // so we know the transition is safe.
                 let group_expr_columns = agg
                     .group_expr
                     .iter()
-                    .map(|e| {
-                        let (relation, name) = e.qualified_name();
-                        Column::new(relation, name)
+                    .filter_map(|e| {
+                        let filter_columnn =
+                            Column::from_qualified_name(e.schema_name().to_string());
+                        if agg.input.schema().has_column(&filter_columnn) {
+                            Some(filter_columnn)
+                        } else {
+                            None
+                        }
                     })
                     .collect::<HashSet<_>>();
 
