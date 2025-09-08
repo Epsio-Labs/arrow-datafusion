@@ -20,11 +20,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
+use crate::simplify_expressions::ConstEvaluator;
 use arrow::array::{new_null_array, Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::tree_node::{TransformedResult, TreeNode};
-use datafusion_common::{Column, DFSchema, Result, ScalarValue};
+use datafusion_common::{internal_err, Column, DFSchema, Result, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_rewriter::replace_col;
 use datafusion_expr::{logical_plan::LogicalPlan, ColumnarValue, Expr};
@@ -142,6 +143,12 @@ fn evaluate_expr_with_null_column<'a>(
 
     let replaced_predicate = replace_col(predicate, &join_cols_to_replace)?;
     let coerced_predicate = coerce(replaced_predicate, &input_schema)?;
+    // If any of the inner expressions can't be evaluated, so does the outer one. So we avoid that
+    if coerced_predicate.exists(|expr| Ok(!ConstEvaluator::can_evaluate(expr)))? {
+        return internal_err!(
+            "Can't evaluate expression {coerced_predicate:?} in plan time"
+        );
+    }
     create_physical_expr(&coerced_predicate, &input_schema, &execution_props)?
         .evaluate(&input_batch)
 }
