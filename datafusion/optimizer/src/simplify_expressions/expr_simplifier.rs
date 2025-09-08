@@ -501,7 +501,7 @@ impl TreeNodeRewriter for Canonicalizer {
 ///
 /// Note it does not handle algebraic rewrites such as `(a or false)`
 /// --> `a`, which is handled by [`Simplifier`]
-struct ConstEvaluator<'a> {
+pub(crate) struct ConstEvaluator<'a> {
     /// `can_evaluate` is used during the depth-first-search of the
     /// `Expr` tree to track if any siblings (or their descendants) were
     /// non evaluatable (e.g. had a column reference or volatile
@@ -634,7 +634,7 @@ impl<'a> ConstEvaluator<'a> {
 
     /// Can the expression be evaluated at plan time, (assuming all of
     /// its children can also be evaluated)?
-    fn can_evaluate(expr: &Expr) -> bool {
+    pub(crate) fn can_evaluate(expr: &Expr) -> bool {
         // check for reasons we can't evaluate this node
         //
         // NOTE all expr types are listed here so when new ones are
