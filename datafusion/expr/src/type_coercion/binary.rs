@@ -190,6 +190,17 @@ fn signature(lhs: &DataType, op: &Operator, rhs: &DataType) -> Result<Signature>
                     rhs: rhs.clone(),
                     ret: json_result_type,
                 })
+            } else if let Some((lhs, rhs)) = interval_coercion(lhs, rhs, op) {
+                // Interval arithmetic with scalars, e.g. Interval * Int32
+                let ret_type = match (lhs.clone(), rhs.clone()) {
+                    (DataType::Interval(unit), _) | (_, DataType::Interval(unit)) => DataType::Interval(unit),
+                    _ => unreachable!(),
+                };
+                Ok(Signature {
+                    lhs,
+                    rhs,
+                    ret: ret_type,
+                })
             } else {
                 plan_err!("Cannot coerce arithmetic expression {lhs} {op} {rhs} to valid types")
             }
@@ -572,6 +583,46 @@ fn json_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     }
     match rhs_type {
         DataType::Utf8 | DataType::LargeUtf8 => Some(json_type()),
+        _ => None,
+    }
+}
+
+/// Coercion rules for interval arithmetic operations
+/// Supports multiplying and dividing intervals by scalar numeric types
+fn interval_coercion(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    op: &Operator,
+) -> Option<(DataType, DataType)> {
+    match op {
+        Operator::Multiply | Operator::Divide => {
+            match (lhs_type, rhs_type) {
+                // Interval * numeric or numeric * Interval
+                (
+                    DataType::Interval(interval_unit),
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _),
+                )
+                | (
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _),
+                    DataType::Interval(interval_unit),
+                ) => Some((lhs_type.clone(), rhs_type.clone())),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

@@ -225,6 +225,8 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 let df_op = match op {
                     BinaryOperator::Plus => Operator::Plus,
                     BinaryOperator::Minus => Operator::Minus,
+                    BinaryOperator::Multiply => Operator::Multiply,
+                    BinaryOperator::Divide => Operator::Divide,
                     _ => {
                         return not_impl_err!("Unsupported interval operator: {op:?}");
                     }
