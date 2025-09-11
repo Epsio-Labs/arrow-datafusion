@@ -296,6 +296,17 @@ impl<'a> BinaryTypeCoercer<'a> {
                     rhs: self.rhs.clone(),
                     ret: json_result_type,
                 })
+            } else if let Some((lhs, rhs)) = interval_coercion(self.lhs, self.rhs, self.op) {
+                // Interval arithmetic with scalars, e.g. Interval * Int32
+                let ret_type = match (self.lhs, self.rhs) {
+                    (Interval(unit), _) | (_, Interval(unit)) => Interval(*unit),
+                    _ => unreachable!(),
+                };
+                Ok(Signature {
+                    lhs,
+                    rhs,
+                    ret: ret_type,
+                })
             } else {
                 plan_err!(
                     "Cannot coerce arithmetic expression {} {} {} to valid types", self.lhs, self.op, self.rhs
@@ -1602,6 +1613,46 @@ pub fn json_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataTyp
         }
         (_, DataType::Utf8 | DataType::LargeUtf8) if lhs_type == &json_type() => {
             Some(json_type())
+        }
+        _ => None,
+    }
+}
+
+/// Coercion rules for interval arithmetic operations
+/// Supports multiplying and dividing intervals by scalar numeric types
+fn interval_coercion(
+    lhs_type: &DataType,
+    rhs_type: &DataType,
+    op: &Operator,
+) -> Option<(DataType, DataType)> {
+    match op {
+        Operator::Multiply | Operator::Divide => {
+            match (lhs_type, rhs_type) {
+                // Interval * numeric or numeric * Interval
+                (
+                    DataType::Interval(_),
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _),
+                )
+                | (
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Decimal128(_, _)
+                    | DataType::Decimal256(_, _),
+                    DataType::Interval(_),
+                ) => Some((lhs_type.clone(), rhs_type.clone())),
+                _ => None,
+            }
         }
         _ => None,
     }
