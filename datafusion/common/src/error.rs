@@ -561,7 +561,7 @@ impl DataFusionError {
                 Cow::Owned(format!("{desc}\ncaused by\n{}", *err))
             }
             DataFusionError::Substrait(ref desc) => Cow::Owned(desc.to_string()),
-            DataFusionError::Diagnostic(_, ref err) => Cow::Owned(err.to_string()),
+            DataFusionError::Diagnostic(_, ref err) => err.message(),
             // Returning the message of the first error is probably fine enough,
             // and makes `DataFusionError::Collection` a transparent wrapped,
             // unless the end user explicitly calls `DataFusionError::iter`.
