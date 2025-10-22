@@ -878,11 +878,6 @@ impl LogicalPlanBuilder {
         select_expr: Vec<Expr>,
         sort_expr: Vec<SortExpr>,
     ) -> Result<Self> {
-        let original_plan_schema = self.plan.schema().clone();
-        // Collect sort columns that are missing in the input plan's schema
-        let projection =
-            LogicalPlan::Projection(Projection::try_new(select_expr.clone(), self.plan)?);
-
         let missing_cols = on_expr
             .iter()
             // Although the sort should be contained within the `on_expr`, we still want to show
@@ -892,34 +887,39 @@ impl LogicalPlanBuilder {
                 let columns = expr.column_refs();
                 let output: Vec<_> = columns
                     .into_iter()
-                    .map(|c| {
-                        let normalized_column =
-                            c.clone().normalize_with_schemas_and_ambiguity_check(
-                                // Try with both schemas, since if we have an alias the alias name and the original column
-                                // name can be used. The alias will be in the projection schema, the original column name
-                                // in the input schema
-                                &[&[projection.schema(), &original_plan_schema]],
-                                &[],
-                            );
-                        normalized_column
-                    })
-                    .filter(|c| {
-                        c.as_ref().is_ok_and(|c| !projection.schema().has_column(c))
-                    })
+                    .filter(|c| !self.plan.schema().has_column(c))
+                    .map(|c| c.clone())
                     .collect();
                 output
             })
-            .collect::<Result<IndexSet<Column>>>()?;
-        let plan = Self::add_missing_columns(projection, &missing_cols, false)?;
+            .collect::<IndexSet<Column>>();
+
+        let plan = Self::add_missing_columns(
+            Arc::unwrap_or_clone(self.plan),
+            &missing_cols,
+            false,
+        )?;
 
         Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
             DistinctOn::try_new(
-                on_expr,
+                on_expr
+                    .into_iter()
+                    .map(|e| expr_as_column_expr(&e, &plan))
+                    .collect::<Result<Vec<Expr>>>()?,
                 select_expr
                     .iter()
                     .map(|s| expr_as_column_expr(s, &plan))
                     .collect::<Result<Vec<Expr>>>()?,
-                sort_expr,
+                sort_expr
+                    .into_iter()
+                    .map(|s| {
+                        Ok(SortExpr {
+                            expr: expr_as_column_expr(&s.expr, &plan)?,
+                            asc: s.asc,
+                            nulls_first: s.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<SortExpr>>>()?,
                 Arc::new(plan),
             )?,
         ))))

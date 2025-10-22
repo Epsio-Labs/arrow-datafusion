@@ -29,7 +29,7 @@ use crate::utils::{
 
 use datafusion_common::error::DataFusionErrorBuilder;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{not_impl_err, plan_err, Result};
+use datafusion_common::{not_impl_err, plan_err, Column, HashMap, Result};
 use datafusion_common::{RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::expr::{Alias, PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
@@ -41,7 +41,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     Aggregate, Expr, Filter, GroupingSet, LogicalPlan, LogicalPlanBuilder,
-    LogicalPlanBuilderOptions, Partitioning,
+    LogicalPlanBuilderOptions, Partitioning, SortExpr,
 };
 
 use indexmap::IndexMap;
@@ -99,7 +99,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let select_exprs = projected_plan.expressions();
 
         let order_by =
-            to_order_by_exprs_with_select(query_order_by, Some(&select_exprs))?;
+            to_order_by_exprs_with_select(query_order_by.clone(), Some(&select_exprs))?;
 
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
@@ -148,9 +148,30 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .transpose()?;
 
+        // Optionally the DISTINCT ON expressions.
+        let distinct_on_expr_opt = match &select.distinct {
+            Some(Distinct::On(on_exprs)) => {
+                let on_exprs_iter = on_exprs.iter().map(|e| {
+                    self.sql_expr_to_logical_expr(
+                        e.clone(),
+                        &combined_schema,
+                        planner_context,
+                    )
+                });
+                let on_exprs: Vec<Expr> = on_exprs_iter.collect::<Result<Vec<Expr>>>()?;
+                Some(on_exprs)
+            }
+            _ => None,
+        };
+
         // The outer expressions we will search through for aggregates.
         // Aggregates may be sourced from the SELECT list or from the HAVING expression.
-        let aggr_expr_haystack = select_exprs.iter().chain(having_expr_opt.iter());
+        // Aggregates may also be sourced from DISTINCT ON expressions
+        let aggr_expr_haystack = select_exprs
+            .iter()
+            .chain(having_expr_opt.iter())
+            .chain(distinct_on_expr_opt.iter().flat_map(|v| v.iter()));
+
         // All of the aggregate expressions (deduplicated).
         let aggr_exprs = find_aggregate_exprs(aggr_expr_haystack);
 
@@ -198,14 +219,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .collect()
         };
 
-        // Process group by, aggregation or having
+        // Process group by, aggregation or having or distinct on
         let (plan, mut select_exprs_post_aggr, having_expr_post_aggr) = if !group_by_exprs
             .is_empty()
             || !aggr_exprs.is_empty()
         {
+            let mut aggregate_select = select_exprs.clone();
+
+            if let Some(distinct_on_expr) = distinct_on_expr_opt {
+                // make sure not already present in aggregate_select
+                for expr in distinct_on_expr {
+                    let resolved_expr = resolve_aliases_to_exprs(expr, &alias_map)?;
+                    if !aggregate_select.contains(&resolved_expr) {
+                        aggregate_select.push(resolved_expr);
+                    }
+                }
+            };
+
             self.aggregate(
                 &base_plan,
-                &select_exprs,
+                &aggregate_select,
                 having_expr_opt.as_ref(),
                 &group_by_exprs,
                 &aggr_exprs,
@@ -252,11 +285,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 LogicalPlanBuilder::from(plan).distinct()?.build()
             }
             Some(Distinct::On(on_expr)) => {
-                if !aggr_exprs.is_empty()
-                    || !group_by_exprs.is_empty()
-                    || !window_func_exprs.is_empty()
-                {
-                    return not_impl_err!("DISTINCT ON expressions with GROUP BY, aggregation or window functions are not supported ");
+                if !window_func_exprs.is_empty() {
+                    return not_impl_err!("DISTINCT ON expressions with window functions are not supported ");
                 }
 
                 let on_expr = on_expr
@@ -266,26 +296,72 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let select_alias_map = extract_aliases(&select_exprs);
-                // First, we need to ensure the ORDER BY expressions start with our ON expression
+                // first we resolve the aliases in the alias map itself
+                let column_to_alias = alias_map
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok((
+                            resolve_columns(v, &base_plan).unwrap_or(v.clone()),
+                            k.clone(),
+                        ))
+                    })
+                    .collect::<Result<HashMap<_, _>>>()?;
+
+                // then we find a match for on_expr after resolving its columns
+                let on_expr = on_expr
+                    .into_iter()
+                    .map(|expr| {
+                        let expr =
+                            resolve_columns(&expr, &base_plan).unwrap_or(expr.clone());
+                        Ok(column_to_alias
+                            .get(&expr)
+                            .map(|alias| Expr::Column(Column::from(alias.as_str())))
+                            .unwrap_or(expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                // now we resolve the sort exprs
+                let sort_expr = order_by_rex
+                    .into_iter()
+                    .map(|s| {
+                        let expr = resolve_columns(&s.expr, &base_plan)
+                            .unwrap_or(s.expr.clone());
+                        Ok(SortExpr {
+                            expr: column_to_alias
+                                .get(&expr)
+                                .map(|alias| Expr::Column(Column::from(alias.as_str())))
+                                .unwrap_or(expr),
+                            asc: s.asc,
+                            nulls_first: s.nulls_first,
+                        })
+                    })
+                    .collect::<Result<Vec<SortExpr>>>()?;
+
+                // we need to ensure the ORDER BY expressions start with our ON expression
                 // This is because the ON expression is used to determine the distinct key
-                for (on_expr, sort) in on_expr.iter().zip(order_by_rex.iter()) {
-                    let on_expr = resolve_columns(
-                        &resolve_aliases_to_exprs(on_expr.clone(), &select_alias_map)?,
-                        &base_plan,
-                    )?;
-                    let sort_expr = resolve_columns(
-                        &resolve_aliases_to_exprs(sort.expr.clone(), &select_alias_map)?,
-                        &base_plan,
-                    )?;
-                    if on_expr != sort_expr {
-                        plan_err!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions (ON expression `{}` does not match ORDER BY expression `{}`)", on_expr.human_display(), sort_expr.human_display())?
+                for (on_expr, sort) in on_expr.iter().zip(sort_expr.iter()) {
+                    if on_expr != &sort.expr {
+                        plan_err!("SELECT DISTINCT ON expressions must match initial ORDER BY expressions (ON expression `{}` does not match ORDER BY expression `{}`)", on_expr.human_display(), sort.expr.human_display())?
+                    }
+                }
+
+                // We also need to ensure that all order by expressions appear in the group by clause for a better error message
+                if !group_by_exprs.is_empty() {
+                    for sort in &sort_expr {
+                        let sort_exp =
+                            resolve_aliases_to_exprs(sort.expr.clone(), &alias_map)
+                                .unwrap_or(sort.expr.clone());
+                        if !(aggr_exprs.contains(&sort_exp)
+                            || group_by_exprs.contains(&sort_exp))
+                        {
+                            plan_err!("Column '{}' must appear in the GROUP BY clause when used in aggregate function", sort_exp.human_display())?
+                        }
                     }
                 }
 
                 // Build the final plan
-                let distinct_on_plan = LogicalPlanBuilder::from(base_plan)
-                    .distinct_on(on_expr, select_exprs, order_by_rex)?
+                let distinct_on_plan = LogicalPlanBuilder::from(plan)
+                    .distinct_on(on_expr, select_exprs, sort_expr)?
                     .build()?;
 
                 return Ok(distinct_on_plan);
