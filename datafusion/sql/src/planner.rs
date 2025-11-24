@@ -33,7 +33,6 @@ use datafusion_common::{
 };
 use datafusion_common::{not_impl_err, plan_err, DFSchema, DataFusionError, Result};
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
-pub use datafusion_expr::planner::ContextProvider;
 use datafusion_expr::utils::find_column_exprs;
 use datafusion_expr::{col, Expr};
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
