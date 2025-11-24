@@ -743,7 +743,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 };
                 make_decimal_type(
                     precision,
-                    scale,
+                    scale.map(|s| s as u64),
                     self.options.default_decimal128_precision,
                     self.options.default_decimal128_scale,
                 )
