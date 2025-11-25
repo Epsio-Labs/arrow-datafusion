@@ -79,6 +79,7 @@ use datafusion_sql::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use datafusion_sql::planner::NullOrdering;
 use itertools::Itertools;
 use log::{debug, info};
 use object_store::ObjectStore;
@@ -503,6 +504,7 @@ impl SessionState {
                 .enable_options_value_normalization,
             support_varchar_with_length: sql_parser_options.support_varchar_with_length,
             map_string_types_to_utf8view: sql_parser_options.map_string_types_to_utf8view,
+            default_null_ordering: NullOrdering::NullsMax,
             default_decimal128_precision: 28,
             collect_spans: sql_parser_options.collect_spans,
             default_decimal128_scale: 10,

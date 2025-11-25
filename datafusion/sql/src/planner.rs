@@ -834,7 +834,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             | SQLDataType::UnsignedInteger
             | SQLDataType::AnyType
             | SQLDataType::Table(_)
-            | SQLDataType::VarBit(_)
             | SQLDataType::UTinyInt
             | SQLDataType::USmallInt
             | SQLDataType::HugeInt

@@ -514,7 +514,7 @@ impl DataFrame {
     ) -> Result<DataFrame> {
         let columns = columns.iter().map(|c| Column::from(*c)).collect();
         let plan = LogicalPlanBuilder::from(self.plan)
-            .unnest_columns_with_options(columns, options)?
+            .unnest_columns_with_options("unnest".to_string(), columns, options)?
             .build()?;
         Ok(DataFrame {
             session_state: self.session_state,
