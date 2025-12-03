@@ -884,6 +884,7 @@ impl LogicalPlanBuilder {
         select_expr: &[Expr],
         sort_expr: Vec<SortExpr>,
     ) -> Result<Self> {
+        let original_plan_schema = Arc::clone(self.plan.schema());
         // Collect sort columns that are missing in the input plan's schema
         let projection = LogicalPlan::Projection(Projection::try_new(
             select_expr.to_owned(),
@@ -899,13 +900,24 @@ impl LogicalPlanBuilder {
                 let columns = expr.column_refs();
                 let output: Vec<_> = columns
                     .into_iter()
-                    .filter(|c| !projection.schema().has_column(c))
-                    .cloned()
+                    .map(|c| {
+                        let normalized_column =
+                            c.clone().normalize_with_schemas_and_ambiguity_check(
+                                // Try with both schemas, since if we have an alias the alias name and the original column
+                                // name can be used. The alias will be in the projection schema, the original column name
+                                // in the input schema
+                                &[&[projection.schema(), &original_plan_schema]],
+                                &[],
+                            );
+                        normalized_column
+                    })
+                    .filter(|c| {
+                        c.as_ref().is_ok_and(|c| !projection.schema().has_column(c))
+                    })
                     .collect();
                 output
             })
-            .collect::<IndexSet<Column>>();
-
+            .collect::<Result<IndexSet<Column>>>()?;
         let plan = Self::add_missing_columns(projection, &missing_cols, false)?;
 
         Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
