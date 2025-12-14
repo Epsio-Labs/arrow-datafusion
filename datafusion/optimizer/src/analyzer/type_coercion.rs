@@ -549,6 +549,7 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                             order_by,
                             window_frame,
                             null_treatment,
+                            distinct,
                         },
                 } = *window_fun;
                 let window_frame =
@@ -571,6 +572,7 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                         .order_by(order_by)
                         .window_frame(window_frame)
                         .null_treatment(null_treatment)
+                        .distinct(distinct)
                         .build()?,
                 ))
             }

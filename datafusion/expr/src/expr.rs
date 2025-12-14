@@ -953,6 +953,8 @@ pub struct WindowFunctionParams {
     pub window_frame: WindowFrame,
     /// Specifies how NULL value is treated: ignore or respect
     pub null_treatment: Option<NullTreatment>,
+    /// Specifies if the function is suppose to be over distinct values
+    pub distinct: bool,
 }
 
 impl WindowFunction {
@@ -967,6 +969,7 @@ impl WindowFunction {
                 order_by: Vec::default(),
                 window_frame: WindowFrame::new(None),
                 null_treatment: None,
+                distinct: false,
             },
         }
     }
@@ -2143,6 +2146,7 @@ impl NormalizeEq for Expr {
                             partition_by: self_partition_by,
                             order_by: self_order_by,
                             null_treatment: self_null_treatment,
+                            distinct: self_distinct,
                         },
                 } = left.as_ref();
                 let WindowFunction {
@@ -2154,12 +2158,14 @@ impl NormalizeEq for Expr {
                             partition_by: other_partition_by,
                             order_by: other_order_by,
                             null_treatment: other_null_treatment,
+                            distinct: other_distinct,
                         },
                 } = other.as_ref();
 
                 self_fun.name() == other_fun.name()
                     && self_window_frame == other_window_frame
                     && self_null_treatment == other_null_treatment
+                    && self_distinct == other_distinct
                     && self_args.len() == other_args.len()
                     && self_args
                         .iter()
@@ -2410,11 +2416,13 @@ impl HashNode for Expr {
                             order_by: _,
                             window_frame,
                             null_treatment,
+                            distinct,
                         },
                 } = window_fun.as_ref();
                 fun.hash(state);
                 window_frame.hash(state);
                 null_treatment.hash(state);
+                distinct.hash(state);
             }
             Expr::InList(InList {
                 expr: _expr,
@@ -2720,12 +2728,18 @@ impl Display for SchemaDisplay<'_> {
                             order_by,
                             window_frame,
                             null_treatment,
+                            distinct,
                         } = params;
 
+                        let distinct_str = match distinct {
+                            true => "DISTINCT ",
+                            false => "",
+                        };
                         write!(
                             f,
-                            "{}({})",
+                            "{}({}{})",
                             fun,
+                            distinct_str,
                             schema_name_from_exprs_comma_separated_without_space(args)?
                         )?;
 
@@ -3118,9 +3132,10 @@ impl Display for Expr {
                             order_by,
                             window_frame,
                             null_treatment,
+                            distinct,
                         } = params;
 
-                        fmt_function(f, &fun.to_string(), false, args, true)?;
+                        fmt_function(f, &fun.to_string(), *distinct, args, true)?;
 
                         if let Some(nt) = null_treatment {
                             write!(f, "{nt}")?;

@@ -348,6 +348,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     order_by,
                     window_frame,
                     null_treatment,
+                    distinct,
                 };
 
                 for planner in self.context_provider.get_expr_planners().iter() {
@@ -364,6 +365,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     order_by,
                     window_frame,
                     null_treatment,
+                    distinct,
                 } = window_expr;
 
                 return Expr::from(expr::WindowFunction::new(func_def, args))
@@ -371,6 +373,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .order_by(order_by)
                     .window_frame(window_frame)
                     .null_treatment(null_treatment)
+                    .distinct(distinct)
                     .build();
             }
         } else {

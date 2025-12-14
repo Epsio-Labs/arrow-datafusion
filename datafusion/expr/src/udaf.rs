@@ -546,12 +546,18 @@ pub trait AggregateUDFImpl: Debug + Send + Sync {
             order_by,
             window_frame,
             null_treatment,
+            distinct,
         } = params;
 
         let mut schema_name = String::new();
+        let distinct_str = match distinct {
+            true => "DISTINCT ",
+            false => "",
+        };
         schema_name.write_fmt(format_args!(
-            "{}({})",
+            "{}({}{})",
             self.name(),
+            distinct_str,
             schema_name_from_exprs(args)?
         ))?;
 
@@ -639,13 +645,19 @@ pub trait AggregateUDFImpl: Debug + Send + Sync {
             order_by,
             window_frame,
             null_treatment,
+            distinct,
         } = params;
 
         let mut display_name = String::new();
+        let distinct_str = match distinct {
+            true => "DISTINCT ",
+            false => "",
+        };
 
         display_name.write_fmt(format_args!(
-            "{}({})",
+            "{}({}{})",
             self.name(),
+            distinct_str,
             expr_vec_fmt!(args)
         ))?;
 
