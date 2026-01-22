@@ -878,6 +878,24 @@ impl LogicalPlanBuilder {
         select_expr: Vec<Expr>,
         sort_expr: Vec<SortExpr>,
     ) -> Result<Self> {
+        let normalize_on_or_sort_expr = |e: Expr, plan: &LogicalPlan| -> Result<Expr> {
+            match &e {
+                Expr::Column(_) => expr_as_column_expr(&e, plan),
+                _ => {
+                    // Check if this expression exists as a column in the schema
+                    let schema_name = e.schema_name().to_string();
+                    let col = Column::from_name(&schema_name);
+                    if plan.schema().has_column(&col) {
+                        // Expression exists as a column (e.g., after aggregation)
+                        Ok(Expr::Column(col))
+                    } else {
+                        // Keep as expression, normalize columns within it
+                        normalize_col(e, plan)
+                    }
+                }
+            }
+        };
+
         let missing_cols = on_expr
             .iter()
             // Although the sort should be contained within the `on_expr`, we still want to show
@@ -904,7 +922,7 @@ impl LogicalPlanBuilder {
             DistinctOn::try_new(
                 on_expr
                     .into_iter()
-                    .map(|e| expr_as_column_expr(&e, &plan))
+                    .map(|e| normalize_on_or_sort_expr(e, &plan))
                     .collect::<Result<Vec<Expr>>>()?,
                 select_expr
                     .iter()
@@ -914,7 +932,7 @@ impl LogicalPlanBuilder {
                     .into_iter()
                     .map(|s| {
                         Ok(SortExpr {
-                            expr: expr_as_column_expr(&s.expr, &plan)?,
+                            expr: normalize_on_or_sort_expr(s.expr, &plan)?,
                             asc: s.asc,
                             nulls_first: s.nulls_first,
                         })
