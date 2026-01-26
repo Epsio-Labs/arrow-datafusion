@@ -530,7 +530,7 @@ impl DFSchema {
 
     /// Find if the field exists with the given name
     pub fn has_column_with_unqualified_name(&self, name: &str) -> bool {
-        self.fields().iter().any(|field| field.name() == name)
+        self.fields().iter().any(|field| field.name().to_lowercase() == name.to_lowercase())
     }
 
     /// Find if the field exists with the given qualified name
@@ -540,7 +540,7 @@ impl DFSchema {
         name: &str,
     ) -> bool {
         self.iter().any(|(q, f)| {
-            q.map(|q| q.resolved_eq(qualifier)).unwrap_or(false) && f.name() == name
+            q.map(|q| q.resolved_eq(qualifier)).unwrap_or(false) && f.name().to_lowercase() == name.to_lowercase()
         })
     }
 
