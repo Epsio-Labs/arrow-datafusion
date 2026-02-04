@@ -403,7 +403,7 @@ impl LexOrdering {
     }
 
     /// Returns an iterator over each `&PhysicalSortExpr` in the LexOrdering.
-    pub fn iter(&self) -> core::slice::Iter<PhysicalSortExpr> {
+    pub fn iter(&self) -> core::slice::Iter<'_, PhysicalSortExpr> {
         self.inner.iter()
     }
 
