@@ -822,6 +822,13 @@ impl OptimizerRule for PushDownFilter {
                 insert_below(LogicalPlan::Sort(sort), new_filter)
             }
             LogicalPlan::SubqueryAlias(subquery_alias) => {
+                // Do not push filters through materialized CTEs
+                if subquery_alias.materialized {
+                    return Ok(Transformed::no(LogicalPlan::Filter(Filter::try_new(
+                        filter.predicate,
+                        Arc::new(LogicalPlan::SubqueryAlias(subquery_alias)),
+                    )?)));
+                }
                 let mut replace_map = HashMap::new();
                 for (i, (qualifier, field)) in
                     subquery_alias.input.schema().iter().enumerate()

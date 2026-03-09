@@ -681,8 +681,13 @@ impl LogicalPlan {
             LogicalPlan::SubqueryAlias(SubqueryAlias {
                 input,
                 alias,
+                materialized,
                 schema: _,
-            }) => SubqueryAlias::try_new(input, alias).map(LogicalPlan::SubqueryAlias),
+            }) => {
+                let mut sa = SubqueryAlias::try_new(input, alias)?;
+                sa.materialized = materialized;
+                Ok(LogicalPlan::SubqueryAlias(sa))
+            }
             LogicalPlan::Limit(_) => Ok(self),
             LogicalPlan::Ddl(_) => Ok(self),
             LogicalPlan::Extension(Extension { node }) => {
@@ -954,11 +959,12 @@ impl LogicalPlan {
                     spans: spans.clone(),
                 }))
             }
-            LogicalPlan::SubqueryAlias(SubqueryAlias { alias, .. }) => {
+            LogicalPlan::SubqueryAlias(SubqueryAlias { alias, materialized, .. }) => {
                 self.assert_no_expressions(expr)?;
                 let input = self.only_input(inputs)?;
-                SubqueryAlias::try_new(Arc::new(input), alias.clone())
-                    .map(LogicalPlan::SubqueryAlias)
+                let mut sa = SubqueryAlias::try_new(Arc::new(input), alias.clone())?;
+                sa.materialized = *materialized;
+                Ok(LogicalPlan::SubqueryAlias(sa))
             }
             LogicalPlan::Limit(Limit { skip, fetch, .. }) => {
                 let old_expr_len = skip.iter().chain(fetch.iter()).count();
@@ -2215,6 +2221,8 @@ pub struct SubqueryAlias {
     pub alias: TableReference,
     /// The schema with qualified field names
     pub schema: DFSchemaRef,
+    /// Whether this subquery alias comes from a MATERIALIZED CTE
+    pub materialized: bool,
 }
 
 impl SubqueryAlias {
@@ -2238,6 +2246,7 @@ impl SubqueryAlias {
             input: plan,
             alias,
             schema,
+            materialized: false,
         })
     }
 }

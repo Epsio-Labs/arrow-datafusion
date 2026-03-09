@@ -26,7 +26,11 @@ use datafusion_common::{
     Result,
 };
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, TableSource};
-use sqlparser::ast::{Query, SetExpr, SetOperator, With};
+use sqlparser::ast::{CteAsMaterialized, Query, SetExpr, SetOperator, With};
+
+fn default_materialized() -> bool {
+    std::env::var("CTE_DEFAULT_MATERIALIZED").unwrap_or("0".to_string()) == "1"
+}
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(super) fn plan_with_clause(
@@ -45,6 +49,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 );
             }
 
+            let is_materialized = matches!(
+                cte.materialized,
+                Some(CteAsMaterialized::Materialized)
+            );
+
             // Create a logical plan for the CTE
             let cte_plan = if is_recursive {
                 self.recursive_cte(cte_name.clone(), *cte.query, planner_context)?
@@ -54,7 +63,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
             // Each `WITH` block can change the column names in the last
             // projection (e.g. "WITH table(t1, t2) AS SELECT 1, 2").
-            let final_plan = self.apply_table_alias(cte_plan, cte.alias)?;
+            let mut final_plan = self.apply_table_alias(cte_plan, cte.alias)?;
+
+            // If the CTE is materialized, mark the SubqueryAlias so that
+            // filter pushdown won't push filters through it.
+            if is_materialized || default_materialized() {
+                if let LogicalPlan::SubqueryAlias(ref mut sa) = final_plan {
+                    sa.materialized = true;
+                }
+            }
+
             // Export the CTE to the outer query
             planner_context.insert_cte(cte_name, final_plan);
         }

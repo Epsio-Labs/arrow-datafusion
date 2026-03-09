@@ -163,11 +163,13 @@ impl TreeNode for LogicalPlan {
                 input,
                 alias,
                 schema,
+                materialized,
             }) => input.map_elements(f)?.update_data(|input| {
                 LogicalPlan::SubqueryAlias(SubqueryAlias {
                     input,
                     alias,
                     schema,
+                    materialized,
                 })
             }),
             LogicalPlan::Extension(extension) => rewrite_extension_inputs(extension, f)?
